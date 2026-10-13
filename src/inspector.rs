@@ -441,10 +441,11 @@ Write-Output "MEM=$mt $mu"
 Write-Output "DISKS=$($disks -join '|')"
 Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
 "#;
-        let out = tokio::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
-            .output()
-            .await?;
+        let mut cmd = tokio::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps_script]);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
+        let out = cmd.output().await?;
         let text = String::from_utf8_lossy(&out.stdout);
         let mut map = HashMap::new();
         for line in text.lines() {

@@ -260,12 +260,14 @@ async fn run_local_exec_task(
     cancel_rx: &mut oneshot::Receiver<()>,
 ) {
     use tokio::io::AsyncReadExt;
-    let mut child = match tokio::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", cmd])
+    let mut ps_cmd = tokio::process::Command::new("powershell.exe");
+    ps_cmd.args(["-NoProfile", "-NonInteractive", "-Command", cmd])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    ps_cmd.creation_flags(0x08000000);
+
+    let mut child = match ps_cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let mut g = inner.lock().unwrap();

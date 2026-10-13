@@ -568,11 +568,12 @@ function copyText(text: string, msg: string) {
   showToast(msg);
 }
 
-function openSettingsPage(tab?: SettingsTabKey) {
-  if (tab) {
-    activeSettingsTab.value = tab;
+function openSettingsPage(tab?: SettingsTabKey | unknown) {
+  const targetTab = typeof tab === 'string' ? (tab as SettingsTabKey) : undefined;
+  if (targetTab) {
+    activeSettingsTab.value = targetTab;
   }
-  if (activePage.value === 'settings' && !tab) {
+  if (activePage.value === 'settings' && !targetTab) {
     activePage.value = 'workspace';
   } else {
     activePage.value = 'settings';
@@ -1530,7 +1531,7 @@ onBeforeUnmount(() => {
               : 'border-zinc-200/80 bg-white/85 text-zinc-600 hover:bg-white hover:text-zinc-900 dark:border-zinc-700/80 dark:bg-zinc-800/85 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-white'
           "
           title="进入设置页（MCP Server / API Key / 登录安全）"
-          @click="openSettingsPage"
+          @click="openSettingsPage()"
         >
           <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3" />

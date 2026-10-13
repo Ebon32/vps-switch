@@ -627,12 +627,12 @@ pub async fn compress_item(
             out_name = format!("{base}-{}.zip", Uuid::new_v4().simple());
             out_path = parent.join(&out_name);
         }
-        let status = tokio::process::Command::new("tar.exe")
-            .args(["-a", "-cf", &out_name, "--", base])
-            .current_dir(parent)
-            .output()
-            .await
-            .context("调用本机 tar.exe 压缩失败")?;
+        let mut tar_cmd = tokio::process::Command::new("tar.exe");
+        tar_cmd.args(["-a", "-cf", &out_name, "--", base])
+            .current_dir(parent);
+        #[cfg(windows)]
+        tar_cmd.creation_flags(0x08000000);
+        let status = tar_cmd.output().await.context("调用本机 tar.exe 压缩失败")?;
         if !status.status.success() {
             return Err(anyhow!(
                 "压缩失败: {}",
@@ -686,11 +686,11 @@ pub async fn extract_item(
             out_dir = parent.join(format!("{folder_name}.extracted"));
         }
         tokio::fs::create_dir_all(&out_dir).await?;
-        let status = tokio::process::Command::new("tar.exe")
-            .args(["-xf", archive_path, "-C", &out_dir.to_string_lossy()])
-            .output()
-            .await
-            .context("调用本机 tar.exe 解压失败")?;
+        let mut tar_cmd = tokio::process::Command::new("tar.exe");
+        tar_cmd.args(["-xf", archive_path, "-C", &out_dir.to_string_lossy()]);
+        #[cfg(windows)]
+        tar_cmd.creation_flags(0x08000000);
+        let status = tar_cmd.output().await.context("调用本机 tar.exe 解压失败")?;
         if !status.status.success() {
             return Err(anyhow!(
                 "解压失败: {}",
