@@ -128,12 +128,12 @@ MEM=$(awk '
     used = (mt > avail) ? (mt - avail) : 0;
     cache = buf + ca + sr;
     sw_used = (st > sf) ? (st - sf) : 0;
-    printf "%d %d %d %d %d", mt*1024, used*1024, cache*1024, st*1024, sw_used*1024
+    printf "%.0f %.0f %.0f %.0f %.0f", mt*1024, used*1024, cache*1024, st*1024, sw_used*1024
   }
 ' /proc/meminfo 2>/dev/null)
-DISKS=$(df -Pk 2>/dev/null | awk 'NR>1 && $1 !~ /^(tmpfs|devtmpfs|udev|none|shm|overlay)$/ && $6 !~ /^\/(dev|proc|sys|run|boot\/efi)/ {printf "%s:%d:%d|", $6, $2*1024, $3*1024}')
+DISKS=$(df -Pk 2>/dev/null | awk 'NR>1 && $1 !~ /^(tmpfs|devtmpfs|udev|none|shm|overlay)$/ && $6 !~ /^\/(dev|proc|sys|run|boot\/efi)/ {printf "%s:%.0f:%.0f|", $6, $2*1024, $3*1024}')
 if [ -z "$DISKS" ]; then
-  DISKS=$(df -Pk / 2>/dev/null | awk 'NR==2 {printf "%s:%d:%d|", $6, $2*1024, $3*1024}')
+  DISKS=$(df -Pk / 2>/dev/null | awk 'NR==2 {printf "%s:%.0f:%.0f|", $6, $2*1024, $3*1024}')
 fi
 MODEL=$(awk -F: '/model name|Model name/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
 CORES=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
