@@ -679,6 +679,8 @@ impl TerminalManager {
         let meta = handle.snapshot_meta();
         {
             let mut guard = self.panes.lock().unwrap();
+            // 顺手回收该主机下已退出的旧 pane：否则反复打开终端会一直堆积 ring buffer 与终端网格
+            guard.retain(|_, p| !(p.host_id == host_id && p.state.lock().unwrap().exited));
             guard.insert(pane_id, handle);
         }
         Ok(meta)

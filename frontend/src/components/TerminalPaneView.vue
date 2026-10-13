@@ -23,6 +23,7 @@ const emit = defineEmits<{
 const containerRef = ref<HTMLDivElement | null>(null);
 const connected = ref(false);
 const exited = ref(false);
+const disconnected = ref(false);
 
 let term: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
@@ -30,6 +31,10 @@ let ws: WebSocket | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitRaf: number | null = null;
 let replayingDepth = 0;
+let disposed = false;
+let reconnectTimer: number | null = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 6;
 const textEncoder = new TextEncoder();
 
 // 拦截 xterm.js 自动发出的设备属性应答（如 DA1 \x1b[?1;2c、DA2 \x1b[>0;276;0c），防止在 Shell 提示符上打出 [?1;2c
@@ -129,6 +134,8 @@ function connectWebSocket() {
 
   ws.onopen = () => {
     connected.value = true;
+    disconnected.value = false;
+    reconnectAttempts = 0;
     scheduleFit();
   };
 
@@ -164,7 +171,29 @@ function connectWebSocket() {
 
   ws.onclose = () => {
     connected.value = false;
+    if (disposed) return;
+    // 后端在新连接上会补发 0x02 历史字节环回放帧，重连即恢复现场；
+    // 退避重试有上限，避免服务端已关闭该 pane 时无限重连。
+    disconnected.value = true;
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) return;
+    const delay = Math.min(400 * 2 ** reconnectAttempts, 4000);
+    reconnectAttempts += 1;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      if (!disposed) connectWebSocket();
+    }, delay);
   };
+}
+
+function manualReconnect() {
+  if (disposed) return;
+  if (reconnectTimer != null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempts = 0;
+  disconnected.value = false;
+  connectWebSocket();
 }
 
 watch(
@@ -243,6 +272,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
+  if (reconnectTimer != null) clearTimeout(reconnectTimer);
   if (fitRaf != null) cancelAnimationFrame(fitRaf);
   resizeObserver?.disconnect();
   if (ws) {
@@ -282,6 +313,23 @@ onBeforeUnmount(() => {
 
     <!-- xterm 挂载容器 -->
     <div ref="containerRef" class="h-full w-full flex-1 overflow-hidden px-3 py-2" />
+
+    <!-- 连接断开提示条：后端支持字节环回放，重连即恢复现场 -->
+    <div
+      v-if="disconnected && !exited"
+      class="flex items-center justify-between border-t border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-700"
+    >
+      <span>{{
+        reconnectAttempts >= MAX_RECONNECT_ATTEMPTS ? '终端连接已断开' : '连接中断，正在重连…'
+      }}</span>
+      <button
+        type="button"
+        class="rounded-md bg-amber-600 px-2 py-0.5 text-white hover:bg-amber-700"
+        @click="manualReconnect"
+      >
+        立即重连
+      </button>
+    </div>
 
     <!-- 会话已退出提示条 -->
     <div

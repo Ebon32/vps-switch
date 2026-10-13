@@ -68,11 +68,18 @@ pub struct TransferTask {
     pub ended_at: Option<String>,
 }
 
+/// 传输任务表与顺序表由同一把锁持有：两把锁交叉获取曾构成 AB-BA 死锁
+/// （create_task 持 order 取 tasks，clear_finished 持 tasks 取 order），单锁后该问题不复存在。
+#[derive(Default)]
+struct TransferStore {
+    tasks: HashMap<String, TransferTask>,
+    order: Vec<String>,
+}
+
 /// 统一传输队列管理器（Web UI 与未来板块六 MCP 工具共用同一套传输状态与引擎）
 #[derive(Default)]
 pub struct TransferManager {
-    tasks: Mutex<HashMap<String, TransferTask>>,
-    order: Mutex<Vec<String>>,
+    store: Mutex<TransferStore>,
 }
 
 impl TransferManager {
@@ -107,19 +114,19 @@ impl TransferManager {
             started_at: Utc::now().to_rfc3339(),
             ended_at: None,
         };
-        self.tasks.lock().unwrap().insert(id.clone(), task);
-        let mut ord = self.order.lock().unwrap();
-        ord.insert(0, id.clone());
-        if ord.len() > 100 {
-            if let Some(old_id) = ord.pop() {
-                self.tasks.lock().unwrap().remove(&old_id);
+        let mut store = self.store.lock().unwrap();
+        store.tasks.insert(id.clone(), task);
+        store.order.insert(0, id.clone());
+        if store.order.len() > 100 {
+            if let Some(old_id) = store.order.pop() {
+                store.tasks.remove(&old_id);
             }
         }
         id
     }
 
     pub fn update_progress(&self, id: &str, transferred: u64, total: u64, elapsed_secs: f64) {
-        if let Some(task) = self.tasks.lock().unwrap().get_mut(id) {
+        if let Some(task) = self.store.lock().unwrap().tasks.get_mut(id) {
             task.transferred_bytes = transferred;
             if total > 0 {
                 task.total_bytes = total;
@@ -131,7 +138,7 @@ impl TransferManager {
     }
 
     pub fn finish_task(&self, id: &str, final_bytes: u64, elapsed_secs: f64) {
-        if let Some(task) = self.tasks.lock().unwrap().get_mut(id) {
+        if let Some(task) = self.store.lock().unwrap().tasks.get_mut(id) {
             task.transferred_bytes = final_bytes;
             if task.total_bytes == 0 {
                 task.total_bytes = final_bytes;
@@ -145,7 +152,7 @@ impl TransferManager {
     }
 
     pub fn fail_task(&self, id: &str, err_msg: impl ToString) {
-        if let Some(task) = self.tasks.lock().unwrap().get_mut(id) {
+        if let Some(task) = self.store.lock().unwrap().tasks.get_mut(id) {
             task.state = "failed".to_string();
             task.error = Some(err_msg.to_string());
             task.ended_at = Some(Utc::now().to_rfc3339());
@@ -153,19 +160,26 @@ impl TransferManager {
     }
 
     pub fn list_tasks(&self, host_id: Option<&str>) -> Vec<TransferTask> {
-        let ord = self.order.lock().unwrap().clone();
-        let map = self.tasks.lock().unwrap();
-        ord.into_iter()
-            .filter_map(|id| map.get(&id).cloned())
+        let store = self.store.lock().unwrap();
+        store
+            .order
+            .iter()
+            .filter_map(|id| store.tasks.get(id))
             .filter(|t| host_id.map(|h| t.host_id == h).unwrap_or(true))
+            .cloned()
             .collect()
     }
 
     pub fn clear_finished(&self) {
-        let mut map = self.tasks.lock().unwrap();
-        let mut ord = self.order.lock().unwrap();
-        map.retain(|_, t| t.state == "running");
-        ord.retain(|id| map.contains_key(id));
+        let mut store = self.store.lock().unwrap();
+        let keep: std::collections::HashSet<String> = store
+            .tasks
+            .iter()
+            .filter(|(_, t)| t.state == "running")
+            .map(|(id, _)| id.clone())
+            .collect();
+        store.tasks.retain(|id, _| keep.contains(id));
+        store.order.retain(|id| keep.contains(id));
     }
 }
 

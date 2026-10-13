@@ -19,7 +19,9 @@ use anyhow::Result;
 use api::{build_api_router, AppState};
 use axum::{
     body::Body,
-    http::{header, StatusCode, Uri},
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use crypto::MasterKey;
@@ -57,6 +59,38 @@ fn resolve_data_dir() -> PathBuf {
     cwd_data
 }
 
+/// 静态资源相对路径白名单校验：拒绝 `..`、空段、反斜杠与盘符，杜绝跳出 frontend/dist 读本机任意文件
+fn is_safe_asset_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.contains('\\')
+        && !rel.contains(':')
+        && rel
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// 只接受本机回环 Host。桌面 WebView、Vite 开发代理、stdio 桥接全部走 127.0.0.1；
+/// 借此挡掉 DNS rebinding（恶意网页把自己的域名解析到 127.0.0.1 后即被浏览器视为"同源"）。
+fn host_header_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = raw.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "::1")
+}
+
+async fn require_loopback_host(State(enforce): State<bool>, req: Request, next: Next) -> Response {
+    if enforce && !host_header_is_loopback(req.headers()) {
+        return (StatusCode::FORBIDDEN, "仅允许通过本机回环地址访问").into_response();
+    }
+    next.run(req).await
+}
+
 /// 静态前端资源服务：优先读本机 frontend/dist（方便开发热更新），不存在时直接走二进制内嵌的 EmbeddedFrontend（单文件打包免外部依赖）
 async fn serve_frontend_asset(uri: Uri) -> Response {
     let raw_path = uri.path().trim_start_matches('/');
@@ -65,6 +99,10 @@ async fn serve_frontend_asset(uri: Uri) -> Response {
     } else {
         raw_path
     };
+
+    if !is_safe_asset_path(rel_path) {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
 
     let disk_candidate = PathBuf::from("frontend/dist").join(rel_path);
     if let Ok(bytes) = tokio::fs::read(&disk_candidate).await {
@@ -203,14 +241,32 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
     let addr = SocketAddr::new(bind_ip, port);
 
+    // 跨源只放行本机回环来源（桌面 WebView 与 Vite 开发端口），不再对任意网站开放读取响应
+    let mut allowed_origins: Vec<HeaderValue> = Vec::new();
+    for origin in [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        "http://127.0.0.1:5173".to_string(),
+        "http://localhost:5173".to_string(),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(&origin) {
+            allowed_origins.push(value);
+        }
+    }
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(allowed_origins)
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // 绑回环时才强制校验 Host；显式设 HOST=0.0.0.0 对外提供服务时交给登录鉴权把关
+    let enforce_loopback_host = bind_ip.is_loopback();
     let app = build_api_router(state.clone())
         .fallback(serve_frontend_asset)
-        .layer(cors);
+        .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            enforce_loopback_host,
+            require_loopback_host,
+        ));
 
     #[cfg(windows)]
     if !is_headless {

@@ -53,7 +53,9 @@ const hosts = ref<PublicHost[]>([]);
 const loading = ref(false);
 const checkingAll = ref(false);
 const checkingIds = ref<Set<string>>(new Set());
-const creatingPane = ref(false);
+const paneCreationInFlight = new Set<string>();
+const paneCreationCount = ref(0);
+const creatingPane = computed(() => paneCreationCount.value > 0);
 
 // 全局昼夜主题
 const isDark = ref(false);
@@ -763,8 +765,11 @@ async function ensureHostHasPane(tab: OpenSessionTab) {
 }
 
 async function createPaneForTab(tab: OpenSessionTab, cwd?: string | null) {
-  if (creatingPane.value) return;
-  creatingPane.value = true;
+  // 按主机去重：全局布尔会让"主机 A 创建中"静默吞掉"主机 B 的创建请求"，
+  // 导致 B 的标签页永久停在"正在连接"。
+  if (paneCreationInFlight.has(tab.hostId)) return;
+  paneCreationInFlight.add(tab.hostId);
+  paneCreationCount.value += 1;
   try {
     const res = await fetch('/api/terminals', {
       method: 'POST',
@@ -789,7 +794,8 @@ async function createPaneForTab(tab: OpenSessionTab, cwd?: string | null) {
   } catch (e) {
     showToast(`启动终端失败: ${(e as Error).message}`, 'err');
   } finally {
-    creatingPane.value = false;
+    paneCreationInFlight.delete(tab.hostId);
+    paneCreationCount.value = Math.max(0, paneCreationCount.value - 1);
   }
 }
 

@@ -130,9 +130,50 @@ pub struct ExecTaskManager {
     tasks: Mutex<HashMap<String, Arc<Mutex<ExecTaskInner>>>>,
 }
 
+/// 单条任务 stdout / stderr 各自的上限，超出即截断并显式标注（避免常驻进程被大输出撑爆内存）
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// 任务表保留上限，超出后按开始时间淘汰最旧的已完成任务
+const MAX_TASKS: usize = 60;
+
+fn append_capped(buf: &mut Vec<u8>, chunk: &[u8]) {
+    if buf.len() >= MAX_OUTPUT_BYTES {
+        return;
+    }
+    let room = MAX_OUTPUT_BYTES - buf.len();
+    if chunk.len() <= room {
+        buf.extend_from_slice(chunk);
+    } else {
+        buf.extend_from_slice(&chunk[..room]);
+        buf.extend_from_slice("\n...[输出超过 1 MiB，已截断]".as_bytes());
+    }
+}
+
 impl ExecTaskManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 淘汰最旧的已完成任务，保证长驻进程的任务表不会无界增长
+    fn evict_old_finished(&self, map: &mut HashMap<String, Arc<Mutex<ExecTaskInner>>>) {
+        if map.len() <= MAX_TASKS {
+            return;
+        }
+        let mut finished: Vec<(Instant, String)> = map
+            .iter()
+            .filter_map(|(id, task)| {
+                let guard = task.lock().unwrap();
+                if guard.state == "running" {
+                    None
+                } else {
+                    Some((guard.started_inst, id.clone()))
+                }
+            })
+            .collect();
+        finished.sort();
+        let remove_n = map.len().saturating_sub(MAX_TASKS);
+        for (_, id) in finished.into_iter().take(remove_n) {
+            map.remove(&id);
+        }
     }
 
     pub fn get_task(&self, task_id: &str) -> Option<ExecTaskSnapshot> {
@@ -185,10 +226,11 @@ impl ExecTaskManager {
             cancel_tx: Some(cancel_tx),
         }));
 
-        self.tasks
-            .lock()
-            .unwrap()
-            .insert(task_id.clone(), inner.clone());
+        {
+            let mut map = self.tasks.lock().unwrap();
+            map.insert(task_id.clone(), inner.clone());
+            self.evict_old_finished(&mut map);
+        }
 
         let st = state.clone();
         let host_clone = host.clone();
@@ -260,8 +302,17 @@ async fn run_local_exec_task(
     cancel_rx: &mut oneshot::Receiver<()>,
 ) {
     use tokio::io::AsyncReadExt;
+    let encoded = windows_ps_encoded_payload(cmd);
     let mut ps_cmd = tokio::process::Command::new("powershell.exe");
-    ps_cmd.args(["-NoProfile", "-NonInteractive", "-Command", cmd])
+    ps_cmd
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            encoded.as_str(),
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
@@ -300,7 +351,7 @@ async fn run_local_exec_task(
                     Ok(0) | Err(_) => out_eof = true,
                     Ok(n) => {
                         let mut g = inner.lock().unwrap();
-                        g.stdout.extend_from_slice(&out_buf[..n]);
+                        append_capped(&mut g.stdout, &out_buf[..n]);
                         g.last_output_inst = Instant::now();
                     }
                 }
@@ -310,7 +361,7 @@ async fn run_local_exec_task(
                     Ok(0) | Err(_) => err_eof = true,
                     Ok(n) => {
                         let mut g = inner.lock().unwrap();
-                        g.stderr.extend_from_slice(&err_buf[..n]);
+                        append_capped(&mut g.stderr, &err_buf[..n]);
                         g.last_output_inst = Instant::now();
                     }
                 }
@@ -329,12 +380,10 @@ async fn run_local_exec_task(
     g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
 }
 
-fn wrap_windows_remote_command(cmd: &str) -> String {
-    let trimmed = cmd.trim();
-    if trimmed.starts_with("powershell") || trimmed.starts_with("cmd.exe") {
-        return cmd.to_string();
-    }
-
+/// 把任意 PowerShell 脚本编码为 `-EncodedCommand` 所需的 UTF-16LE base64。
+/// 本机与远端两条执行路径共用：统一注入 UTF-8 输出编码（否则中文按 GBK 落管道变乱码）、
+/// 抑制进度条噪音，并把真实退出码原样带出。
+fn windows_ps_encoded_payload(command: &str) -> String {
     let payload = format!(
         "$ProgressPreference = 'SilentlyContinue'\n\
          try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}\n\
@@ -344,7 +393,7 @@ fn wrap_windows_remote_command(cmd: &str) -> String {
          if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}\n\
          if (-not $__vpsOk) {{ exit 1 }}\n\
          exit 0",
-        trimmed
+        command.trim()
     );
 
     let utf16_bytes: Vec<u8> = payload
@@ -352,9 +401,19 @@ fn wrap_windows_remote_command(cmd: &str) -> String {
         .flat_map(|u| u.to_le_bytes())
         .collect();
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&utf16_bytes);
+    base64::engine::general_purpose::STANDARD.encode(&utf16_bytes)
+}
 
-    format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64}")
+fn wrap_windows_remote_command(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.starts_with("powershell") || trimmed.starts_with("cmd.exe") {
+        return cmd.to_string();
+    }
+
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
+        windows_ps_encoded_payload(cmd)
+    )
 }
 
 fn clean_clixml_stderr(raw: &[u8]) -> Vec<u8> {
@@ -435,6 +494,7 @@ async fn run_ssh_exec_task(
     }
 
     let mut exit_code: Option<i32> = None;
+    let mut connection_lost = false;
     loop {
         tokio::select! {
             _ = &mut *cancel_rx => {
@@ -445,7 +505,7 @@ async fn run_ssh_exec_task(
                 match msg_opt {
                     Some(ChannelMsg::Data { data }) => {
                         let mut g = inner.lock().unwrap();
-                        g.stdout.extend_from_slice(&data);
+                        append_capped(&mut g.stdout, &data);
                         g.last_output_inst = Instant::now();
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
@@ -455,13 +515,18 @@ async fn run_ssh_exec_task(
                         } else {
                             data.to_vec()
                         };
-                        g.stderr.extend_from_slice(&cleaned);
+                        append_capped(&mut g.stderr, &cleaned);
                         g.last_output_inst = Instant::now();
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status as i32);
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => break,
+                    // russh 在收到对端 CHANNEL_CLOSE 时会先投递显式的 Close/Eof，只有会话整体消失才会得到 None
+                    None => {
+                        connection_lost = true;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -470,14 +535,37 @@ async fn run_ssh_exec_task(
 
     let mut g = inner.lock().unwrap();
     if g.state == "running" {
-        let code = exit_code.unwrap_or(0);
-        g.exit_code = Some(code);
-        g.state = if code == 0 {
-            "completed".to_string()
-        } else {
-            "failed".to_string()
-        };
         g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+        match exit_code {
+            Some(code) => {
+                g.exit_code = Some(code);
+                g.state = if code == 0 {
+                    "completed".to_string()
+                } else {
+                    "failed".to_string()
+                };
+            }
+            None => {
+                // 没拿到远端退出码就不能声称成功：连接中断与"服务端未上报退出码"都如实报失败
+                g.exit_code = None;
+                g.state = "failed".to_string();
+                if connection_lost {
+                    append_capped(
+                        &mut g.stderr,
+                        "\n[SSH 连接在命令结束前中断，输出可能不完整，退出码未知]".as_bytes(),
+                    );
+                    g.hint = Some(
+                        "SSH 连接中断，命令结果不完整。请重试，或改用 vps_task 查询后续输出。"
+                            .to_string(),
+                    );
+                } else {
+                    g.hint = Some(
+                        "远端未上报退出码，无法确认命令是否成功（已按失败处理，stdout/stderr 仍原样返回）。"
+                            .to_string(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1264,19 +1352,26 @@ async fn tool_vps_transfer(state: &Arc<AppState>, args: Value) -> Result<Value> 
         let src_host = resolve_host(&state.db, src_q)?;
         let dst_host = resolve_host(&state.db, dst_q)?;
         let st = state.clone();
+        let src_id = src_host.id.clone();
+        let dst_id = dst_host.id.clone();
 
-        let fut = files::transfer_remote_to_remote(
-            &st.ssh_pool,
-            &st.db,
-            &st.transfers,
-            &src_host.id,
-            &src_path,
-            &dst_host.id,
-            &dst_path,
-        );
-        match tokio::time::timeout(Duration::from_secs(wait_seconds), fut).await {
-            Ok(res) => {
-                let task = res?;
+        // 必须 spawn：若把 future 直接交给 timeout，超时会把它 drop 掉（传输被真正取消），
+        // 却仍对外声称"仍在后台传输"，属于谎报。spawn 后超时只是不再等待，传输继续跑。
+        let handle = tokio::spawn(async move {
+            files::transfer_remote_to_remote(
+                &st.ssh_pool,
+                &st.db,
+                &st.transfers,
+                &src_id,
+                &src_path,
+                &dst_id,
+                &dst_path,
+            )
+            .await
+        });
+        match tokio::time::timeout(Duration::from_secs(wait_seconds), handle).await {
+            Ok(join_res) => {
+                let task = join_res??;
                 return Ok(json!({ "ok": true, "transfer": task }));
             }
             Err(_) => {
@@ -1384,7 +1479,7 @@ async fn tool_vps_task(
     }
 }
 
-/// `--mcp-stdio` 本地模式：若 127.0.0.1:3302 主进程正在运行则直接桥接过去（与桌面 UI 共享连接池、探针缓存和终端唤起事件），
+/// `--mcp-stdio` 本地模式：若常驻主进程正在监听则直接桥接过去（与桌面 UI 共享连接池、探针缓存和终端唤起事件），
 /// 若主进程未运行则在当前进程内直接处理。
 pub async fn run_stdio_bridge(state: Arc<AppState>, exec_tasks: Arc<ExecTaskManager>, port: u16) -> Result<()> {
     let stdin = tokio::io::stdin();
@@ -1399,8 +1494,14 @@ pub async fn run_stdio_bridge(state: Arc<AppState>, exec_tasks: Arc<ExecTaskMana
             continue;
         };
 
-        // 优先尝试转发给已运行的常驻 UI 主进程（以便共享 SshPool 与 UI 终端弹窗联动）
-        if let Some(resp_str) = try_forward_to_daemon(port, trimmed).await {
+        // 优先尝试转发给已运行的常驻 UI 主进程（以便共享 SshPool 与 UI 终端弹窗联动）；
+        // 带上与主进程共库的真实 API Key，不再依赖任何可伪造的"我是内部桥接"请求头
+        let api_key = state
+            .db
+            .get_app_settings()
+            .map(|s| s.mcp_api_key)
+            .unwrap_or_default();
+        if let Some(resp_str) = try_forward_to_daemon(port, &api_key, trimmed).await {
             if !resp_str.trim().is_empty() {
                 println!("{}", resp_str.trim());
             }
@@ -1414,7 +1515,7 @@ pub async fn run_stdio_bridge(state: Arc<AppState>, exec_tasks: Arc<ExecTaskMana
     Ok(())
 }
 
-async fn try_forward_to_daemon(port: u16, raw_json: &str) -> Option<String> {
+async fn try_forward_to_daemon(port: u16, api_key: &str, raw_json: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let addr = format!("127.0.0.1:{port}");
     let mut stream = tokio::time::timeout(
@@ -1426,7 +1527,7 @@ async fn try_forward_to_daemon(port: u16, raw_json: &str) -> Option<String> {
     .ok()?;
 
     let req_bytes = format!(
-        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-vps-switch-stdio: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {api_key}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         raw_json.len(),
         raw_json
     );

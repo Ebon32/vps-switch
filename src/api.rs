@@ -1466,12 +1466,9 @@ async fn api_mcp_rpc(
         return err_response(StatusCode::FORBIDDEN, "MCP Server 当前已在设置中关闭").into_response();
     }
 
-    // 本机 --mcp-stdio 内部桥接请求带 x-vps-switch-stdio: 1；其余外部 HTTP 请求若开启了 API Key 校验则必须匹配
-    let is_local_stdio = headers
-        .get("x-vps-switch-stdio")
-        .and_then(|v| v.to_str().ok())
-        == Some("1");
-    if settings.mcp_require_api_key && !is_local_stdio {
+    // API Key 一律校验。stdio 桥接同样走真实 Key（见 mcp.rs try_forward_to_daemon），
+    // 不再存在任何客户端可伪造的豁免请求头。
+    if settings.mcp_require_api_key {
         let provided = extract_mcp_api_key(&headers);
         if provided.as_deref() != Some(settings.mcp_api_key.as_str()) {
             return err_response(

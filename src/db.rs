@@ -784,7 +784,7 @@ impl Database {
                 [],
             )?;
             conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES ('mcp_require_api_key', 'false')",
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('mcp_require_api_key', 'true')",
                 [],
             )?;
             conn.execute(
@@ -839,8 +839,8 @@ impl Database {
             .unwrap_or(true);
         let mcp_require_api_key = self
             .get_setting("mcp_require_api_key")?
-            .map(|v| v == "true")
-            .unwrap_or(false);
+            .map(|v| v != "false")
+            .unwrap_or(true);
         let mcp_api_key = match self.get_setting("mcp_api_key")? {
             Some(k) if !k.is_empty() => k,
             _ => {
