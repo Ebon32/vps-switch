@@ -1,0 +1,1475 @@
+use crate::{
+    api::AppState,
+    db::Database,
+    files,
+    models::{HostRecord, LOCAL_HOST_ID},
+    ssh::open_host_channel,
+    terminal::looks_like_interactive_prompt,
+};
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use futures::stream::{self, StreamExt};
+use russh::ChannelMsg;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{io::AsyncBufReadExt, sync::oneshot};
+use uuid::Uuid;
+
+/// 按名称、别名、IP 或 ID 解析主机（彻底告别逼 Agent 查 UUID 编号的痛点）
+pub fn resolve_host(db: &Database, query: &str) -> Result<HostRecord> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err(anyhow!("host 参数不能为空"));
+    }
+    let records = db.list_records()?;
+    let lower = q.to_lowercase();
+
+    if lower == "local" || lower == "本机" || lower == "localhost" || lower == "127.0.0.1" {
+        if let Some(loc) = records.iter().find(|r| r.id == LOCAL_HOST_ID) {
+            return Ok(loc.clone());
+        }
+    }
+
+    // 1. 精确匹配 name（大小写不敏感）或 id
+    if let Some(exact) = records
+        .iter()
+        .find(|r| r.name.eq_ignore_ascii_case(q) || r.id.eq_ignore_ascii_case(q))
+    {
+        return Ok(exact.clone());
+    }
+
+    // 2. 精确匹配 IP / 域名
+    if let Some(by_addr) = records.iter().find(|r| r.addr.eq_ignore_ascii_case(q)) {
+        return Ok(by_addr.clone());
+    }
+
+    // 3. 唯一子串匹配 name
+    let partial: Vec<_> = records
+        .iter()
+        .filter(|r| r.name.to_lowercase().contains(&lower))
+        .collect();
+    if partial.len() == 1 {
+        return Ok(partial[0].clone());
+    }
+
+    let available: Vec<String> = records
+        .iter()
+        .filter(|r| !r.archived)
+        .map(|r| r.name.clone())
+        .collect();
+    Err(anyhow!(
+        "未找到主机「{}」。可用主机名: {}",
+        q,
+        available.join(", ")
+    ))
+}
+
+// ==================== 后台长耗时命令管理器 (ExecTaskManager) ====================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecTaskSnapshot {
+    pub id: String,
+    pub host_id: String,
+    pub host_name: String,
+    pub command: String,
+    pub state: String, // "running" | "completed" | "failed" | "interactive_stall" | "cancelled"
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub stdout: String,
+    pub stderr: String,
+    pub hint: Option<String>,
+    pub started_at: String,
+}
+
+struct ExecTaskInner {
+    id: String,
+    host_id: String,
+    host_name: String,
+    command: String,
+    state: String,
+    exit_code: Option<i32>,
+    started_inst: Instant,
+    ended_ms: Option<u64>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    last_output_inst: Instant,
+    hint: Option<String>,
+    started_at: String,
+    cancel_tx: Option<oneshot::Sender<()>>,
+}
+
+impl ExecTaskInner {
+    fn snapshot(&self) -> ExecTaskSnapshot {
+        let dur = self
+            .ended_ms
+            .unwrap_or_else(|| self.started_inst.elapsed().as_millis() as u64);
+        ExecTaskSnapshot {
+            id: self.id.clone(),
+            host_id: self.host_id.clone(),
+            host_name: self.host_name.clone(),
+            command: self.command.clone(),
+            state: self.state.clone(),
+            exit_code: self.exit_code,
+            duration_ms: dur,
+            stdout: String::from_utf8_lossy(&self.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&self.stderr).to_string(),
+            hint: self.hint.clone(),
+            started_at: self.started_at.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ExecTaskManager {
+    tasks: Mutex<HashMap<String, Arc<Mutex<ExecTaskInner>>>>,
+}
+
+impl ExecTaskManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get_task(&self, task_id: &str) -> Option<ExecTaskSnapshot> {
+        let map = self.tasks.lock().unwrap();
+        map.get(task_id).map(|t| t.lock().unwrap().snapshot())
+    }
+
+    pub fn list_tasks(&self) -> Vec<ExecTaskSnapshot> {
+        let map = self.tasks.lock().unwrap();
+        map.values().map(|t| t.lock().unwrap().snapshot()).collect()
+    }
+
+    pub fn cancel_task(&self, task_id: &str) -> Option<ExecTaskSnapshot> {
+        let arc = self.tasks.lock().unwrap().get(task_id).cloned()?;
+        let mut g = arc.lock().unwrap();
+        if let Some(tx) = g.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+        if g.state == "running" {
+            g.state = "cancelled".to_string();
+            g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+        }
+        Some(g.snapshot())
+    }
+
+    pub async fn exec_with_wait(
+        &self,
+        state: &Arc<AppState>,
+        host: &HostRecord,
+        command: &str,
+        wait_seconds: u64,
+    ) -> Result<ExecTaskSnapshot> {
+        let task_id = format!("exec_{}", Uuid::new_v4());
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+
+        let inner = Arc::new(Mutex::new(ExecTaskInner {
+            id: task_id.clone(),
+            host_id: host.id.clone(),
+            host_name: host.name.clone(),
+            command: command.to_string(),
+            state: "running".to_string(),
+            exit_code: None,
+            started_inst: Instant::now(),
+            ended_ms: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            last_output_inst: Instant::now(),
+            hint: None,
+            started_at: Utc::now().to_rfc3339(),
+            cancel_tx: Some(cancel_tx),
+        }));
+
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), inner.clone());
+
+        let st = state.clone();
+        let host_clone = host.clone();
+        let cmd_str = command.to_string();
+        let inner_bg = inner.clone();
+
+        tokio::spawn(async move {
+            if host_clone.id == LOCAL_HOST_ID {
+                run_local_exec_task(inner_bg, &cmd_str, &mut cancel_rx).await;
+            } else {
+                run_ssh_exec_task(&st, &host_clone, inner_bg, &cmd_str, &mut cancel_rx).await;
+            }
+        });
+
+        let wait_dur = Duration::from_secs(wait_seconds.clamp(1, 120));
+        let deadline = Instant::now() + wait_dur;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            {
+                let mut g = inner.lock().unwrap();
+                if g.state != "running" {
+                    return Ok(g.snapshot());
+                }
+
+                // 交互式提问早退保护：若命令输出末尾停在 [Y/n] / password: 等提问且静默超过 2 秒，立即中断提醒 Agent
+                if g.last_output_inst.elapsed() >= Duration::from_millis(2000)
+                    && (!g.stdout.is_empty() || !g.stderr.is_empty())
+                {
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&g.stdout),
+                        String::from_utf8_lossy(&g.stderr)
+                    );
+                    if let Some(last_line) = combined.lines().rev().find(|l| !l.trim().is_empty()) {
+                        if looks_like_interactive_prompt(last_line) {
+                            if let Some(tx) = g.cancel_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            g.state = "interactive_stall".to_string();
+                            g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+                            g.hint = Some(format!(
+                                "检测到命令停在交互式提问: 「{}」。非交互通道无法输入；请加 -y / DEBIAN_FRONTEND=noninteractive 参数，或改用 vps_terminal 工具（默认无头自动回复 y，遇到隐私密码可设 reveal_ui: true 让用户输入）。",
+                                last_line.trim()
+                            ));
+                            return Ok(g.snapshot());
+                        }
+                    }
+                }
+            }
+
+            if Instant::now() >= deadline {
+                let mut g = inner.lock().unwrap();
+                if g.state == "running" {
+                    g.hint = Some(format!(
+                        "命令运行超过 {} 秒尚未结束，已自动转入后台运行。请使用 vps_task(task_id: \"{}\") 查询后续输出或终止。",
+                        wait_seconds, g.id
+                    ));
+                }
+                return Ok(g.snapshot());
+            }
+        }
+    }
+}
+
+async fn run_local_exec_task(
+    inner: Arc<Mutex<ExecTaskInner>>,
+    cmd: &str,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut child = match tokio::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", cmd])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let mut g = inner.lock().unwrap();
+            g.state = "failed".to_string();
+            g.stderr
+                .extend_from_slice(format!("启动本机 PowerShell 失败: {e}").as_bytes());
+            g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+            return;
+        }
+    };
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut out_buf = [0u8; 4096];
+    let mut err_buf = [0u8; 4096];
+    let mut out_eof = false;
+    let mut err_eof = false;
+
+    loop {
+        if out_eof && err_eof {
+            break;
+        }
+        tokio::select! {
+            _ = &mut *cancel_rx => {
+                let _ = child.kill().await;
+                return;
+            }
+            res = stdout.read(&mut out_buf), if !out_eof => {
+                match res {
+                    Ok(0) | Err(_) => out_eof = true,
+                    Ok(n) => {
+                        let mut g = inner.lock().unwrap();
+                        g.stdout.extend_from_slice(&out_buf[..n]);
+                        g.last_output_inst = Instant::now();
+                    }
+                }
+            }
+            res = stderr.read(&mut err_buf), if !err_eof => {
+                match res {
+                    Ok(0) | Err(_) => err_eof = true,
+                    Ok(n) => {
+                        let mut g = inner.lock().unwrap();
+                        g.stderr.extend_from_slice(&err_buf[..n]);
+                        g.last_output_inst = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+
+    let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+    let mut g = inner.lock().unwrap();
+    g.exit_code = Some(code);
+    g.state = if code == 0 {
+        "completed".to_string()
+    } else {
+        "failed".to_string()
+    };
+    g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+}
+
+async fn run_ssh_exec_task(
+    state: &Arc<AppState>,
+    host: &HostRecord,
+    inner: Arc<Mutex<ExecTaskInner>>,
+    cmd: &str,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) {
+    let mut channel = match open_host_channel(&state.ssh_pool, &state.db, &host.id).await {
+        Ok((_, ch)) => ch,
+        Err(e) => {
+            let mut g = inner.lock().unwrap();
+            g.state = "failed".to_string();
+            g.stderr
+                .extend_from_slice(format!("SSH 连接失败: {e:#}").as_bytes());
+            g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+            return;
+        }
+    };
+
+    if let Err(e) = channel.exec(true, cmd).await {
+        let mut g = inner.lock().unwrap();
+        g.state = "failed".to_string();
+        g.stderr
+            .extend_from_slice(format!("发送 exec 请求失败: {e}").as_bytes());
+        g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+        return;
+    }
+
+    let mut exit_code: Option<i32> = None;
+    loop {
+        tokio::select! {
+            _ = &mut *cancel_rx => {
+                let _ = channel.close().await;
+                return;
+            }
+            msg_opt = channel.wait() => {
+                match msg_opt {
+                    Some(ChannelMsg::Data { data }) => {
+                        let mut g = inner.lock().unwrap();
+                        g.stdout.extend_from_slice(&data);
+                        g.last_output_inst = Instant::now();
+                    }
+                    Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        let mut g = inner.lock().unwrap();
+                        g.stderr.extend_from_slice(&data);
+                        g.last_output_inst = Instant::now();
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        exit_code = Some(exit_status as i32);
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut g = inner.lock().unwrap();
+    if g.state == "running" {
+        let code = exit_code.unwrap_or(0);
+        g.exit_code = Some(code);
+        g.state = if code == 0 {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        };
+        g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+    }
+}
+
+// ==================== MCP JSON-RPC 2.0 协议与 7 大精锐工具定义 ====================
+
+#[derive(Debug, Deserialize)]
+pub struct JsonRpcRequest {
+    #[allow(dead_code)]
+    pub jsonrpc: Option<String>,
+    pub id: Option<Value>,
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+pub fn mcp_tool_definitions() -> Value {
+    json!([
+        {
+            "name": "vps_list",
+            "description": "列出所有托管的 VPS 与本机（直接以主机名标识，无需查 UUID），同时返回每台主机的在线状态、延迟以及已缓存的探针硬件概览（CPU%、Steal% 超售率、内存已用/总量、磁盘已用/总量、BBR 状态）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": {
+                        "type": "boolean",
+                        "description": "是否先并发实时刷新全机队探针快照（默认 false 直接秒回内存缓存）"
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "按角色过滤（primary/project/proxy/relay/test/archive）"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "按主机名称、IP 或标签搜索"
+                    }
+                }
+            }
+        },
+        {
+            "name": "vps_inspect",
+            "description": "对一台或多台 VPS 立即触发实时深度探索（纯内核计数差分），返回精确 CPU%、Steal% 超售率、1/5/15 分钟负载、内存与缓存解剖、全部挂载磁盘容量、主物理网卡实时上下行速率与累计总流量。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "目标主机名（如 'vip-hk'、'lazy-gomami'、'本机'）或 IP"
+                    },
+                    "hosts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "批量并发探索多台主机名列表"
+                    }
+                }
+            }
+        },
+        {
+            "name": "vps_exec",
+            "description": "在一台或多台 VPS 上并发执行非交互式命令（直接传主机名如 'vip-hk'）。若在 wait_seconds 内完成则同步返回 stdout/stderr/exitCode；若超时未完则自动转入后台并返回 taskId；若检测到命令卡在 [Y/n] 等交互提问超过 2 秒会自动早退提醒改用 vps_terminal。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "单台目标主机名（如 'vip-hk'、'lazy-gomami'、'本机'）或 IP"
+                    },
+                    "hosts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "多台目标主机名数组（将并发在所有指定主机上同时执行该命令）"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的命令"
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "description": "同步等待秒数（默认 25，上限 120）；超时后任务继续在后台运行并返回 taskId"
+                    }
+                },
+                "required": ["command"]
+            }
+        },
+        {
+            "name": "vps_terminal",
+            "description": "有状态 PTY 交互式终端工具（基于 Rust alacritty_terminal 真实二维屏幕网格）。默认无头运行（reveal_ui: false），专门用于运行需要交互确认（如输入 yes/[Y/n]、选择安装菜单）的脚本——当脚本停下等待输入时会立即返回 state='waiting_input' 及光标所在行文字，你可以继续调用 send 发送 'y'。当遇到需要用户亲自输入隐私密码（如数据库密码、sudo密码、密钥口令）或人工接手时，设置 reveal_ui=true 或调用 action='reveal'，即可像 Playwright 一样直接将终端弹窗展现在用户界面上。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "目标主机名（如 'vip-hk'、'lazy-gomami'、'本机'）"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["send", "key", "read", "reveal", "close"],
+                        "description": "动作：send(发送命令或交互回答如 'y') / key(发送控制键如 'ctrl+c','enter') / read(读取当前屏幕网格) / reveal(在用户界面唤起并展示该终端供用户输密码或接手) / close(关闭终端)"
+                    },
+                    "input": {
+                        "type": "string",
+                        "description": "action='send' 时要输入的命令或回答文本（默认自动附带回车），或 action='key' 时的按键名（ctrl+c / ctrl+d / ctrl+z / enter / esc / tab / up / down）"
+                    },
+                    "submit": {
+                        "type": "boolean",
+                        "description": "action='send' 时是否在末尾自动发送回车（默认 true）"
+                    },
+                    "reveal_ui": {
+                        "type": "boolean",
+                        "description": "是否将该终端在用户前端界面自动弹出展示（默认 false 无头运行不打扰用户；需要用户亲自输密码或观察时设为 true）"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "唤起界面终端时展示给用户的提示原因（如 '请在终端中输入 MySQL root 密码'）"
+                    },
+                    "wait_ms": {
+                        "type": "integer",
+                        "description": "发送输入后等待屏幕稳定或提问出现的毫秒数（默认 6000）"
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "返回的终端屏幕尾部行数（默认 35）"
+                    },
+                    "pane_id": {
+                        "type": "string",
+                        "description": "可选的指定 paneId（不传则自动复用或创建该主机的主终端）"
+                    }
+                },
+                "required": ["host", "action"]
+            }
+        },
+        {
+            "name": "vps_fs",
+            "description": "统一本机与远端 SFTP 文件系统操作：列目录(list)、读文本文件(read)、写文本/配置文件(write)、新建目录(mkdir)、重命名(rename)、删除(remove)、打包压缩(compress)、解压归档(extract)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "目标主机名（如 'vip-hk'、'本机'）"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "read", "write", "mkdir", "rename", "remove", "compress", "extract"],
+                        "description": "文件操作类型"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "目标文件或目录路径"
+                    },
+                    "new_path": {
+                        "type": "string",
+                        "description": "action='rename' 时的目标新路径"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "action='write' 时写入的完整 UTF-8 文本内容"
+                    },
+                    "is_dir": {
+                        "type": "boolean",
+                        "description": "action='remove' 时是否为目录"
+                    }
+                },
+                "required": ["host", "action", "path"]
+            }
+        },
+        {
+            "name": "vps_transfer",
+            "description": "满速流式文件传输引擎（16MiB 通道窗口 + 64 路并发 SFTP 流水线 + 12 秒无推进失速看门狗）。支持三种方向：upload（本机路径 -> 远端路径）、download（远端路径 -> 本机路径）、cross（源 VPS 路径 -> 目标 VPS 路径，内存直传不落本机硬盘）。无需分片或 base64，一次调用直接完成。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["upload", "download", "cross"],
+                        "description": "upload(本机上传到VPS) / download(从VPS下载到本机) / cross(从一台VPS直接传到另一台VPS)"
+                    },
+                    "host": {
+                        "type": "string",
+                        "description": "upload 或 download 时的目标 VPS 主机名"
+                    },
+                    "local_path": {
+                        "type": "string",
+                        "description": "upload 或 download 时的本机文件完整路径"
+                    },
+                    "remote_path": {
+                        "type": "string",
+                        "description": "upload 或 download 时的远端 VPS 文件或目录路径"
+                    },
+                    "source_host": {
+                        "type": "string",
+                        "description": "direction='cross' 时的源 VPS 主机名"
+                    },
+                    "source_path": {
+                        "type": "string",
+                        "description": "direction='cross' 时的源 VPS 文件路径"
+                    },
+                    "target_host": {
+                        "type": "string",
+                        "description": "direction='cross' 时的目标 VPS 主机名"
+                    },
+                    "target_path": {
+                        "type": "string",
+                        "description": "direction='cross' 时的目标 VPS 文件或目录路径"
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "description": "同步等待秒数（默认 25）；超大文件若超时未传完则转入后台并返回 transferId"
+                    }
+                },
+                "required": ["direction"]
+            }
+        },
+        {
+            "name": "vps_task",
+            "description": "查询或取消正在后台运行的命令任务（exec_...）或大文件传输任务（tr_...）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get", "list", "cancel"],
+                        "description": "get(查询单个任务) / list(列出所有任务) / cancel(取消运行中的命令任务)"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "exec_... 或 tr_... 任务 ID"
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    ])
+}
+
+pub async fn handle_mcp_request(
+    state: &Arc<AppState>,
+    exec_tasks: &Arc<ExecTaskManager>,
+    req: JsonRpcRequest,
+) -> Option<Value> {
+    let id = req.id.clone();
+    match req.method.as_str() {
+        "notifications/initialized" | "notifications/cancelled" => None,
+        "initialize" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "vps-switch",
+                    "version": "0.1.0"
+                }
+            }
+        })),
+        "ping" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        })),
+        "tools/list" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "tools": mcp_tool_definitions()
+            }
+        })),
+        "tools/call" => {
+            let tool_name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args = req
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            match dispatch_tool_call(state, exec_tasks, tool_name, args).await {
+                Ok(val) => {
+                    let text = serde_json::to_string_pretty(&val).unwrap_or_default();
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": false
+                        }
+                    }))
+                }
+                Err(err) => {
+                    let text = json!({
+                        "ok": false,
+                        "error": format!("{err:#}")
+                    })
+                    .to_string();
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": true
+                        }
+                    }))
+                }
+            }
+        }
+        _ => Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("Method not found: {}", req.method)
+            }
+        })),
+    }
+}
+
+async fn dispatch_tool_call(
+    state: &Arc<AppState>,
+    exec_tasks: &Arc<ExecTaskManager>,
+    name: &str,
+    args: Value,
+) -> Result<Value> {
+    match name {
+        "vps_list" => tool_vps_list(state, args).await,
+        "vps_inspect" => tool_vps_inspect(state, args).await,
+        "vps_exec" => tool_vps_exec(state, exec_tasks, args).await,
+        "vps_terminal" => tool_vps_terminal(state, args).await,
+        "vps_fs" => tool_vps_fs(state, args).await,
+        "vps_transfer" => tool_vps_transfer(state, args).await,
+        "vps_task" => tool_vps_task(state, exec_tasks, args).await,
+        _ => Err(anyhow!("未知的 MCP 工具: {name}")),
+    }
+}
+
+async fn tool_vps_list(state: &Arc<AppState>, args: Value) -> Result<Value> {
+    let refresh = args.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
+    let role_filter = args.get("role").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let search_q = args
+        .get("search")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+
+    if refresh {
+        let records = state.db.list_records()?;
+        let active: Vec<_> = records.into_iter().filter(|r| !r.archived).collect();
+        stream::iter(active)
+            .for_each_concurrent(8, |rec| {
+                let st = state.clone();
+                async move {
+                    let _ = st
+                        .inspector
+                        .inspect_host(&st.ssh_pool, &st.db, &rec.id)
+                        .await;
+                }
+            })
+            .await;
+    }
+
+    let hosts = state.db.list_public_hosts()?;
+    let snaps = state.inspector.get_all_cached();
+
+    let mut out = Vec::new();
+    for h in hosts {
+        if h.archived {
+            continue;
+        }
+        if !role_filter.is_empty() && h.role.as_deref() != Some(role_filter) {
+            continue;
+        }
+        if !search_q.is_empty() {
+            let hay = format!(
+                "{} {} {} {}",
+                h.name,
+                h.addr,
+                h.os_info
+                    .as_ref()
+                    .and_then(|o| o.pretty_name.as_deref())
+                    .unwrap_or(""),
+                h.tags.join(" ")
+            )
+            .to_lowercase();
+            if !hay.contains(&search_q) {
+                continue;
+            }
+        }
+
+        let snap = snaps.get(&h.id);
+        out.push(json!({
+            "name": h.name,
+            "status": h.status,
+            "latencyMs": h.latency_ms,
+            "address": if h.kind == "local" { "127.0.0.1".to_string() } else { format!("{}:{}", h.addr, h.port) },
+            "username": h.username,
+            "os": h.os_info.as_ref().and_then(|o| o.pretty_name.clone()),
+            "role": h.role,
+            "tags": h.tags,
+            "viaJump": h.jump_host_name,
+            "metrics": snap.map(|s| json!({
+                "cpuUsagePct": s.cpu_usage_pct,
+                "cpuStealPct": s.cpu_steal_pct,
+                "load1": s.load_1,
+                "memUsedMB": s.mem_used_bytes / 1024 / 1024,
+                "memTotalMB": s.mem_total_bytes / 1024 / 1024,
+                "diskUsedGB": ((s.disk_used_bytes as f64 / 1073741824.0) * 10.0).round() / 10.0,
+                "diskTotalGB": ((s.disk_total_bytes as f64 / 1073741824.0) * 10.0).round() / 10.0,
+                "tcpCc": s.tcp_cc,
+            })),
+        }));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "note": "所有工具均支持直接传 name（如 'vip-hk'、'lazy-gomami'、'本机'）定位主机，无需使用内部 ID。",
+        "total": out.len(),
+        "hosts": out,
+    }))
+}
+
+async fn tool_vps_inspect(state: &Arc<AppState>, args: Value) -> Result<Value> {
+    let mut target_queries: Vec<String> = Vec::new();
+    if let Some(h) = args.get("host").and_then(|v| v.as_str()) {
+        if !h.trim().is_empty() {
+            target_queries.push(h.trim().to_string());
+        }
+    }
+    if let Some(arr) = args.get("hosts").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                if !s.trim().is_empty() {
+                    target_queries.push(s.trim().to_string());
+                }
+            }
+        }
+    }
+    if target_queries.is_empty() {
+        return Err(anyhow!("请提供 host 或 hosts 参数"));
+    }
+
+    let mut resolved = Vec::new();
+    for q in target_queries {
+        resolved.push(resolve_host(&state.db, &q)?);
+    }
+
+    let results: Vec<Value> = stream::iter(resolved)
+        .map(|rec| {
+            let st = state.clone();
+            async move {
+                match st
+                    .inspector
+                    .inspect_host(&st.ssh_pool, &st.db, &rec.id)
+                    .await
+                {
+                    Ok(ins) => json!({
+                        "host": rec.name,
+                        "ok": true,
+                        "inspection": ins,
+                    }),
+                    Err(e) => json!({
+                        "host": rec.name,
+                        "ok": false,
+                        "error": format!("{e:#}"),
+                    }),
+                }
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+
+    Ok(json!({
+        "ok": true,
+        "results": results,
+    }))
+}
+
+async fn tool_vps_exec(
+    state: &Arc<AppState>,
+    exec_tasks: &Arc<ExecTaskManager>,
+    args: Value,
+) -> Result<Value> {
+    let command = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("command 参数不能为空"))?
+        .to_string();
+    let wait_seconds = args
+        .get("wait_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(25);
+
+    let mut host_queries = Vec::new();
+    if let Some(h) = args.get("host").and_then(|v| v.as_str()) {
+        if !h.trim().is_empty() {
+            host_queries.push(h.trim().to_string());
+        }
+    }
+    if let Some(arr) = args.get("hosts").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                if !s.trim().is_empty() {
+                    host_queries.push(s.trim().to_string());
+                }
+            }
+        }
+    }
+    if host_queries.is_empty() {
+        return Err(anyhow!("请提供 host 或 hosts 参数（直接传主机名，如 'vip-hk'）"));
+    }
+
+    let mut targets = Vec::new();
+    for q in host_queries {
+        targets.push(resolve_host(&state.db, &q)?);
+    }
+
+    if targets.len() == 1 {
+        let snap = exec_tasks
+            .exec_with_wait(state, &targets[0], &command, wait_seconds)
+            .await?;
+        return Ok(json!({
+            "ok": snap.state == "completed" || snap.state == "running",
+            "result": snap,
+        }));
+    }
+
+    let results: Vec<ExecTaskSnapshot> = stream::iter(targets)
+        .map(|rec| {
+            let st = state.clone();
+            let et = exec_tasks.clone();
+            let cmd = command.clone();
+            async move {
+                et.exec_with_wait(&st, &rec, &cmd, wait_seconds)
+                    .await
+                    .unwrap_or_else(|e| ExecTaskSnapshot {
+                        id: String::new(),
+                        host_id: rec.id,
+                        host_name: rec.name,
+                        command: cmd,
+                        state: "failed".to_string(),
+                        exit_code: Some(-1),
+                        duration_ms: 0,
+                        stdout: String::new(),
+                        stderr: format!("{e:#}"),
+                        hint: None,
+                        started_at: Utc::now().to_rfc3339(),
+                    })
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+
+    Ok(json!({
+        "ok": true,
+        "results": results,
+    }))
+}
+
+async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> {
+    let host_q = args
+        .get("host")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("缺少 host 参数"))?;
+    let host = resolve_host(&state.db, host_q)?;
+
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("read");
+    let reveal_ui = args
+        .get("reveal_ui")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(action == "reveal");
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let max_lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(35) as usize;
+    let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(6000);
+
+    let pane_id_arg = args.get("pane_id").and_then(|v| v.as_str());
+
+    if action == "close" {
+        if let Some(pid) = pane_id_arg {
+            state.terminals.close_pane(pid);
+        } else if let Some(pane) = state.terminals.find_active_pane_for_host(&host.id) {
+            state.terminals.close_pane(&pane.id);
+        }
+        return Ok(json!({ "ok": true, "host": host.name, "closed": true }));
+    }
+
+    // 查找或自动创建该主机的终端会话（默认 headless=true 无头运行，除非 reveal_ui=true）
+    let pane = if let Some(pid) = pane_id_arg {
+        state
+            .terminals
+            .get_pane(pid)
+            .ok_or_else(|| anyhow!("指定的终端 pane 不存在: {pid}"))?
+    } else if let Some(existing) = state.terminals.find_active_pane_for_host(&host.id) {
+        existing
+    } else {
+        let created = state
+            .terminals
+            .create_pane(
+                &state.ssh_pool,
+                &state.db,
+                &host.id,
+                100,
+                30,
+                None,
+                !reveal_ui,
+            )
+            .await?;
+        let handle = state
+            .terminals
+            .get_pane(&created.id)
+            .ok_or_else(|| anyhow!("创建终端后获取句柄失败"))?;
+        // 等待远端初始 shell 提示符就绪
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        handle
+    };
+
+    if reveal_ui {
+        state.terminals.reveal_pane_in_ui(&pane.id, reason.clone());
+    }
+
+    let snap = match action {
+        "reveal" | "read" => pane.read_screen_snapshot(max_lines),
+        "send" => {
+            let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+            let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(true);
+            let mut bytes = input.as_bytes().to_vec();
+            if submit {
+                bytes.push(b'\r');
+            }
+            pane.send_and_wait(bytes, max_lines, wait_ms).await
+        }
+        "key" => {
+            let key_name = args
+                .get("input")
+                .and_then(|v| v.as_str())
+                .unwrap_or("enter")
+                .to_lowercase();
+            let bytes: Vec<u8> = match key_name.as_str() {
+                "ctrl+c" | "c-c" | "sigint" => vec![0x03],
+                "ctrl+d" | "c-d" | "eof" => vec![0x04],
+                "ctrl+z" | "c-z" => vec![0x1a],
+                "ctrl+l" | "c-l" => vec![0x0c],
+                "enter" | "return" => vec![b'\r'],
+                "esc" | "escape" => vec![0x1b],
+                "tab" => vec![b'\t'],
+                "space" => vec![b' '],
+                "up" => b"\x1b[A".to_vec(),
+                "down" => b"\x1b[B".to_vec(),
+                "right" => b"\x1b[C".to_vec(),
+                "left" => b"\x1b[D".to_vec(),
+                other => other.as_bytes().to_vec(),
+            };
+            pane.send_and_wait(bytes, max_lines, wait_ms).await
+        }
+        other => return Err(anyhow!("未知的 vps_terminal action: {other}")),
+    };
+
+    Ok(json!({
+        "ok": true,
+        "host": host.name,
+        "revealedInUi": !snap.headless,
+        "terminal": snap,
+    }))
+}
+
+async fn tool_vps_fs(state: &Arc<AppState>, args: Value) -> Result<Value> {
+    let host_q = args
+        .get("host")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("缺少 host 参数"))?;
+    let host = resolve_host(&state.db, host_q)?;
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("缺少 action 参数"))?;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+    match action {
+        "list" => {
+            let listing = files::list_dir(&state.ssh_pool, &state.db, &host.id, Some(path), false).await?;
+            Ok(json!({
+                "ok": true,
+                "host": host.name,
+                "path": listing.path,
+                "parent": listing.parent,
+                "items": listing.items,
+            }))
+        }
+        "read" => {
+            let res = files::read_text_file(&state.ssh_pool, &state.db, &host.id, path).await?;
+            Ok(json!({
+                "ok": true,
+                "host": host.name,
+                "path": res.path,
+                "size": res.size,
+                "content": res.content,
+            }))
+        }
+        "write" => {
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("write 操作需要 content 参数"))?;
+            let size =
+                files::write_text_file(&state.ssh_pool, &state.db, &host.id, path, content).await?;
+            Ok(json!({
+                "ok": true,
+                "host": host.name,
+                "path": path,
+                "size": size,
+            }))
+        }
+        "mkdir" => {
+            files::create_dir(&state.ssh_pool, &state.db, &host.id, path).await?;
+            Ok(json!({ "ok": true, "host": host.name, "path": path }))
+        }
+        "rename" => {
+            let new_path = args
+                .get("new_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("rename 操作需要 new_path 参数"))?;
+            files::rename_item(&state.ssh_pool, &state.db, &host.id, path, new_path).await?;
+            Ok(json!({ "ok": true, "host": host.name, "oldPath": path, "newPath": new_path }))
+        }
+        "remove" => {
+            let is_dir = args.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
+            files::remove_item(&state.ssh_pool, &state.db, &host.id, path, is_dir).await?;
+            Ok(json!({ "ok": true, "host": host.name, "removed": path }))
+        }
+        "compress" => {
+            let out = files::compress_item(&state.ssh_pool, &state.db, &host.id, path).await?;
+            Ok(json!({ "ok": true, "host": host.name, "archivePath": out }))
+        }
+        "extract" => {
+            let out = files::extract_item(&state.ssh_pool, &state.db, &host.id, path).await?;
+            Ok(json!({ "ok": true, "host": host.name, "extractedPath": out }))
+        }
+        other => Err(anyhow!("未知的 vps_fs action: {other}")),
+    }
+}
+
+async fn tool_vps_transfer(state: &Arc<AppState>, args: Value) -> Result<Value> {
+    let direction = args
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("缺少 direction 参数 (upload | download | cross)"))?;
+    let wait_seconds = args
+        .get("wait_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(25)
+        .clamp(2, 120);
+
+    if direction == "cross" {
+        let src_q = args
+            .get("source_host")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("cross 模式需要 source_host"))?;
+        let dst_q = args
+            .get("target_host")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("cross 模式需要 target_host"))?;
+        let src_path = args
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("cross 模式需要 source_path"))?
+            .to_string();
+        let dst_path = args
+            .get("target_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("cross 模式需要 target_path"))?
+            .to_string();
+
+        let src_host = resolve_host(&state.db, src_q)?;
+        let dst_host = resolve_host(&state.db, dst_q)?;
+        let st = state.clone();
+
+        let fut = files::transfer_remote_to_remote(
+            &st.ssh_pool,
+            &st.db,
+            &st.transfers,
+            &src_host.id,
+            &src_path,
+            &dst_host.id,
+            &dst_path,
+        );
+        match tokio::time::timeout(Duration::from_secs(wait_seconds), fut).await {
+            Ok(res) => {
+                let task = res?;
+                return Ok(json!({ "ok": true, "transfer": task }));
+            }
+            Err(_) => {
+                let latest = state.transfers.list_tasks(Some(&dst_host.id));
+                return Ok(json!({
+                    "ok": true,
+                    "state": "running_in_background",
+                    "transfer": latest.first(),
+                    "hint": "大文件仍在高速传输中，可用 vps_task 查询实时进度与速率。"
+                }));
+            }
+        }
+    }
+
+    let host_q = args
+        .get("host")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("缺少 host 参数"))?;
+    let host = resolve_host(&state.db, host_q)?;
+    let local_path = args
+        .get("local_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("缺少 local_path 参数"))?
+        .to_string();
+    let remote_path = args
+        .get("remote_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("缺少 remote_path 参数"))?
+        .to_string();
+
+    let st = state.clone();
+    let dir_str = direction.to_string();
+    let hid = host.id.clone();
+    let handle = tokio::spawn(async move {
+        files::transfer_local_remote_file(
+            &st.ssh_pool,
+            &st.db,
+            &st.transfers,
+            &hid,
+            &dir_str,
+            &local_path,
+            &remote_path,
+        )
+        .await
+    });
+
+    match tokio::time::timeout(Duration::from_secs(wait_seconds), handle).await {
+        Ok(join_res) => {
+            let task = join_res??;
+            Ok(json!({
+                "ok": true,
+                "host": host.name,
+                "transfer": task,
+            }))
+        }
+        Err(_) => {
+            let latest = state.transfers.list_tasks(Some(&host.id));
+            Ok(json!({
+                "ok": true,
+                "host": host.name,
+                "state": "running_in_background",
+                "transfer": latest.first(),
+                "hint": "大文件仍在后台满速传输中，请用 vps_task 查询进度（若连续 12 秒无字节推进将由看门狗自动中断报错）。"
+            }))
+        }
+    }
+}
+
+async fn tool_vps_task(
+    state: &Arc<AppState>,
+    exec_tasks: &Arc<ExecTaskManager>,
+    args: Value,
+) -> Result<Value> {
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+    let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+
+    match action {
+        "get" => {
+            if task_id.starts_with("exec_") {
+                let t = exec_tasks
+                    .get_task(task_id)
+                    .ok_or_else(|| anyhow!("未找到命令任务: {task_id}"))?;
+                Ok(json!({ "ok": true, "task": t }))
+            } else {
+                let t = state
+                    .transfers
+                    .list_tasks(None)
+                    .into_iter()
+                    .find(|x| x.id == task_id)
+                    .ok_or_else(|| anyhow!("未找到传输任务: {task_id}"))?;
+                Ok(json!({ "ok": true, "transfer": t }))
+            }
+        }
+        "cancel" => {
+            let t = exec_tasks
+                .cancel_task(task_id)
+                .ok_or_else(|| anyhow!("未找到可取消的命令任务: {task_id}"))?;
+            Ok(json!({ "ok": true, "task": t }))
+        }
+        _ => Ok(json!({
+            "ok": true,
+            "execTasks": exec_tasks.list_tasks(),
+            "transfers": state.transfers.list_tasks(None),
+        })),
+    }
+}
+
+/// `--mcp-stdio` 本地模式：若 127.0.0.1:3302 主进程正在运行则直接桥接过去（与桌面 UI 共享连接池、探针缓存和终端唤起事件），
+/// 若主进程未运行则在当前进程内直接处理。
+pub async fn run_stdio_bridge(state: Arc<AppState>, exec_tasks: Arc<ExecTaskManager>, port: u16) -> Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut lines = tokio::io::BufReader::new(stdin).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(req) = serde_json::from_str::<JsonRpcRequest>(trimmed) else {
+            continue;
+        };
+
+        // 优先尝试转发给已运行的常驻 UI 主进程（以便共享 SshPool 与 UI 终端弹窗联动）
+        if let Some(resp_str) = try_forward_to_daemon(port, trimmed).await {
+            if !resp_str.trim().is_empty() {
+                println!("{}", resp_str.trim());
+            }
+            continue;
+        }
+
+        if let Some(resp) = handle_mcp_request(&state, &exec_tasks, req).await {
+            println!("{}", serde_json::to_string(&resp)?);
+        }
+    }
+    Ok(())
+}
+
+async fn try_forward_to_daemon(port: u16, raw_json: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = tokio::time::timeout(
+        Duration::from_millis(80),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let req_bytes = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-vps-switch-stdio: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        raw_json.len(),
+        raw_json
+    );
+    stream.write_all(req_bytes.as_bytes()).await.ok()?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.ok()?;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let (_, body) = resp_str.split_once("\r\n\r\n")?;
+    Some(body.trim().to_string())
+}
+
+// ==================== 自动写入 Claude Code (~/.claude.json) 与 Codex (~/.codex/config.toml) ====================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliSyncStatus {
+    pub exe_path: String,
+    pub port: u16,
+    pub claude_code_path: String,
+    pub claude_code_synced: bool,
+    pub codex_path: String,
+    pub codex_synced: bool,
+}
+
+fn user_home_dir() -> Option<std::path::PathBuf> {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+pub fn sync_cli_mcp_configs(port: u16) -> CliSyncStatus {
+    let exe_path = std::env::current_exe()
+        .ok()
+        .map(|p| {
+            let s = p.to_string_lossy().to_string();
+            s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+        })
+        .unwrap_or_else(|| "vps-switch".to_string());
+
+    let home = user_home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let claude_path = home.join(".claude.json");
+    let codex_path = home.join(".codex").join("config.toml");
+
+    let claude_ok = sync_claude_json(&claude_path, &exe_path).unwrap_or(false);
+    let codex_ok = sync_codex_toml(&codex_path, &exe_path).unwrap_or(false);
+
+    CliSyncStatus {
+        exe_path,
+        port,
+        claude_code_path: claude_path.to_string_lossy().to_string(),
+        claude_code_synced: claude_ok,
+        codex_path: codex_path.to_string_lossy().to_string(),
+        codex_synced: codex_ok,
+    }
+}
+
+fn sync_claude_json(claude_path: &std::path::Path, exe_path: &str) -> Result<bool> {
+    if !claude_path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(claude_path)?;
+    let mut root: Value = serde_json::from_str(&raw)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+
+    let desired = json!({
+        "type": "stdio",
+        "command": exe_path,
+        "args": ["--mcp-stdio"]
+    });
+
+    let mcp_servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}));
+    if let Some(servers_obj) = mcp_servers.as_object_mut() {
+        if servers_obj.get("vps-switch") == Some(&desired) {
+            return Ok(true);
+        }
+        servers_obj.insert("vps-switch".to_string(), desired);
+    }
+
+    let tmp_path = claude_path.with_extension("json.vps-switch-tmp");
+    std::fs::write(&tmp_path, serde_json::to_string_pretty(&root)?)?;
+    std::fs::rename(&tmp_path, claude_path)?;
+    Ok(true)
+}
+
+fn sync_codex_toml(codex_path: &std::path::Path, exe_path: &str) -> Result<bool> {
+    if !codex_path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(codex_path)?;
+    let posix_exe = exe_path.replace('\\', "/");
+    let desired_block = format!(
+        "[mcp_servers.vps-switch]\ncommand = \"{}\"\nargs = [\"--mcp-stdio\"]",
+        posix_exe
+    );
+
+    if raw.contains(&desired_block) {
+        return Ok(true);
+    }
+
+    let updated = if let Some(start_idx) = raw.find("[mcp_servers.vps-switch]") {
+        let after_header = start_idx + "[mcp_servers.vps-switch]".len();
+        let next_section_rel = raw[after_header..].find("\n[");
+        match next_section_rel {
+            Some(rel) => {
+                let end_idx = after_header + rel;
+                format!("{}{}{}", &raw[..start_idx], desired_block, &raw[end_idx..])
+            }
+            None => format!("{}{}\n", &raw[..start_idx], desired_block),
+        }
+    } else {
+        let mut s = raw;
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push('\n');
+        s.push_str(&desired_block);
+        s.push('\n');
+        s
+    };
+
+    let tmp_path = codex_path.with_extension("toml.vps-switch-tmp");
+    std::fs::write(&tmp_path, updated)?;
+    std::fs::rename(&tmp_path, codex_path)?;
+    Ok(true)
+}

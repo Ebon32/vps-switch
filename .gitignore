@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Tauri
+/src-tauri/target
+/src-tauri/gen
+
+# Node / 前端
+node_modules/
+/frontend/dist
+
+# 运行态与本地数据
+/data
+*.log
+.env
+.env.local
+.playwright-mcp/
+conpty.dll
+OpenConsole.exe
+
+# 系统
+.DS_Store
+Thumbs.db

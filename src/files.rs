@@ -1,0 +1,1061 @@
+use crate::{
+    db::Database,
+    models::LOCAL_HOST_ID,
+    ssh::SshPool,
+};
+use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
+use russh_sftp::{client::SftpSession, protocol::OpenFlags};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Instant, UNIX_EPOCH},
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use uuid::Uuid;
+
+const MAX_TEXT_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+/// 流式读写块大小：1 MiB（喂给 russh-sftp 内部自动切分为 64 路 255KiB 并发流水线）
+const STREAM_BUF_SIZE: usize = 1024 * 1024;
+/// 失速看门狗超时：若连续 12 秒没有任何新字节推进，立即判定链路僵死并强制中断，防止拖死 Agent
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+    pub permissions: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirListing {
+    pub path: String,
+    pub parent: Option<String>,
+    pub items: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileReadResult {
+    pub path: String,
+    pub content: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferTask {
+    pub id: String,
+    pub host_id: String,
+    pub host_name: String,
+    pub direction: String, // "upload" | "download"
+    pub filename: String,
+    pub local_path: Option<String>,
+    pub remote_path: String,
+    pub total_bytes: u64,
+    pub transferred_bytes: u64,
+    pub speed_bps: u64,
+    pub state: String, // "running" | "completed" | "failed"
+    pub error: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+
+/// 统一传输队列管理器（Web UI 与未来板块六 MCP 工具共用同一套传输状态与引擎）
+#[derive(Default)]
+pub struct TransferManager {
+    tasks: Mutex<HashMap<String, TransferTask>>,
+    order: Mutex<Vec<String>>,
+}
+
+impl TransferManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn create_task(
+        &self,
+        host_id: &str,
+        host_name: &str,
+        direction: &str,
+        filename: &str,
+        local_path: Option<String>,
+        remote_path: &str,
+        total_bytes: u64,
+    ) -> String {
+        let id = format!("tr_{}", Uuid::new_v4());
+        let task = TransferTask {
+            id: id.clone(),
+            host_id: host_id.to_string(),
+            host_name: host_name.to_string(),
+            direction: direction.to_string(),
+            filename: filename.to_string(),
+            local_path,
+            remote_path: remote_path.to_string(),
+            total_bytes,
+            transferred_bytes: 0,
+            speed_bps: 0,
+            state: "running".to_string(),
+            error: None,
+            started_at: Utc::now().to_rfc3339(),
+            ended_at: None,
+        };
+        self.tasks.lock().unwrap().insert(id.clone(), task);
+        let mut ord = self.order.lock().unwrap();
+        ord.insert(0, id.clone());
+        if ord.len() > 100 {
+            if let Some(old_id) = ord.pop() {
+                self.tasks.lock().unwrap().remove(&old_id);
+            }
+        }
+        id
+    }
+
+    pub fn update_progress(&self, id: &str, transferred: u64, total: u64, elapsed_secs: f64) {
+        if let Some(task) = self.tasks.lock().unwrap().get_mut(id) {
+            task.transferred_bytes = transferred;
+            if total > 0 {
+                task.total_bytes = total;
+            }
+            if elapsed_secs > 0.05 {
+                task.speed_bps = (transferred as f64 / elapsed_secs) as u64;
+            }
+        }
+    }
+
+    pub fn finish_task(&self, id: &str, final_bytes: u64, elapsed_secs: f64) {
+        if let Some(task) = self.tasks.lock().unwrap().get_mut(id) {
+            task.transferred_bytes = final_bytes;
+            if task.total_bytes == 0 {
+                task.total_bytes = final_bytes;
+            }
+            if elapsed_secs > 0.01 {
+                task.speed_bps = (final_bytes as f64 / elapsed_secs) as u64;
+            }
+            task.state = "completed".to_string();
+            task.ended_at = Some(Utc::now().to_rfc3339());
+        }
+    }
+
+    pub fn fail_task(&self, id: &str, err_msg: impl ToString) {
+        if let Some(task) = self.tasks.lock().unwrap().get_mut(id) {
+            task.state = "failed".to_string();
+            task.error = Some(err_msg.to_string());
+            task.ended_at = Some(Utc::now().to_rfc3339());
+        }
+    }
+
+    pub fn list_tasks(&self, host_id: Option<&str>) -> Vec<TransferTask> {
+        let ord = self.order.lock().unwrap().clone();
+        let map = self.tasks.lock().unwrap();
+        ord.into_iter()
+            .filter_map(|id| map.get(&id).cloned())
+            .filter(|t| host_id.map(|h| t.host_id == h).unwrap_or(true))
+            .collect()
+    }
+
+    pub fn clear_finished(&self) {
+        let mut map = self.tasks.lock().unwrap();
+        let mut ord = self.order.lock().unwrap();
+        map.retain(|_, t| t.state == "running");
+        ord.retain(|id| map.contains_key(id));
+    }
+}
+
+// ==================== 统一目录浏览与文件操作（本机 + 远端 SFTP） ====================
+
+pub async fn list_dir(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    dir_path: Option<&str>,
+    force_refresh: bool,
+) -> Result<DirListing> {
+    if host_id == LOCAL_HOST_ID {
+        return list_local_dir(dir_path).await;
+    }
+
+    let req_key = dir_path.unwrap_or("").trim();
+    if !force_refresh {
+        if let Some(cached) = pool
+            .get_cached_dir(host_id, req_key, std::time::Duration::from_secs(45))
+            .await
+        {
+            return Ok(cached);
+        }
+    }
+
+    let res = match list_remote_dir_once(pool, db, host_id, dir_path).await {
+        Ok(r) => r,
+        Err(_) => {
+            pool.invalidate_sftp(host_id).await;
+            list_remote_dir_once(pool, db, host_id, dir_path).await?
+        }
+    };
+    pool.put_cached_dir(host_id, req_key, &res).await;
+    Ok(res)
+}
+
+async fn list_local_dir(dir_path: Option<&str>) -> Result<DirListing> {
+    let raw = dir_path.unwrap_or("").trim();
+
+    // Windows 顶层虚拟根目录 "drives"（此电脑）：列出 C:/ D:/ E:/ 等全部可用盘符
+    if raw.eq_ignore_ascii_case("drives") || raw == "/" || raw == "\\" {
+        let mut drives = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let drive_str = format!("{}:/", letter as char);
+            let p = PathBuf::from(&drive_str);
+            if tokio::fs::metadata(&p).await.is_ok() {
+                drives.push(FileEntry {
+                    name: format!("本地磁盘 ({}:)", letter as char),
+                    path: drive_str,
+                    is_dir: true,
+                    size: 0,
+                    mtime: 0,
+                    permissions: None,
+                });
+            }
+        }
+        return Ok(DirListing {
+            path: "drives".to_string(),
+            parent: None,
+            items: drives,
+        });
+    }
+
+    let target: PathBuf = if raw.is_empty() || raw == "~" {
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("C:/"))
+    } else if raw.len() == 2 && raw.as_bytes()[1] == b':' {
+        PathBuf::from(format!("{raw}/"))
+    } else {
+        PathBuf::from(raw)
+    };
+
+    let canonical = tokio::fs::canonicalize(&target).await.unwrap_or(target);
+    let clean_path = strip_verbatim_prefix(&canonical);
+
+    let mut rd = tokio::fs::read_dir(&clean_path)
+        .await
+        .with_context(|| format!("读取本机目录失败: {}", clean_path.display()))?;
+
+    let mut items = Vec::new();
+    while let Some(entry) = rd.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let full = entry.path();
+        let meta = tokio::fs::metadata(&full).await.ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        items.push(FileEntry {
+            name,
+            path: full.to_string_lossy().replace('\\', "/"),
+            is_dir,
+            size,
+            mtime,
+            permissions: None,
+        });
+    }
+
+    sort_file_entries(&mut items);
+
+    let norm_path = clean_path.to_string_lossy().replace('\\', "/");
+    // 若当前已经是某个盘符根目录（如 C:/ 或 D:/），其 parent 指向 "drives"（此电脑盘符列表）
+    let is_drive_root = norm_path.len() <= 3 && norm_path.ends_with(":/");
+    let parent = if is_drive_root {
+        Some("drives".to_string())
+    } else {
+        clean_path
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty() && p != &norm_path)
+            .or_else(|| Some("drives".to_string()))
+    };
+
+    Ok(DirListing {
+        path: norm_path,
+        parent,
+        items,
+    })
+}
+
+fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p.to_path_buf()
+    }
+}
+
+async fn list_remote_dir_once(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    dir_path: Option<&str>,
+) -> Result<DirListing> {
+    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    let raw = dir_path.unwrap_or("").trim();
+
+    let resolved = if raw.is_empty() || raw == "~" || raw == "." {
+        pool.get_home_dir(&sftp, host_id).await
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        let home = pool.get_home_dir(&sftp, host_id).await;
+        join_remote_path(&home, rest)
+    } else if raw.len() > 1 {
+        raw.trim_end_matches('/').to_string()
+    } else {
+        raw.to_string()
+    };
+
+    let read_dir = sftp
+        .read_dir(&resolved)
+        .await
+        .with_context(|| format!("SFTP 读取目录失败: {resolved}"))?;
+
+    let mut items = Vec::new();
+    for entry in read_dir {
+        let name = entry.file_name();
+        let meta = entry.metadata();
+        let is_dir = meta.is_dir();
+        let size = meta.size.unwrap_or(0);
+        let mtime = meta.mtime.map(|m| (m as i64) * 1000).unwrap_or(0);
+        let permissions = meta.permissions;
+        let item_path = join_remote_path(&resolved, &name);
+
+        items.push(FileEntry {
+            name,
+            path: item_path,
+            is_dir,
+            size,
+            mtime,
+            permissions,
+        });
+    }
+
+    sort_file_entries(&mut items);
+
+    let parent = if resolved == "/" {
+        None
+    } else {
+        match resolved.rfind('/') {
+            Some(0) => Some("/".to_string()),
+            Some(idx) => Some(resolved[..idx].to_string()),
+            None => None,
+        }
+    };
+
+    Ok(DirListing {
+        path: resolved,
+        parent,
+        items,
+    })
+}
+
+fn sort_file_entries(items: &mut [FileEntry]) {
+    items.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+pub fn join_remote_path(dir: &str, name: &str) -> String {
+    let clean_dir = dir.trim_end_matches('/');
+    let clean_name = name.trim_start_matches('/');
+    if clean_dir.is_empty() || clean_dir == "/" {
+        format!("/{clean_name}")
+    } else {
+        format!("{clean_dir}/{clean_name}")
+    }
+}
+
+pub async fn read_text_file(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    file_path: &str,
+) -> Result<FileReadResult> {
+    if host_id == LOCAL_HOST_ID {
+        let meta = tokio::fs::metadata(file_path).await?;
+        if meta.len() > MAX_TEXT_PREVIEW_BYTES {
+            return Err(anyhow!("文件过大 ({} MB)，超过在线编辑上限 8 MB", meta.len() / 1024 / 1024));
+        }
+        let bytes = tokio::fs::read(file_path).await?;
+        let content = String::from_utf8(bytes).context("该文件不是有效的 UTF-8 文本文件")?;
+        return Ok(FileReadResult {
+            path: file_path.to_string(),
+            content,
+            size: meta.len(),
+        });
+    }
+
+    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    let meta = sftp
+        .metadata(file_path)
+        .await
+        .with_context(|| format!("读取远端文件属性失败: {file_path}"))?;
+    let size = meta.size.unwrap_or(0);
+    if size > MAX_TEXT_PREVIEW_BYTES {
+        return Err(anyhow!(
+            "文件过大 ({:.1} MB)，超过在线编辑上限 8 MB，请直接下载",
+            size as f64 / 1024.0 / 1024.0
+        ));
+    }
+    let bytes = sftp
+        .read(file_path)
+        .await
+        .with_context(|| format!("读取远端文件失败: {file_path}"))?;
+    let content = String::from_utf8(bytes).context("该文件不是有效的 UTF-8 文本文件")?;
+    Ok(FileReadResult {
+        path: file_path.to_string(),
+        content,
+        size,
+    })
+}
+
+pub async fn write_text_file(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    file_path: &str,
+    content: &str,
+) -> Result<u64> {
+    let bytes = content.as_bytes();
+    if host_id == LOCAL_HOST_ID {
+        tokio::fs::write(file_path, bytes).await?;
+        return Ok(bytes.len() as u64);
+    }
+
+    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    let mut file = sftp
+        .create(file_path)
+        .await
+        .with_context(|| format!("打开远端文件写入失败: {file_path}"))?;
+    file.write_all(bytes).await?;
+    file.close().await?;
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(bytes.len() as u64)
+}
+
+pub async fn create_dir(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    dir_path: &str,
+) -> Result<()> {
+    if host_id == LOCAL_HOST_ID {
+        tokio::fs::create_dir_all(dir_path).await?;
+        return Ok(());
+    }
+    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    sftp.create_dir(dir_path)
+        .await
+        .with_context(|| format!("创建远端目录失败: {dir_path}"))?;
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(())
+}
+
+pub async fn rename_item(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Result<()> {
+    if host_id == LOCAL_HOST_ID {
+        tokio::fs::rename(old_path, new_path).await?;
+        return Ok(());
+    }
+    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    // 若目标已存在，先删除旧目标再 rename
+    if sftp.try_exists(new_path).await.unwrap_or(false) {
+        let _ = sftp.remove_file(new_path).await;
+    }
+    sftp.rename(old_path, new_path)
+        .await
+        .with_context(|| format!("重命名失败: {old_path} -> {new_path}"))?;
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(())
+}
+
+pub async fn remove_item(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    target_path: &str,
+    is_dir: bool,
+) -> Result<()> {
+    if target_path == "/" || target_path.trim().is_empty() {
+        return Err(anyhow!("禁止删除根目录"));
+    }
+    if host_id == LOCAL_HOST_ID {
+        if is_dir {
+            tokio::fs::remove_dir_all(target_path).await?;
+        } else {
+            tokio::fs::remove_file(target_path).await?;
+        }
+        return Ok(());
+    }
+
+    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    if is_dir {
+        remove_remote_dir_recursive(&sftp, target_path).await?;
+    } else {
+        sftp.remove_file(target_path)
+            .await
+            .with_context(|| format!("删除远端文件失败: {target_path}"))?;
+    }
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(())
+}
+
+async fn remove_remote_dir_recursive(sftp: &SftpSession, dir_path: &str) -> Result<()> {
+    let mut stack = vec![dir_path.to_string()];
+    let mut dirs_to_remove = Vec::new();
+
+    while let Some(curr) = stack.pop() {
+        let entries = sftp.read_dir(&curr).await?;
+        dirs_to_remove.push(curr.clone());
+        for entry in entries {
+            let sub_path = join_remote_path(&curr, &entry.file_name());
+            if entry.metadata().is_dir() {
+                stack.push(sub_path);
+            } else {
+                sftp.remove_file(&sub_path).await?;
+            }
+        }
+    }
+
+    for dir in dirs_to_remove.into_iter().rev() {
+        sftp.remove_dir(&dir).await?;
+    }
+    Ok(())
+}
+
+// ==================== 压缩与解压（复用 SshPool 连接 / 本机命令） ====================
+
+fn shell_quote(val: &str) -> String {
+    format!("'{}'", val.replace('\'', r"'\''"))
+}
+
+fn detect_archive_kind(path: &str) -> Option<(&'static str, &'static str)> {
+    let lower = path.to_lowercase();
+    for (suffix, kind) in [
+        (".tar.gz", "tar.gz"),
+        (".tgz", "tar.gz"),
+        (".tar.xz", "tar.xz"),
+        (".txz", "tar.xz"),
+        (".tar.bz2", "tar.bz2"),
+        (".tbz2", "tar.bz2"),
+        (".tar", "tar"),
+        (".zip", "zip"),
+        (".gz", "gz"),
+    ] {
+        if lower.ends_with(suffix) {
+            return Some((suffix, kind));
+        }
+    }
+    None
+}
+
+async fn run_ssh_exec_checked(pool: &SshPool, db: &Database, host_id: &str, cmd: &str) -> Result<String> {
+    let (_rec, mut channel) = crate::ssh::open_host_channel(pool, db, host_id).await?;
+    channel.exec(true, cmd).await?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code: Option<u32> = None;
+
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+            russh::ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    let out_str = String::from_utf8_lossy(&stdout).trim().to_string();
+    let err_str = String::from_utf8_lossy(&stderr).trim().to_string();
+    if exit_code.unwrap_or(0) != 0 {
+        let msg = if !err_str.is_empty() {
+            err_str
+        } else if !out_str.is_empty() {
+            out_str
+        } else {
+            format!("exit code {}", exit_code.unwrap_or(1))
+        };
+        return Err(anyhow!(msg));
+    }
+    Ok(out_str)
+}
+
+pub async fn compress_item(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    target_path: &str,
+) -> Result<String> {
+    let clean = target_path.trim_end_matches(['/', '\\']);
+    if clean.is_empty() || clean == "/" || clean == "drives" {
+        return Err(anyhow!("不能直接压缩根目录"));
+    }
+
+    if host_id == LOCAL_HOST_ID {
+        let p = PathBuf::from(clean);
+        let parent = p.parent().ok_or_else(|| anyhow!("无效路径"))?;
+        let base = p.file_name().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("无效文件名"))?;
+        let mut out_name = format!("{base}.zip");
+        let mut out_path = parent.join(&out_name);
+        if tokio::fs::metadata(&out_path).await.is_ok() {
+            out_name = format!("{base}-{}.zip", Uuid::new_v4().simple());
+            out_path = parent.join(&out_name);
+        }
+        let status = tokio::process::Command::new("tar.exe")
+            .args(["-a", "-cf", &out_name, "--", base])
+            .current_dir(parent)
+            .output()
+            .await
+            .context("调用本机 tar.exe 压缩失败")?;
+        if !status.status.success() {
+            return Err(anyhow!(
+                "压缩失败: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+        return Ok(out_path.to_string_lossy().replace('\\', "/"));
+    }
+
+    let (dir, base) = match clean.rfind('/') {
+        Some(0) => ("/", &clean[1..]),
+        Some(idx) => (&clean[..idx], &clean[idx + 1..]),
+        None => (".", clean),
+    };
+    let archive_name = format!("{base}.tar.gz");
+    let archive_full = join_remote_path(dir, &archive_name);
+
+    let cmd = format!(
+        "set -eu; cd {}; out={}; if [ -e \"$out\" ]; then out={}; fi; tar -czf \"$out\" -- {}; printf '%s\\n' \"$out\"",
+        shell_quote(dir),
+        shell_quote(&archive_name),
+        shell_quote(&format!("{base}-{}.tar.gz", &Uuid::new_v4().simple().to_string()[..6])),
+        shell_quote(base),
+    );
+    let out = run_ssh_exec_checked(pool, db, host_id, &cmd).await?;
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(if out.is_empty() {
+        archive_full
+    } else {
+        join_remote_path(dir, &out)
+    })
+}
+
+pub async fn extract_item(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    archive_path: &str,
+) -> Result<String> {
+    let (suffix, kind) = detect_archive_kind(archive_path)
+        .ok_or_else(|| anyhow!("不支持的压缩包格式（支持 .tar.gz / .tgz / .tar.xz / .tar.bz2 / .tar / .zip / .gz）"))?;
+
+    if host_id == LOCAL_HOST_ID {
+        let p = PathBuf::from(archive_path);
+        let parent = p.parent().ok_or_else(|| anyhow!("无效路径"))?;
+        let fname = p.file_name().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("无效文件名"))?;
+        let stem = fname[..fname.len() - suffix.len()].trim();
+        let folder_name = if stem.is_empty() { "extracted" } else { stem };
+        let mut out_dir = parent.join(folder_name);
+        if tokio::fs::metadata(&out_dir).await.is_ok() {
+            out_dir = parent.join(format!("{folder_name}.extracted"));
+        }
+        tokio::fs::create_dir_all(&out_dir).await?;
+        let status = tokio::process::Command::new("tar.exe")
+            .args(["-xf", archive_path, "-C", &out_dir.to_string_lossy()])
+            .output()
+            .await
+            .context("调用本机 tar.exe 解压失败")?;
+        if !status.status.success() {
+            return Err(anyhow!(
+                "解压失败: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+        return Ok(out_dir.to_string_lossy().replace('\\', "/"));
+    }
+
+    let (dir, fname) = match archive_path.rfind('/') {
+        Some(0) => ("/", &archive_path[1..]),
+        Some(idx) => (&archive_path[..idx], &archive_path[idx + 1..]),
+        None => (".", archive_path),
+    };
+    let stem = fname[..fname.len() - suffix.len()].trim();
+    let folder_name = if stem.is_empty() { "extracted" } else { stem };
+    let out_dir = join_remote_path(dir, folder_name);
+    let fallback_dir = join_remote_path(dir, &format!("{folder_name}.extracted"));
+
+    let extract_cmd = match kind {
+        "tar.gz" => "tar -xzf \"$arch\" -C \"$dest\"".to_string(),
+        "tar.xz" => "tar -xJf \"$arch\" -C \"$dest\"".to_string(),
+        "tar.bz2" => "tar -xjf \"$arch\" -C \"$dest\"".to_string(),
+        "tar" => "tar -xf \"$arch\" -C \"$dest\"".to_string(),
+        "zip" => "unzip -q \"$arch\" -d \"$dest\"".to_string(),
+        "gz" => format!("gzip -dc \"$arch\" > \"$dest\"/{}", shell_quote(folder_name)),
+        _ => return Err(anyhow!("不支持的归档类型")),
+    };
+
+    let cmd = format!(
+        "set -eu; arch={}; dest={}; if [ -e \"$dest\" ]; then dest={}; fi; mkdir -p -- \"$dest\"; {}; printf '%s\\n' \"$dest\"",
+        shell_quote(archive_path),
+        shell_quote(&out_dir),
+        shell_quote(&fallback_dir),
+        extract_cmd,
+    );
+    let out = run_ssh_exec_checked(pool, db, host_id, &cmd).await?;
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(if out.is_empty() { out_dir } else { out })
+}
+
+// ==================== 板块四：满速流式传输核心（UI 与未来 MCP 共用） ====================
+
+/// 从任意异步流（如 HTTP 上传流或本机文件流）高速写入目标主机，
+/// 写 `.part` 临时文件并在完成后原子改名，全程实时刷新速率与进度。
+pub async fn stream_upload_to_host<R>(
+    pool: &SshPool,
+    db: &Database,
+    transfers: &TransferManager,
+    task_id: &str,
+    host_id: &str,
+    remote_dir: &str,
+    filename: &str,
+    expected_size: u64,
+    mut reader: R,
+) -> Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let safe_name = Path::new(filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("无效的文件名"))?;
+    let final_path = join_remote_path(remote_dir, safe_name);
+    let temp_path = format!("{final_path}.vps-part-{}", Uuid::new_v4().simple());
+    let started = Instant::now();
+
+    if host_id == LOCAL_HOST_ID {
+        let local_final = PathBuf::from(remote_dir).join(safe_name);
+        let local_temp = PathBuf::from(remote_dir).join(format!(".{safe_name}.vps-part"));
+        let mut out_file = tokio::fs::File::create(&local_temp).await?;
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
+        let mut transferred = 0u64;
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            out_file.write_all(&buf[..n]).await?;
+            transferred += n as u64;
+            transfers.update_progress(
+                task_id,
+                transferred,
+                expected_size,
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        out_file.flush().await?;
+        drop(out_file);
+        tokio::fs::rename(&local_temp, &local_final).await?;
+        transfers.finish_task(task_id, transferred, started.elapsed().as_secs_f64());
+        return Ok(local_final.to_string_lossy().replace('\\', "/"));
+    }
+
+    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    let mut remote_file = sftp
+        .open_with_flags(
+            &temp_path,
+            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+        )
+        .await
+        .with_context(|| format!("创建远端临时文件失败: {temp_path}"))?;
+
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    let mut transferred = 0u64;
+    let write_res: Result<()> = async {
+        loop {
+            let n = tokio::time::timeout(STALL_TIMEOUT, reader.read(&mut buf))
+                .await
+                .map_err(|_| anyhow!("上传读取失速超时 (连续 12 秒无数据推进)"))??;
+            if n == 0 {
+                break;
+            }
+            tokio::time::timeout(STALL_TIMEOUT, remote_file.write_all(&buf[..n]))
+                .await
+                .map_err(|_| anyhow!("远端写入失速超时 (连续 12 秒无数据推进)"))??;
+            transferred += n as u64;
+            transfers.update_progress(
+                task_id,
+                transferred,
+                expected_size,
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        tokio::time::timeout(STALL_TIMEOUT, remote_file.close())
+            .await
+            .map_err(|_| anyhow!("关闭远端文件句柄失速超时"))??;
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = write_res {
+        let _ = sftp.remove_file(&temp_path).await;
+        transfers.fail_task(task_id, &err);
+        return Err(err);
+    }
+
+    // 原子替换目标文件
+    if sftp.try_exists(&final_path).await.unwrap_or(false) {
+        let _ = sftp.remove_file(&final_path).await;
+    }
+    if let Err(err) = sftp.rename(&temp_path, &final_path).await {
+        let _ = sftp.remove_file(&temp_path).await;
+        transfers.fail_task(task_id, &err);
+        return Err(err.into());
+    }
+
+    transfers.finish_task(task_id, transferred, started.elapsed().as_secs_f64());
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(final_path)
+}
+
+/// 本机路径 ↔ 远端路径 直接高速传输（桌面端直传 & 未来板块六 MCP `file.put` / `file.get` 直接调用此函数）
+pub async fn transfer_local_remote_file(
+    pool: &SshPool,
+    db: &Database,
+    transfers: &TransferManager,
+    host_id: &str,
+    direction: &str, // "upload" | "download"
+    local_path: &str,
+    remote_path: &str,
+) -> Result<TransferTask> {
+    let host = db
+        .get_record(host_id)?
+        .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
+
+    if direction == "upload" {
+        let meta = tokio::fs::metadata(local_path)
+            .await
+            .with_context(|| format!("读取本机文件失败: {local_path}"))?;
+        let filename = Path::new(local_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("upload.bin")
+            .to_string();
+        let remote_dir = if remote_path.ends_with('/') {
+            remote_path.trim_end_matches('/').to_string()
+        } else {
+            match remote_path.rfind('/') {
+                Some(0) => "/".to_string(),
+                Some(idx) => remote_path[..idx].to_string(),
+                None => ".".to_string(),
+            }
+        };
+        let target_name = if remote_path.ends_with('/') {
+            filename.clone()
+        } else {
+            remote_path
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&filename)
+                .to_string()
+        };
+
+        let task_id = transfers.create_task(
+            host_id,
+            &host.name,
+            "upload",
+            &target_name,
+            Some(local_path.to_string()),
+            &join_remote_path(&remote_dir, &target_name),
+            meta.len(),
+        );
+        let file = tokio::fs::File::open(local_path).await?;
+        stream_upload_to_host(
+            pool,
+            db,
+            transfers,
+            &task_id,
+            host_id,
+            &remote_dir,
+            &target_name,
+            meta.len(),
+            file,
+        )
+        .await?;
+
+        transfers
+            .list_tasks(None)
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .ok_or_else(|| anyhow!("读取传输任务状态失败"))
+    } else {
+        let sftp = pool.get_or_open_sftp(db, host_id).await?;
+        let meta = sftp
+            .metadata(remote_path)
+            .await
+            .with_context(|| format!("远端文件不存在: {remote_path}"))?;
+        let total = meta.size.unwrap_or(0);
+        let filename = remote_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("download.bin")
+            .to_string();
+
+        let task_id = transfers.create_task(
+            host_id,
+            &host.name,
+            "download",
+            &filename,
+            Some(local_path.to_string()),
+            remote_path,
+            total,
+        );
+        let started = Instant::now();
+        let mut remote_file = sftp.open(remote_path).await?;
+        let temp_local = format!("{local_path}.vps-part");
+        let mut out_file = tokio::fs::File::create(&temp_local).await?;
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
+        let mut transferred = 0u64;
+
+        let res: Result<()> = async {
+            loop {
+                let n = tokio::time::timeout(STALL_TIMEOUT, remote_file.read(&mut buf))
+                    .await
+                    .map_err(|_| anyhow!("下载读取失速超时 (连续 12 秒无数据推进)"))??;
+                if n == 0 {
+                    break;
+                }
+                out_file.write_all(&buf[..n]).await?;
+                transferred += n as u64;
+                transfers.update_progress(
+                    &task_id,
+                    transferred,
+                    total,
+                    started.elapsed().as_secs_f64(),
+                );
+            }
+            out_file.flush().await?;
+            let _ = tokio::time::timeout(STALL_TIMEOUT, remote_file.close()).await;
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = res {
+            let _ = tokio::fs::remove_file(&temp_local).await;
+            transfers.fail_task(&task_id, &err);
+            return Err(err);
+        }
+
+        tokio::fs::rename(&temp_local, local_path).await?;
+        transfers.finish_task(&task_id, transferred, started.elapsed().as_secs_f64());
+
+        transfers
+            .list_tasks(None)
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .ok_or_else(|| anyhow!("读取传输任务状态失败"))
+    }
+}
+
+/// 跨 VPS 直接流式对传（VPS A ──内存流──▶ VPS B，不落本机磁盘）
+pub async fn transfer_remote_to_remote(
+    pool: &SshPool,
+    db: &Database,
+    transfers: &TransferManager,
+    src_host_id: &str,
+    src_path: &str,
+    dst_host_id: &str,
+    dst_path: &str,
+) -> Result<TransferTask> {
+    let src_host = db
+        .get_record(src_host_id)?
+        .ok_or_else(|| anyhow!("源主机不存在: {src_host_id}"))?;
+    let dst_host = db
+        .get_record(dst_host_id)?
+        .ok_or_else(|| anyhow!("目标主机不存在: {dst_host_id}"))?;
+
+    let src_sftp = pool.get_or_open_sftp(db, src_host_id).await?;
+    let meta = src_sftp
+        .metadata(src_path)
+        .await
+        .with_context(|| format!("源主机文件不存在: {src_path}"))?;
+    let total = meta.size.unwrap_or(0);
+    let src_filename = src_path
+        .rsplit('/')
+        .next()
+        .unwrap_or("transfer.bin")
+        .to_string();
+
+    let (dst_dir, dst_name) = if dst_path.ends_with('/') {
+        (
+            dst_path.trim_end_matches('/').to_string(),
+            src_filename.clone(),
+        )
+    } else {
+        match dst_path.rfind('/') {
+            Some(0) => ("/".to_string(), dst_path[1..].to_string()),
+            Some(idx) => (
+                dst_path[..idx].to_string(),
+                dst_path[idx + 1..].to_string(),
+            ),
+            None => (".".to_string(), dst_path.to_string()),
+        }
+    };
+
+    let label = format!("{} -> {}", src_host.name, dst_host.name);
+    let task_id = transfers.create_task(
+        dst_host_id,
+        &label,
+        "upload",
+        &dst_name,
+        Some(format!("{}:{src_path}", src_host.name)),
+        &join_remote_path(&dst_dir, &dst_name),
+        total,
+    );
+
+    let src_file = src_sftp.open(src_path).await?;
+    stream_upload_to_host(
+        pool,
+        db,
+        transfers,
+        &task_id,
+        dst_host_id,
+        &dst_dir,
+        &dst_name,
+        total,
+        src_file,
+    )
+    .await?;
+
+    transfers
+        .list_tasks(None)
+        .into_iter()
+        .find(|t| t.id == task_id)
+        .ok_or_else(|| anyhow!("读取跨主机传输任务状态失败"))
+}
