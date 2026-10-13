@@ -2,6 +2,7 @@ use crate::{
     api::AppState,
     db::Database,
     files,
+    guard::Verdict,
     models::{HostRecord, LOCAL_HOST_ID},
     ssh::open_host_channel,
     terminal::looks_like_interactive_prompt,
@@ -624,7 +625,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "vps_exec",
-            "description": "在一台或多台 VPS 上并发执行非交互式命令（直接传主机名如 'vip-hk'）。若在 wait_seconds 内完成则同步返回 stdout/stderr/exitCode；若超时未完则自动转入后台并返回 taskId；若检测到命令卡在 [Y/n] 等交互提问超过 2 秒会自动早退提醒改用 vps_terminal。",
+            "description": "在一台或多台 VPS 上并发执行非交互式命令（直接传主机名如 'vip-hk'）。若在 wait_seconds 内完成则同步返回 stdout/stderr/exitCode；若超时未完则自动转入后台并返回 taskId；若检测到命令卡在 [Y/n] 等交互提问超过 2 秒会自动早退提醒改用 vps_terminal。命令会先过本机命令黑名单，命中不可逆灾难（如 rm -rf /、mkfs、格式化盘）即直接拒绝执行、不产生任何输出——名单文件是 data/deny-list.txt，被拦时不要换写法重试，直接告诉用户哪条被拦。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -651,7 +652,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "vps_terminal",
-            "description": "有状态 PTY 交互式终端工具（基于 Rust alacritty_terminal 真实二维屏幕网格）。默认无头运行（reveal_ui: false），专门用于运行需要交互确认（如输入 yes/[Y/n]、选择安装菜单）的脚本——当脚本停下等待输入时会立即返回 state='waiting_input' 及光标所在行文字，你可以继续调用 send 发送 'y'。当遇到需要用户亲自输入隐私密码（如数据库密码、sudo密码、密钥口令）或人工接手时，设置 reveal_ui=true 或调用 action='reveal'，即可像 Playwright 一样直接将终端弹窗展现在用户界面上。",
+            "description": "有状态 PTY 交互式终端工具（基于 Rust alacritty_terminal 真实二维屏幕网格）。默认无头运行（reveal_ui: false），专门用于运行需要交互确认（如输入 yes/[Y/n]、选择安装菜单）的脚本——当脚本停下等待输入时会立即返回 state='waiting_input' 及光标所在行文字，你可以继续调用 send 发送 'y'。当遇到需要用户亲自输入隐私密码（如数据库密码、sudo密码、密钥口令）或人工接手时，设置 reveal_ui=true 或调用 action='reveal'，即可像 Playwright 一样直接将终端弹窗展现在用户界面上。action='send' 的输入同样会先过命令黑名单，命中不可逆灾难即拒绝发送。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1058,6 +1059,12 @@ async fn tool_vps_exec(
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow!("command 参数不能为空"))?
         .to_string();
+
+    // 护栏：agent 通道的命令先过黑名单。命中即拒绝执行，不给任何执行结果。
+    if let Verdict::Deny { why } = state.guard.check(&command) {
+        return Err(anyhow!("{why}"));
+    }
+
     let wait_seconds = args
         .get("wait_seconds")
         .and_then(|v| v.as_u64())
@@ -1201,6 +1208,11 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
         "reveal" | "read" => pane.read_screen_snapshot(max_lines),
         "send" => {
             let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+            // 护栏：终端也是命令通道，`vps_exec` 拦下的写法不能从这里绕过去。
+            // 交互回答（"y"、密码）不会命中黑名单，照常发送。
+            if let Verdict::Deny { why } = state.guard.check(input) {
+                return Err(anyhow!("{why}"));
+            }
             let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(true);
             let mut bytes = input.as_bytes().to_vec();
             if submit {

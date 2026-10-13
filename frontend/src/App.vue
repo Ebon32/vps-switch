@@ -100,6 +100,11 @@ const hasAdminPassword = ref(false);
 const savingAuth = ref(false);
 const savingMcp = ref(false);
 
+// 命令黑名单（Agent 执行护栏）：名单原文与文件路径
+const guardContent = ref('');
+const guardPath = ref('');
+const savingGuard = ref(false);
+
 const mcpStatus = ref<{
   exePath: string;
   port: number;
@@ -368,6 +373,41 @@ async function loadSettings() {
   }
   void loadAutostartSettings();
   void loadAboutInfo();
+  void loadGuardList();
+}
+
+async function loadGuardList() {
+  try {
+    const res = await fetch('/api/guard');
+    const data = await res.json();
+    if (data.ok) {
+      guardContent.value = data.content || '';
+      guardPath.value = data.path || '';
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function saveGuardList() {
+  savingGuard.value = true;
+  try {
+    const res = await fetch('/api/guard', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: guardContent.value }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showToast(data.error || '保存命令黑名单失败', 'err');
+      return;
+    }
+    showToast('命令黑名单已保存，立即生效');
+  } catch (e) {
+    showToast(`保存失败: ${(e as Error).message}`, 'err');
+  } finally {
+    savingGuard.value = false;
+  }
 }
 
 async function loadAutostartSettings() {
@@ -1964,6 +2004,51 @@ onBeforeUnmount(() => {
               class="overflow-x-auto rounded-xl border border-zinc-200/80 bg-zinc-950 p-3.5 font-mono text-[11px] leading-relaxed text-zinc-200 dark:border-zinc-800"
             >{{ displayedMcpConfigJson }}</pre>
           </div>
+        </section>
+
+        <!-- 板块 2：命令黑名单（Agent 执行护栏） -->
+        <section
+          class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
+        >
+          <div class="flex items-start justify-between gap-3 border-b border-zinc-100 pb-3.5 dark:border-zinc-800">
+            <div>
+              <h3 class="text-sm font-semibold">命令黑名单（Agent 执行护栏）</h3>
+              <p class="mt-0.5 text-xs text-zinc-400">
+                命中即拒绝执行，agent 拿不到任何执行结果。外部 agent 一旦放行 MCP 工具，参数里的命令就不再受它自身权限系统检查，这里是唯一的兜底
+              </p>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 rounded-lg bg-zinc-900 px-3 py-1 text-[11px] font-medium text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+              :disabled="savingGuard"
+              @click="saveGuardList"
+            >
+              {{ savingGuard ? '保存中…' : '保存名单' }}
+            </button>
+          </div>
+
+          <div class="flex items-center gap-2 rounded-xl border border-zinc-200/70 bg-zinc-50/60 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-800/40">
+            <span class="shrink-0 text-[11px] font-medium text-zinc-500">名单文件</span>
+            <span class="flex-1 truncate font-mono text-[11px] text-zinc-700 dark:text-zinc-300">{{ guardPath || 'data/deny-list.txt' }}</span>
+            <button
+              type="button"
+              class="shrink-0 text-[11px] text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200"
+              @click="copyText(guardPath, '已复制名单文件路径')"
+            >
+              复制路径
+            </button>
+          </div>
+
+          <textarea
+            v-model="guardContent"
+            spellcheck="false"
+            rows="16"
+            class="w-full resize-y rounded-xl border border-zinc-200/80 bg-white p-3.5 font-mono text-[11px] leading-relaxed text-zinc-800 outline-none focus:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+          ></textarea>
+
+          <p class="text-[11px] leading-relaxed text-zinc-400">
+            一行一条，<code class="font-mono">#</code> 起头是注释。<code class="font-mono">*</code> 通配，没有 <code class="font-mono">*</code> 就是精确匹配，按词边界匹配（<code class="font-mono">rm -rf /</code> 不会误伤 <code class="font-mono">rm -rf /var/log</code>）。判定前会剥引号、转小写，并把 <code class="font-mono">-r -f</code> 与 <code class="font-mono">-fr</code> 视作等价。这份名单防手滑，不防蓄意绕过。
+          </p>
         </section>
       </div>
 

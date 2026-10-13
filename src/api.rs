@@ -44,6 +44,7 @@ use uuid::Uuid;
 
 pub struct AppState {
     pub db: Arc<Database>,
+    pub guard: Arc<crate::guard::Guard>,
     pub ssh_pool: Arc<SshPool>,
     pub terminals: Arc<TerminalManager>,
     pub transfers: Arc<TransferManager>,
@@ -62,6 +63,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/api/settings", get(api_get_settings))
         .route("/api/settings/auth", put(api_update_auth_settings))
         .route("/api/settings/mcp", put(api_update_mcp_settings))
+        .route("/api/guard", get(api_get_guard).put(api_update_guard))
         .route("/api/events", get(api_sse_events))
         .route("/api/hosts", get(list_hosts).post(create_host))
         .route("/api/hosts/reorder", put(reorder_hosts))
@@ -1430,6 +1432,40 @@ async fn api_update_mcp_settings(
             Json(json!({
                 "ok": true,
                 "settings": settings,
+            })),
+        )
+            .into_response(),
+        Err(e) => err_response(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn api_get_guard(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "path": state.guard.path().to_string_lossy(),
+            "content": state.guard.read_list(),
+        })),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GuardUpdatePayload {
+    content: String,
+}
+
+async fn api_update_guard(
+    State(state): State<Arc<AppState>>,
+    Json(p): Json<GuardUpdatePayload>,
+) -> impl IntoResponse {
+    match state.guard.write_list(&p.content) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "path": state.guard.path().to_string_lossy(),
             })),
         )
             .into_response(),

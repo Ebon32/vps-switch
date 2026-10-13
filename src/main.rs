@@ -9,6 +9,7 @@ mod db;
 #[cfg(windows)]
 mod desktop;
 mod files;
+mod guard;
 mod inspector;
 mod mcp;
 mod models;
@@ -27,6 +28,7 @@ use axum::{
 use crypto::MasterKey;
 use db::Database;
 use files::TransferManager;
+use guard::Guard;
 use inspector::InspectorEngine;
 use mcp::{run_stdio_bridge, sync_cli_mcp_configs, ExecTaskManager};
 use rust_embed::RustEmbed;
@@ -194,6 +196,7 @@ fn main() -> Result<()> {
     let exec_tasks = Arc::new(ExecTaskManager::new());
     let state = Arc::new(AppState {
         db,
+        guard: Arc::new(Guard::load_or_create(&data_dir)?),
         ssh_pool: Arc::new(SshPool::new()),
         terminals: Arc::new(TerminalManager::new()),
         transfers: Arc::new(TransferManager::new()),
