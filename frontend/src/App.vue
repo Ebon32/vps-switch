@@ -107,6 +107,41 @@ const mcpStatus = ref<{
   codexSynced: boolean;
 } | null>(null);
 
+// 设置页分类导航与状态
+type SettingsTabKey = 'general' | 'security' | 'mcp' | 'about';
+const activeSettingsTab = ref<SettingsTabKey>('general');
+
+const autostartEnabled = ref(false);
+const closeAction = ref<'tray' | 'exit'>('tray');
+const savingAutostart = ref(false);
+
+const appAbout = ref<{
+  version: string;
+  description: string;
+  exePath: string;
+  port: number;
+  githubUrl: string;
+  stack: string;
+} | null>(null);
+
+const updateStatus = ref<{
+  checking: boolean;
+  checked: boolean;
+  hasUpdate: boolean;
+  currentVersion: string;
+  latestVersion: string;
+  publishedAt?: string;
+  releaseNotes?: string;
+  releaseUrl?: string;
+  message?: string;
+}>({
+  checking: false,
+  checked: false,
+  hasUpdate: false,
+  currentVersion: 'v0.1.0',
+  latestVersion: 'v0.1.0',
+});
+
 // 拖拽排序
 const draggingId = ref<string | null>(null);
 const dragOverId = ref<string | null>(null);
@@ -320,8 +355,100 @@ async function loadSettings() {
     if (data.cliSync) {
       mcpStatus.value = data.cliSync;
     }
+    if (data.autostart !== undefined) {
+      autostartEnabled.value = Boolean(data.autostart);
+    }
+    if (data.closeAction) {
+      closeAction.value = data.closeAction === 'exit' ? 'exit' : 'tray';
+    }
   } catch {
     // ignore
+  }
+  void loadAutostartSettings();
+  void loadAboutInfo();
+}
+
+async function loadAutostartSettings() {
+  try {
+    const res = await fetch('/api/system/autostart');
+    const data = await res.json();
+    if (data.ok) {
+      autostartEnabled.value = Boolean(data.autostart);
+      closeAction.value = data.closeAction === 'exit' ? 'exit' : 'tray';
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function saveAutostartSettings() {
+  savingAutostart.value = true;
+  try {
+    const res = await fetch('/api/system/autostart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        autostart: autostartEnabled.value,
+        closeAction: closeAction.value,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showToast(data.error || '保存自启与运行设置失败', 'err');
+      return;
+    }
+    autostartEnabled.value = Boolean(data.autostart);
+    closeAction.value = data.closeAction === 'exit' ? 'exit' : 'tray';
+    showToast('开机自启与后台常驻设置已生效');
+  } catch (e) {
+    showToast(`保存失败: ${(e as Error).message}`, 'err');
+  } finally {
+    savingAutostart.value = false;
+  }
+}
+
+async function loadAboutInfo() {
+  try {
+    const res = await fetch('/api/system/about');
+    const data = await res.json();
+    if (data.ok) {
+      appAbout.value = data;
+      updateStatus.value.currentVersion = data.version;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function checkAppUpdate() {
+  updateStatus.value.checking = true;
+  try {
+    const res = await fetch('/api/system/check-update', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      updateStatus.value = {
+        checking: false,
+        checked: true,
+        hasUpdate: Boolean(data.hasUpdate),
+        currentVersion: data.currentVersion || 'v0.1.0',
+        latestVersion: data.latestVersion || 'v0.1.0',
+        publishedAt: data.publishedAt,
+        releaseNotes: data.releaseNotes,
+        releaseUrl: data.releaseUrl,
+        message: data.message,
+      };
+      if (data.hasUpdate) {
+        showToast(`发现新版本 ${data.latestVersion}！`);
+      } else {
+        showToast('当前已是最新版本');
+      }
+    } else {
+      showToast('检查更新失败', 'err');
+    }
+  } catch (e) {
+    showToast(`检查更新出错: ${(e as Error).message}`, 'err');
+  } finally {
+    updateStatus.value.checking = false;
   }
 }
 
@@ -441,8 +568,11 @@ function copyText(text: string, msg: string) {
   showToast(msg);
 }
 
-function openSettingsPage() {
-  if (activePage.value === 'settings') {
+function openSettingsPage(tab?: SettingsTabKey) {
+  if (tab) {
+    activeSettingsTab.value = tab;
+  }
+  if (activePage.value === 'settings' && !tab) {
     activePage.value = 'workspace';
   } else {
     activePage.value = 'settings';
@@ -1453,6 +1583,205 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <!-- 分类切换导航条（毛玻璃胶囊 Tab） -->
+        <div class="flex items-center gap-1.5 overflow-x-auto rounded-2xl border border-zinc-200/80 bg-white/75 p-1.5 backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/75">
+          <button
+            type="button"
+            class="flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-medium transition cursor-pointer"
+            :class="
+              activeSettingsTab === 'general'
+                ? 'bg-zinc-900 text-white shadow-sm dark:bg-zinc-100 dark:text-zinc-900'
+                : 'text-zinc-600 hover:bg-zinc-100/80 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            "
+            @click="activeSettingsTab = 'general'"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+            <span>常规与自启</span>
+          </button>
+
+          <button
+            type="button"
+            class="flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-medium transition cursor-pointer"
+            :class="
+              activeSettingsTab === 'security'
+                ? 'bg-zinc-900 text-white shadow-sm dark:bg-zinc-100 dark:text-zinc-900'
+                : 'text-zinc-600 hover:bg-zinc-100/80 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            "
+            @click="activeSettingsTab = 'security'"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+              <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+            </svg>
+            <span>访问安全</span>
+          </button>
+
+          <button
+            type="button"
+            class="flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-medium transition cursor-pointer"
+            :class="
+              activeSettingsTab === 'mcp'
+                ? 'bg-zinc-900 text-white shadow-sm dark:bg-zinc-100 dark:text-zinc-900'
+                : 'text-zinc-600 hover:bg-zinc-100/80 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            "
+            @click="activeSettingsTab = 'mcp'"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+            </svg>
+            <span>MCP Server</span>
+          </button>
+
+          <button
+            type="button"
+            class="flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-medium transition cursor-pointer"
+            :class="
+              activeSettingsTab === 'about'
+                ? 'bg-zinc-900 text-white shadow-sm dark:bg-zinc-100 dark:text-zinc-900'
+                : 'text-zinc-600 hover:bg-zinc-100/80 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            "
+            @click="activeSettingsTab = 'about'"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="16" x2="12" y2="12" />
+              <line x1="12" y1="8" x2="12.01" y2="8" />
+            </svg>
+            <span>关于与更新</span>
+            <span
+              v-if="updateStatus.hasUpdate"
+              class="h-2 w-2 rounded-full bg-emerald-500 animate-ping"
+            />
+          </button>
+        </div>
+
+        <!-- 1. 常规与自启 -->
+        <div v-show="activeSettingsTab === 'general'" class="space-y-4">
+          <!-- 开机自启与后台常驻 -->
+          <section
+            class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
+          >
+            <div class="flex items-center justify-between border-b border-zinc-100 pb-3.5 dark:border-zinc-800">
+              <div>
+                <h3 class="text-sm font-semibold">开机自启与后台常驻</h3>
+                <p class="text-xs text-zinc-400">
+                  配置 Windows 开机静默后台启动与窗口关闭时的托盘常驻行为
+                </p>
+              </div>
+            </div>
+
+            <!-- 开机自启开关 -->
+            <div class="flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div>
+                <div class="text-xs font-semibold">Windows 登录时自动启动</div>
+                <div class="mt-0.5 text-[11px] text-zinc-400">
+                  开机登录后自动在后台启动 VPS Switch 并静默常驻系统托盘，无需手动双击运行
+                </div>
+              </div>
+              <label class="inline-flex items-center gap-2 cursor-pointer">
+                <span class="text-xs font-medium text-zinc-600 dark:text-zinc-300">
+                  {{ autostartEnabled ? '已开启' : '已关闭' }}
+                </span>
+                <input
+                  v-model="autostartEnabled"
+                  type="checkbox"
+                  class="h-4 w-4 rounded border-zinc-300 text-zinc-900 cursor-pointer"
+                  :disabled="savingAutostart"
+                  @change="saveAutostartSettings"
+                />
+              </label>
+            </div>
+
+            <!-- 窗口关闭行为 -->
+            <div class="flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div>
+                <div class="text-xs font-semibold">点击窗口右上角关闭按钮 (✕) 时</div>
+                <div class="mt-0.5 text-[11px] text-zinc-400">
+                  推荐最小化到系统托盘，保持 SSH 连接池与 MCP Server 在后台随时可用
+                </div>
+              </div>
+              <div class="flex rounded-xl bg-zinc-200/70 p-0.5 text-xs dark:bg-zinc-800">
+                <button
+                  type="button"
+                  class="rounded-lg px-2.5 py-1 font-medium transition cursor-pointer"
+                  :class="closeAction === 'tray' ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-500'"
+                  @click="closeAction = 'tray'; saveAutostartSettings()"
+                >
+                  最小化到托盘
+                </button>
+                <button
+                  type="button"
+                  class="rounded-lg px-2.5 py-1 font-medium transition cursor-pointer"
+                  :class="closeAction === 'exit' ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-500'"
+                  @click="closeAction = 'exit'; saveAutostartSettings()"
+                >
+                  直接退出程序
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 界面与外观主题 -->
+          <section
+            class="grid gap-3 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl sm:grid-cols-2 dark:border-zinc-800 dark:bg-zinc-900/85"
+          >
+            <div class="flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div>
+                <div class="text-xs font-semibold">界面昼夜主题</div>
+                <div class="mt-0.5 text-[11px] text-zinc-400">日间白色毛玻璃 / 夜间深空黑毛玻璃</div>
+              </div>
+              <div class="flex rounded-xl bg-zinc-200/70 p-0.5 text-xs dark:bg-zinc-800">
+                <button
+                  type="button"
+                  class="rounded-lg px-2.5 py-1 font-medium transition cursor-pointer"
+                  :class="!isDark ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500'"
+                  @click="applyTheme(false)"
+                >
+                  ☀ 日间
+                </button>
+                <button
+                  type="button"
+                  class="rounded-lg px-2.5 py-1 font-medium transition cursor-pointer"
+                  :class="isDark ? 'bg-zinc-700 text-white shadow-sm' : 'text-zinc-500'"
+                  @click="applyTheme(true)"
+                >
+                  ☾ 夜间
+                </button>
+              </div>
+            </div>
+
+            <div class="flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div>
+                <div class="text-xs font-semibold">终端画布配色</div>
+                <div class="mt-0.5 text-[11px] text-zinc-400">独立切换终端区域的白底或黑底</div>
+              </div>
+              <div class="flex rounded-xl bg-zinc-200/70 p-0.5 text-xs dark:bg-zinc-800">
+                <button
+                  type="button"
+                  class="rounded-lg px-2.5 py-1 font-medium transition cursor-pointer"
+                  :class="!terminalDark ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500'"
+                  @click="terminalDark = false"
+                >
+                  白底
+                </button>
+                <button
+                  type="button"
+                  class="rounded-lg px-2.5 py-1 font-medium transition cursor-pointer"
+                  :class="terminalDark ? 'bg-zinc-700 text-white shadow-sm' : 'text-zinc-500'"
+                  @click="terminalDark = true"
+                >
+                  黑底
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- 2. MCP Server -->
+        <div v-show="activeSettingsTab === 'mcp'" class="space-y-4">
         <!-- 板块 1：MCP Server 开关与 API Key -->
         <section
           class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
@@ -1629,7 +1958,10 @@ onBeforeUnmount(() => {
             >{{ displayedMcpConfigJson }}</pre>
           </div>
         </section>
+      </div>
 
+      <!-- 分类 2：访问安全 (Security) -->
+      <div v-show="activeSettingsTab === 'security'" class="space-y-4">
         <!-- 板块 2：Web 登录安全与账号密码 -->
         <section
           class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
@@ -1684,61 +2016,134 @@ onBeforeUnmount(() => {
             </button>
           </form>
         </section>
+      </div>
 
-        <!-- 板块 3：外观与终端偏好 -->
+      <!-- 分类 4：关于与更新 (About) -->
+      <div v-show="activeSettingsTab === 'about'" class="space-y-4">
         <section
-          class="grid gap-3 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl sm:grid-cols-2 dark:border-zinc-800 dark:bg-zinc-900/85"
+          class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
         >
-          <div class="flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-800/40">
-            <div>
-              <div class="text-xs font-semibold">界面昼夜主题</div>
-              <div class="mt-0.5 text-[11px] text-zinc-400">日间白色毛玻璃 / 夜间深空黑毛玻璃</div>
+          <div class="flex items-center justify-between border-b border-zinc-100 pb-3.5 dark:border-zinc-800">
+            <div class="flex items-center gap-3">
+              <BrandLogo size="md" />
+              <div>
+                <div class="flex items-center gap-2">
+                  <h3 class="text-base font-bold">VPS Switch</h3>
+                  <span class="rounded-full bg-emerald-100 px-2 py-0.5 font-mono text-[11px] font-semibold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                    {{ updateStatus.currentVersion }}
+                  </span>
+                </div>
+                <p class="text-xs text-zinc-400">
+                  轻量级 VPS 管理工具与 MCP Server · 概念数少于 1Shell · 零模型调用
+                </p>
+              </div>
             </div>
-            <div class="flex rounded-xl bg-zinc-200/70 p-0.5 text-xs dark:bg-zinc-800">
-              <button
-                type="button"
-                class="rounded-lg px-2.5 py-1 font-medium transition"
-                :class="!isDark ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500'"
-                @click="applyTheme(false)"
+
+            <!-- 检查更新按钮 -->
+            <button
+              type="button"
+              class="inline-flex items-center gap-1.5 rounded-xl bg-zinc-900 px-3.5 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white cursor-pointer"
+              :disabled="updateStatus.checking"
+              @click="checkAppUpdate"
+            >
+              <svg
+                class="h-3.5 w-3.5"
+                :class="{ 'animate-spin': updateStatus.checking }"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
               >
-                ☀ 日间
-              </button>
-              <button
-                type="button"
-                class="rounded-lg px-2.5 py-1 font-medium transition"
-                :class="isDark ? 'bg-zinc-700 text-white shadow-sm' : 'text-zinc-500'"
-                @click="applyTheme(true)"
+                <path d="M21 12a9 9 0 1 1-3-6.7" />
+                <path d="M21 3v6h-6" />
+              </svg>
+              <span>{{ updateStatus.checking ? '正在检查...' : '检查更新' }}</span>
+            </button>
+          </div>
+
+          <!-- 更新检测反馈卡片 -->
+          <div
+            v-if="updateStatus.checked"
+            class="rounded-xl border p-4 transition"
+            :class="
+              updateStatus.hasUpdate
+                ? 'border-emerald-200/80 bg-emerald-50/70 dark:border-emerald-900/60 dark:bg-emerald-950/40'
+                : 'border-zinc-200/70 bg-zinc-50/60 dark:border-zinc-800 dark:bg-zinc-800/40'
+            "
+          >
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span
+                  class="h-2 w-2 rounded-full"
+                  :class="updateStatus.hasUpdate ? 'bg-emerald-500 animate-ping' : 'bg-zinc-400'"
+                />
+                <span class="text-xs font-semibold">
+                  {{
+                    updateStatus.hasUpdate
+                      ? `发现新版本 ${updateStatus.latestVersion}`
+                      : `当前已是最新版本 (${updateStatus.currentVersion})`
+                  }}
+                </span>
+              </div>
+              <a
+                v-if="updateStatus.hasUpdate && updateStatus.releaseUrl"
+                :href="updateStatus.releaseUrl"
+                target="_blank"
+                class="text-xs font-semibold text-emerald-600 hover:underline dark:text-emerald-400"
               >
-                ☾ 夜间
-              </button>
+                前往 GitHub 查看发布说明 →
+              </a>
+            </div>
+            <div
+              v-if="updateStatus.hasUpdate && updateStatus.releaseNotes"
+              class="mt-2.5 rounded-lg border border-emerald-200/60 bg-white/80 p-3 font-mono text-xs text-zinc-700 whitespace-pre-wrap dark:border-emerald-900 dark:bg-zinc-900/80 dark:text-zinc-300"
+            >
+              {{ updateStatus.releaseNotes }}
             </div>
           </div>
 
-          <div class="flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-800/40">
-            <div>
-              <div class="text-xs font-semibold">终端画布配色</div>
-              <div class="mt-0.5 text-[11px] text-zinc-400">独立切换终端区域的白底或黑底</div>
+          <!-- 系统运行信息条目 -->
+          <div class="grid gap-2.5 sm:grid-cols-2 text-xs">
+            <div class="rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div class="text-[11px] font-medium text-zinc-400">本地服务监听</div>
+              <div class="mt-1 font-mono font-semibold">127.0.0.1:{{ appAbout?.port || 18800 }}</div>
             </div>
-            <div class="flex rounded-xl bg-zinc-200/70 p-0.5 text-xs dark:bg-zinc-800">
+            <div class="rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div class="text-[11px] font-medium text-zinc-400">技术选型与底座</div>
+              <div class="mt-1 font-mono text-[11px]">Rust + russh + alacritty_terminal + Wry/Tao + Vue 3</div>
+            </div>
+            <div class="sm:col-span-2 rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div class="flex items-center justify-between">
+                <div class="text-[11px] font-medium text-zinc-400">可执行文件绝对路径</div>
+                <button
+                  v-if="appAbout?.exePath"
+                  type="button"
+                  class="text-[11px] text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200 cursor-pointer"
+                  @click="copyText(appAbout.exePath, '已复制程序绝对路径')"
+                >
+                  复制路径
+                </button>
+              </div>
+              <div class="mt-1 font-mono text-[11px] truncate text-zinc-600 dark:text-zinc-300">
+                {{ appAbout?.exePath || 'E:\\1shell4.7\\vps-switch\\target\\release\\vps-switch.exe' }}
+              </div>
+            </div>
+            <div class="sm:col-span-2 flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
+              <div>
+                <div class="text-xs font-semibold">GitHub 官方私有仓库</div>
+                <div class="mt-0.5 font-mono text-[11px] text-zinc-400">https://github.com/weidu12123/vps-switch</div>
+              </div>
               <button
                 type="button"
-                class="rounded-lg px-2.5 py-1 font-medium transition"
-                :class="!terminalDark ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500'"
-                @click="terminalDark = false"
+                class="rounded-lg border border-zinc-200 bg-white px-2.5 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 cursor-pointer"
+                @click="copyText('https://github.com/weidu12123/vps-switch', '已复制 GitHub 仓库链接')"
               >
-                白底
-              </button>
-              <button
-                type="button"
-                class="rounded-lg px-2.5 py-1 font-medium transition"
-                :class="terminalDark ? 'bg-zinc-700 text-white shadow-sm' : 'text-zinc-500'"
-                @click="terminalDark = true"
-              >
-                黑底
+                复制链接
               </button>
             </div>
           </div>
         </section>
+      </div>
       </div>
     </main>
 

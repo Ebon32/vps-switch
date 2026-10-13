@@ -36,6 +36,8 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
@@ -53,6 +55,9 @@ pub struct AppState {
 
 pub fn build_api_router(state: Arc<AppState>) -> Router {
     let protected_api = Router::new()
+        .route("/api/system/about", get(api_get_about))
+        .route("/api/system/autostart", get(api_get_autostart).post(api_set_autostart))
+        .route("/api/system/check-update", post(api_check_update))
         .route("/api/mcp/status", get(api_mcp_status).post(api_mcp_sync))
         .route("/api/settings", get(api_get_settings))
         .route("/api/settings/auth", put(api_update_auth_settings))
@@ -1141,16 +1146,219 @@ async fn api_auth_logout(
         .unwrap()
 }
 
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn check_autostart_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("reg")
+            .args(["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "VPSSwitch"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn set_autostart_enabled(enabled: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        if enabled {
+            let exe = std::env::current_exe()?;
+            let exe_str = exe.to_string_lossy();
+            let cmd_val = format!("\"{}\" --minimized", exe_str);
+            let status = std::process::Command::new("reg")
+                .args([
+                    "add",
+                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                    "/v",
+                    "VPSSwitch",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &cmd_val,
+                    "/f",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()?;
+            if !status.success() {
+                return Err(anyhow::anyhow!("写入 Windows 注册表开机自启失败"));
+            }
+        } else {
+            let _ = std::process::Command::new("reg")
+                .args([
+                    "delete",
+                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                    "/v",
+                    "VPSSwitch",
+                    "/f",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    Ok(())
+}
+
+async fn api_get_autostart(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let enabled = check_autostart_enabled();
+    let close_action = state
+        .db
+        .get_setting("close_action")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "tray".to_string());
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "autostart": enabled,
+            "closeAction": close_action,
+        })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetAutostartPayload {
+    autostart: Option<bool>,
+    close_action: Option<String>,
+}
+
+async fn api_set_autostart(
+    State(state): State<Arc<AppState>>,
+    Json(p): Json<SetAutostartPayload>,
+) -> impl IntoResponse {
+    if let Some(enable) = p.autostart {
+        if let Err(e) = set_autostart_enabled(enable) {
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(ref action) = p.close_action {
+        let valid_action = if action == "exit" { "exit" } else { "tray" };
+        let _ = state.db.set_setting("close_action", valid_action);
+    }
+    let enabled = check_autostart_enabled();
+    let close_action = state
+        .db
+        .get_setting("close_action")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "tray".to_string());
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "autostart": enabled,
+            "closeAction": close_action,
+        })),
+    )
+        .into_response()
+}
+
+async fn api_get_about(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let exe_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "version": format!("v{}", env!("CARGO_PKG_VERSION")),
+            "description": "轻量级 VPS 管理工具与 MCP Server",
+            "exePath": exe_path,
+            "port": state.port,
+            "githubUrl": "https://github.com/weidu12123/vps-switch",
+            "stack": "Rust (Axum + russh + alacritty_terminal + Wry/Tao) + Vue 3",
+        })),
+    )
+}
+
+async fn api_check_update() -> impl IntoResponse {
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    #[cfg(windows)]
+    let gh_res = std::process::Command::new("gh")
+        .args([
+            "release",
+            "view",
+            "--repo",
+            "weidu12123/vps-switch",
+            "--json",
+            "tagName,name,publishedAt,body,url",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    #[cfg(not(windows))]
+    let gh_res = std::process::Command::new("gh")
+        .args([
+            "release",
+            "view",
+            "--repo",
+            "weidu12123/vps-switch",
+            "--json",
+            "tagName,name,publishedAt,body,url",
+        ])
+        .output();
+
+    if let Ok(out) = gh_res {
+        if out.status.success() {
+            if let Ok(info) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                let tag = info["tagName"].as_str().unwrap_or("").trim_start_matches('v');
+                let has_update = !tag.is_empty() && tag != current_version;
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "currentVersion": format!("v{current_version}"),
+                        "latestVersion": info["tagName"].as_str().unwrap_or(&format!("v{current_version}")),
+                        "hasUpdate": has_update,
+                        "publishedAt": info["publishedAt"].as_str(),
+                        "releaseNotes": info["body"].as_str(),
+                        "releaseUrl": info["url"].as_str(),
+                    })),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "currentVersion": format!("v{current_version}"),
+            "latestVersion": format!("v{current_version}"),
+            "hasUpdate": false,
+            "message": "当前已是最新版本",
+            "releaseUrl": "https://github.com/weidu12123/vps-switch",
+        })),
+    )
+}
+
 async fn api_get_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.get_app_settings() {
         Ok(settings) => {
             let cli_sync = sync_cli_mcp_configs(state.port);
+            let autostart = check_autostart_enabled();
+            let close_action = state
+                .db
+                .get_setting("close_action")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "tray".to_string());
             (
                 StatusCode::OK,
                 Json(json!({
                     "ok": true,
                     "settings": settings,
                     "cliSync": cli_sync,
+                    "autostart": autostart,
+                    "closeAction": close_action,
                 })),
             )
                 .into_response()

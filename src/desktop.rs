@@ -179,11 +179,14 @@ pub fn run_desktop_window(
     let win_icon = WindowIcon::from_rgba(rgba64.clone(), 64, 64).ok();
     let tray_icon_img = TrayIconImage::from_rgba(rgba64, 64, 64)?;
 
+    let start_minimized = std::env::args().any(|a| a == "--minimized" || a == "--hidden");
+
     let window = WindowBuilder::new()
         .with_title("VPS Switch")
         .with_inner_size(Size::Logical(LogicalSize::new(1280.0, 800.0)))
         .with_min_inner_size(Size::Logical(LogicalSize::new(920.0, 600.0)))
         .with_window_icon(win_icon.clone())
+        .with_visible(!start_minimized)
         .build(&event_loop)?;
 
     let url = format!("http://127.0.0.1:{port}");
@@ -227,8 +230,21 @@ pub fn run_desktop_window(
                 ..
             } => {
                 if window_id == window.id() {
-                    // 点击主窗口右上角 × 最小化驻留到系统托盘，保持后台不断连
-                    window.set_visible(false);
+                    let close_action = state
+                        .db
+                        .get_setting("close_action")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "tray".to_string());
+                    if close_action == "exit" {
+                        standalone_windows.clear();
+                        host_to_window.clear();
+                        let _ = tray_icon.take();
+                        *control_flow = ControlFlow::Exit;
+                    } else {
+                        // 默认最小化驻留到系统托盘，保持后台不断连
+                        window.set_visible(false);
+                    }
                 } else if let Some(removed) = standalone_windows.remove(&window_id) {
                     // 独立终端窗口点击 ×：完全关闭并销毁该窗口
                     host_to_window.remove(&removed.host_id);
