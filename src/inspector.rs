@@ -197,23 +197,71 @@ impl InspectorEngine {
             }
         };
 
-        let raw = match exec_short_command(&session, LINUX_INSPECT_SCRIPT).await {
-            Ok(r) => r,
-            Err(err) => {
-                pool.invalidate_host(host_id).await;
-                let _ = db.update_check_result(
-                    host_id,
-                    false,
-                    None,
-                    None,
-                    Some(format!("{err:#}")),
-                );
-                return Err(err);
-            }
-        };
-        let latency_ms = started.elapsed().as_millis() as i64;
+        let is_windows = record
+            .os_info
+            .as_ref()
+            .and_then(|o| o.os.as_deref())
+            .map(|s| s.eq_ignore_ascii_case("windows"))
+            .unwrap_or(false);
 
-        let (inspection, os_info) = self.parse_linux_inspection(host_id, &raw)?;
+        let (inspection, os_info) = if is_windows {
+            let win_script = r#"$ProgressPreference = 'SilentlyContinue'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$os = Get-CimInstance Win32_OperatingSystem
+$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+$disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object { "$($_.DeviceID)/:$($_.Size):$($_.Size - $_.FreeSpace)" }
+$net = Get-NetAdapterStatistics | Where-Object { $_.ReceivedBytes -gt 0 } | Sort-Object ReceivedBytes -Descending | Select-Object -First 1
+$up = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
+$mt = [uint64]$os.TotalVisibleMemorySize * 1024
+$mf = [uint64]$os.FreePhysicalMemory * 1024
+$mu = if ($mt -gt $mf) { $mt - $mf } else { 0 }
+Write-Output "UP=$up"
+Write-Output "CPU_PCT=$($cpu.LoadPercentage)"
+Write-Output "CPU_NAME=$($cpu.Name)"
+Write-Output "CORES=$([Environment]::ProcessorCount)"
+Write-Output "MEM=$mt $mu"
+Write-Output "DISKS=$($disks -join '|')"
+Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
+"#;
+            let utf16: Vec<u8> = win_script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&utf16);
+            let win_cmd = format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64}");
+
+            let raw = match exec_short_command(&session, &win_cmd).await {
+                Ok(r) => r,
+                Err(err) => {
+                    pool.invalidate_host(host_id).await;
+                    let _ = db.update_check_result(
+                        host_id,
+                        false,
+                        None,
+                        None,
+                        Some(format!("{err:#}")),
+                    );
+                    return Err(err);
+                }
+            };
+            self.parse_windows_inspection_text(host_id, &raw)?
+        } else {
+            let raw = match exec_short_command(&session, LINUX_INSPECT_SCRIPT).await {
+                Ok(r) => r,
+                Err(err) => {
+                    pool.invalidate_host(host_id).await;
+                    let _ = db.update_check_result(
+                        host_id,
+                        false,
+                        None,
+                        None,
+                        Some(format!("{err:#}")),
+                    );
+                    return Err(err);
+                }
+            };
+            self.parse_linux_inspection(host_id, &raw)?
+        };
+
+        let latency_ms = started.elapsed().as_millis() as i64;
         let _ = db.update_check_result(host_id, true, Some(latency_ms), Some(os_info), None);
         self.latest_snapshots
             .lock()
@@ -447,6 +495,15 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
         cmd.creation_flags(0x08000000);
         let out = cmd.output().await?;
         let text = String::from_utf8_lossy(&out.stdout);
+        let (ins, _) = self.parse_windows_inspection_text(LOCAL_HOST_ID, &text)?;
+        Ok(ins)
+    }
+
+    fn parse_windows_inspection_text(
+        &self,
+        host_id: &str,
+        text: &str,
+    ) -> Result<(HostInspection, OsInfo)> {
         let mut map = HashMap::new();
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
@@ -468,8 +525,6 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
             if item.trim().is_empty() {
                 continue;
             }
-            let mut p = item.split(':');
-            // Windows mount has C:/ so first two parts are "C" and "/"
             let parts: Vec<&str> = item.split(':').collect();
             if parts.len() >= 4 {
                 let mount = format!("{}:{}", parts[0], parts[1]);
@@ -482,17 +537,20 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
                         used_bytes: used,
                     });
                 }
-            } else if let (Some(m), Some(tot), Some(used)) = (
-                p.next(),
-                p.next().and_then(|s| s.parse::<u64>().ok()),
-                p.next().and_then(|s| s.parse::<u64>().ok()),
-            ) {
-                if tot > 0 {
-                    disks.push(DiskUsageItem {
-                        mount: m.to_string(),
-                        total_bytes: tot,
-                        used_bytes: used,
-                    });
+            } else {
+                let mut p = item.split(':');
+                if let (Some(m), Some(tot), Some(used)) = (
+                    p.next(),
+                    p.next().and_then(|s| s.parse::<u64>().ok()),
+                    p.next().and_then(|s| s.parse::<u64>().ok()),
+                ) {
+                    if tot > 0 {
+                        disks.push(DiskUsageItem {
+                            mount: m.to_string(),
+                            total_bytes: tot,
+                            used_bytes: used,
+                        });
+                    }
                 }
             }
         }
@@ -510,7 +568,7 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
         let now_inst = Instant::now();
         let (net_rx_bps, net_tx_bps) = {
             let mut guard = self.prev_samples.lock().unwrap();
-            let rates = if let Some(prev) = guard.get(LOCAL_HOST_ID) {
+            let rates = if let Some(prev) = guard.get(host_id) {
                 let elapsed = now_inst.duration_since(prev.at).as_secs_f64();
                 if elapsed > 0.2 {
                     (
@@ -524,7 +582,7 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
                 (0, 0)
             };
             guard.insert(
-                LOCAL_HOST_ID.to_string(),
+                host_id.to_string(),
                 PrevHostSample {
                     at: now_inst,
                     cpu: CpuTicks {
@@ -548,15 +606,15 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
             rates
         };
 
-        Ok(HostInspection {
-            host_id: LOCAL_HOST_ID.to_string(),
+        let inspection = HostInspection {
+            host_id: host_id.to_string(),
             sampled_at: Utc::now().to_rfc3339(),
             uptime_seconds,
             load_1: 0.0,
             load_5: 0.0,
             load_15: 0.0,
             tcp_cc: None,
-            cpu_model,
+            cpu_model: cpu_model.clone(),
             cpu_cores,
             cpu_usage_pct,
             cpu_iowait_pct: 0.0,
@@ -575,7 +633,21 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
             net_tx_bytes_total: net_tx,
             net_rx_bps,
             net_tx_bps,
-        })
+        };
+
+        let os_info = OsInfo {
+            os: Some("windows".to_string()),
+            distro_id: Some("windows".to_string()),
+            version_id: None,
+            pretty_name: Some("Windows".to_string()),
+            kernel: None,
+            arch: if cpu_cores >= 8 { Some("x86_64".to_string()) } else { Some("x86".to_string()) },
+            cpu_model,
+            cpu_cores: Some(cpu_cores as u32),
+            detected_at: Some(Utc::now().to_rfc3339()),
+        };
+
+        Ok((inspection, os_info))
     }
 }
 

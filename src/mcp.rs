@@ -329,6 +329,70 @@ async fn run_local_exec_task(
     g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
 }
 
+fn wrap_windows_remote_command(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.starts_with("powershell") || trimmed.starts_with("cmd.exe") {
+        return cmd.to_string();
+    }
+
+    let payload = format!(
+        "$ProgressPreference = 'SilentlyContinue'\n\
+         try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}\n\
+         $global:LASTEXITCODE = $null\n\
+         {}\n\
+         $__vpsOk = $?\n\
+         if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}\n\
+         if (-not $__vpsOk) {{ exit 1 }}\n\
+         exit 0",
+        trimmed
+    );
+
+    let utf16_bytes: Vec<u8> = payload
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&utf16_bytes);
+
+    format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64}")
+}
+
+fn clean_clixml_stderr(raw: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(raw);
+    if !text.contains("<Objs") && !text.contains("#< CLIXML") {
+        return raw.to_vec();
+    }
+    let mut result = String::new();
+    let mut cursor = 0;
+    while let Some(start_tag) = text[cursor..].find("<S") {
+        let tag_start = cursor + start_tag;
+        if let Some(close_bracket) = text[tag_start..].find('>') {
+            let content_start = tag_start + close_bracket + 1;
+            if let Some(end_tag) = text[content_start..].find("</S>") {
+                let content = &text[content_start..content_start + end_tag];
+                let unescaped = content
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&apos;", "'")
+                    .replace("&amp;", "&")
+                    .replace("_x000D__x000A_", "\n")
+                    .replace("_x000D_", "\r")
+                    .replace("_x000A_", "\n");
+                result.push_str(&unescaped);
+                cursor = content_start + end_tag + 4;
+                continue;
+            }
+        }
+        cursor += 2;
+    }
+    if result.is_empty() {
+        text.replace("#< CLIXML", "").into_bytes()
+    } else {
+        result.into_bytes()
+    }
+}
+
 async fn run_ssh_exec_task(
     state: &Arc<AppState>,
     host: &HostRecord,
@@ -348,7 +412,20 @@ async fn run_ssh_exec_task(
         }
     };
 
-    if let Err(e) = channel.exec(true, cmd).await {
+    let is_windows = host
+        .os_info
+        .as_ref()
+        .and_then(|o| o.os.as_deref())
+        .map(|s| s.eq_ignore_ascii_case("windows"))
+        .unwrap_or(false);
+
+    let final_cmd = if is_windows {
+        wrap_windows_remote_command(cmd)
+    } else {
+        cmd.to_string()
+    };
+
+    if let Err(e) = channel.exec(true, final_cmd.as_str()).await {
         let mut g = inner.lock().unwrap();
         g.state = "failed".to_string();
         g.stderr
@@ -373,7 +450,12 @@ async fn run_ssh_exec_task(
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         let mut g = inner.lock().unwrap();
-                        g.stderr.extend_from_slice(&data);
+                        let cleaned = if is_windows {
+                            clean_clixml_stderr(&data)
+                        } else {
+                            data.to_vec()
+                        };
+                        g.stderr.extend_from_slice(&cleaned);
                         g.last_output_inst = Instant::now();
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
