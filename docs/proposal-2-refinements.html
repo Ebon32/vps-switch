@@ -1,0 +1,421 @@
+<title>方案 2 深度微调与进化</title>
+<style>
+  :root {
+    --bg-ground: #0a0a0c;
+    --surface-card: #141417;
+    --border-subtle: #27272a;
+    --text-primary: #ffffff;
+    --text-muted: #a1a1aa;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg-ground);
+    color: var(--text-primary);
+    padding: 36px 20px;
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .container {
+    max-width: 1080px;
+    margin: 0 auto;
+  }
+
+  .header {
+    text-align: center;
+    margin-bottom: 32px;
+  }
+  .header h1 {
+    font-size: 26px;
+    font-weight: 800;
+    margin: 0 0 8px 0;
+    letter-spacing: -0.03em;
+  }
+  .header p {
+    font-size: 14px;
+    color: var(--text-muted);
+    max-width: 620px;
+    margin: 0 auto;
+  }
+
+  .diagnosis-box {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 16px 20px;
+    margin-bottom: 32px;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .diagnosis-box strong {
+    color: #ffffff;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 20px;
+    margin-bottom: 36px;
+  }
+
+  .card {
+    background: var(--surface-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 20px;
+    padding: 22px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+    position: relative;
+    transition: border-color 0.2s ease, transform 0.2s ease;
+  }
+  .card:hover {
+    border-color: #52525b;
+    transform: translateY(-2px);
+  }
+
+  .badge-tag {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: #ffffff;
+    color: #000000;
+  }
+
+  .card-title {
+    font-size: 16px;
+    font-weight: 800;
+    margin: 0 0 4px 0;
+    letter-spacing: -0.01em;
+  }
+  .card-subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0 0 16px 0;
+  }
+
+  .hero-icon-box {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 24px 0;
+    background: radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.05), transparent 70%);
+    border-radius: 14px;
+    margin-bottom: 18px;
+  }
+
+  .hero-svg {
+    width: 100px;
+    height: 100px;
+    filter: drop-shadow(0 8px 20px rgba(0, 0, 0, 0.35));
+    transition: transform 0.2s ease;
+  }
+  .hero-svg:hover {
+    transform: scale(1.08);
+  }
+
+  .section-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }
+
+  .scale-preview {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    padding: 12px 14px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    margin-bottom: 12px;
+  }
+  .scale-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+  .scale-caption {
+    font-size: 9px;
+    color: var(--text-muted);
+    font-family: monospace;
+  }
+
+  .taskbar-sim {
+    padding: 10px 14px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+    background: #000000;
+    border: 1px solid #27272a;
+  }
+  .taskbar-sim-title {
+    font-size: 10px;
+    font-weight: 600;
+    color: #a1a1aa;
+  }
+
+  .feature-list {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 0 0;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .feature-list li {
+    margin-bottom: 4px;
+    display: flex;
+    align-items: flex-start;
+    gap: 5px;
+  }
+  .feature-list li::before {
+    content: "■";
+    font-size: 7px;
+    color: #ffffff;
+    margin-top: 4px;
+  }
+</style>
+
+<div class="container">
+  <div class="header">
+    <h1>方案 2「折角穿梭」精准手术级微调</h1>
+    <p>第二套为什么你觉得「有点感觉，但总感觉差点」？因为抓住了黑白对冲动势的胚子，但细节被中间多余的圆点和生硬的粗细断层破坏了呼吸感。</p>
+  </div>
+
+  <div class="diagnosis-box">
+    <strong>🎯 病因诊断：为什么之前差点意思？</strong><br>
+    1. <strong>中间那个圆点是多余的</strong>：在 <code>&gt;</code> 和 <code>&lt;</code> 中间放一个点，远看像个颜文字表情包 <code>&gt;·&lt;</code>，破坏了严肃的工程张力。<br>
+    2. <strong>两条折角各玩各的</strong>：左边实心右边半透明，没有真正<strong>咬合交织</strong>，缺乏顶级品牌（如 Linear、Next.js）那种呼之欲出的整体性。
+  </div>
+
+  <div class="grid">
+    <!-- 2A：双折角错位咬合通道 -->
+    <div class="card">
+      <span class="badge-tag">力荐 · 呼吸负空间</span>
+      <h2 class="card-title">2A · 刀锋交错咬合</h2>
+      <p class="card-subtitle">去掉多余圆点 · 几何刀锋对咬 · 纯粹张力</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+          <!-- 左右两个折角在中央优雅穿插，形成极速 Switch 的流转感 -->
+          <path d="M15 18 L31 32 L15 46" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M49 46 L33 32 L49 18" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M15 18 L31 32 L15 46" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/>
+            <path d="M49 46 L33 32 L49 18" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M15 18 L31 32 L15 46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+            <path d="M49 46 L33 32 L49 18" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M15 17 L32 32 L15 47" stroke="#FFFFFF" stroke-width="8" stroke-linecap="round"/>
+            <path d="M49 47 L32 32 L49 17" stroke="#FFFFFF" stroke-width="8" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M15 18 L31 32 L15 46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/><path d="M49 46 L33 32 L49 18" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>改动精髓</strong>：彻底删掉弱智圆点，左右两条主折角同等粗壮对称咬合。</li>
+        <li><strong>视觉意象</strong>：像两个交错的纯白刀锋，中间留出一道呼吸负空间，极具现代张力。</li>
+      </ul>
+    </div>
+
+    <!-- 2B：双层追加穿梭 >> (Shell 重定向与极速跳转) -->
+    <div class="card">
+      <span class="badge-tag">Shell 本质 · 瞬切速度</span>
+      <h2 class="card-title">2B · 极速重定向 &gt;&gt;</h2>
+      <p class="card-subtitle">Shell 终端重定向符号 &gt;&gt; · 绝对速度与瞬连</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+          <!-- 前后叠进的两个粗壮命令符 >> (Shell 开发者心智最深处的符号) -->
+          <path d="M16 19 L29 32 L16 45" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M32 19 L45 32 L32 45" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 19 L29 32 L16 45" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="6.5" stroke-linecap="round"/>
+            <path d="M32 19 L45 32 L32 45" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 19 L29 32 L16 45" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="7" stroke-linecap="round"/>
+            <path d="M32 19 L45 32 L32 45" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 18 L29 32 L16 46" stroke="#FFFFFF" stroke-opacity="0.5" stroke-width="7.5" stroke-linecap="round"/>
+            <path d="M33 18 L46 32 L33 46" stroke="#FFFFFF" stroke-width="7.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M16 19 L29 32 L16 45" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="6.5" stroke-linecap="round"/><path d="M32 19 L45 32 L32 45" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>开发者共鸣</strong>：<code>&gt;&gt;</code> 是 Linux Shell 里最熟悉不过的输出重定向符，也是快速穿梭（Fast Forward）的象征。</li>
+        <li><strong>层次感强</strong>：前亮后暗，充满冲破屏幕的速度感。</li>
+      </ul>
+    </div>
+
+    <!-- 2C：终极黄金比例 > 与光标折线 -->
+    <div class="card">
+      <span class="badge-tag">黄金比例 · 极致干脆</span>
+      <h2 class="card-title">2C · 纯粹主折角 &gt; _</h2>
+      <p class="card-subtitle">单体粗壮霸道命令符 &gt; · 搭配水平光标下划线</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+          <!-- 一个比例极度协调的大号粗终端折角 > 与实心下划线 _ -->
+          <path d="M16 18 L31 32 L16 46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+          <line x1="36" y1="46" x2="48" y2="46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 18 L31 32 L16 46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+            <line x1="36" y1="46" x2="48" y2="46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 18 L31 32 L16 46" stroke="#FFFFFF" stroke-width="7.5" stroke-linecap="round"/>
+            <line x1="36" y1="46" x2="48" y2="46" stroke="#FFFFFF" stroke-width="7.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M15 17 L31 32 L15 47" stroke="#FFFFFF" stroke-width="8.5" stroke-linecap="round"/>
+            <line x1="36" y1="47" x2="49" y2="47" stroke="#FFFFFF" stroke-width="8.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M16 18 L31 32 L16 46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/><line x1="36" y1="46" x2="48" y2="46" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>纯粹终端自信</strong>：对标 Apple 和 Vercel 的单体标志逻辑，纯粹靠粗壮的黄金分割笔触说话。</li>
+        <li><strong>无论多小都清晰</strong>：下划线 <code>_</code> 像基座一样托住折角，端庄沉稳。</li>
+      </ul>
+    </div>
+
+    <!-- 2D：S 型回路折角 (真正的 Switch 意象) -->
+    <div class="card">
+      <span class="badge-tag">Switch 概念正宗</span>
+      <h2 class="card-title">2D · 闭合 S 轨回折</h2>
+      <p class="card-subtitle">两条终端折线相互勾结 · 抽象构成字母 S</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+          <!-- 纯白一体式 S 型折线回路：上折向右，下折向左，中央闭环 -->
+          <path d="M43 20 H25 C19.5 20 17 24 19 28 L27 34 H39 C45 34 47 38 45 42 L39 46 H21" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M43 20 H25 C19.5 20 17 24 19 28 L27 34 H39 C45 34 47 38 45 42 L39 46 H21" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M43 20 H25 C19.5 20 17 24 19 28 L27 34 H39 C45 34 47 38 45 42 L39 46 H21" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M43 20 H25 C19.5 20 17 24 19 28 L27 34 H39 C45 34 47 38 45 42 L39 46 H21" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M43 20 H25 C19.5 20 17 24 19 28 L27 34 H39 C45 34 47 38 45 42 L39 46 H21" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>字标 Monogram</strong>：将 Switch 的字母 <code>S</code> 融入终端折角，一条连续的纯白光带一气呵成。</li>
+        <li><strong>标志性极强</strong>：类似高端汽车车标或现代框架的几何剪影。</li>
+      </ul>
+    </div>
+  </div>
+</div>

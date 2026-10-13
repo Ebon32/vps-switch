@@ -6,7 +6,7 @@ defineProps<{
 
 <template>
   <div
-    class=" relative inline-flex shrink-0 items-center justify-center overflow-hidden bg-zinc-900 shadow-[0_2px_8px_rgba(24,24,27,0.18)] ring-1 ring-black/5 dark:bg-zinc-100 dark:ring-white/10"
+    class="relative inline-flex shrink-0 items-center justify-center overflow-hidden bg-black shadow-[0_2px_8px_rgba(0,0,0,0.3)] ring-1 ring-white/15 dark:bg-black dark:ring-white/20"
     :class="{
       'h-7 w-7 rounded-lg': !size || size === 'sm',
       'h-9 w-9 rounded-xl': size === 'md',
@@ -14,31 +14,14 @@ defineProps<{
     }"
   >
     <svg
-      class="h-[72%] w-[72%]"
-      viewBox="0 0 40 40"
+      class="h-[75%] w-[75%]"
+      viewBox="0 0 64 64"
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
     >
-      <!-- 左侧终端命令符 > -->
-      <path
-        d="M8.5 12.5L16.5 20L8.5 27.5"
-        class="stroke-white dark:stroke-zinc-900"
-        stroke-width="3.4"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-      />
-      <!-- 右侧 Switch 胶囊拨杆轨道 -->
-      <rect
-        x="19.5"
-        y="14.5"
-        width="13"
-        height="11"
-        rx="5.5"
-        class="stroke-white/35 fill-white/10 dark:stroke-zinc-900/35 dark:fill-zinc-900/10"
-        stroke-width="2"
-      />
-      <!-- 激活态活力橙圆点（呼应右上角 + 与 Switch 概念） -->
-      <circle cx="27" cy="20" r="3.4" fill="#F97316" />
+      <path d="M16 18 H38 V26 H24 V40 H16 Z" fill="#FFFFFF" />
+      <path d="M48 46 H26 V38 H40 V24 H48 Z" fill="#FFFFFF" />
+      <circle cx="32" cy="32" r="3.5" fill="#FFFFFF" />
     </svg>
   </div>
 </template>

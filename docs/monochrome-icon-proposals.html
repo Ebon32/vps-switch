@@ -1,0 +1,413 @@
+<title>VPS Switch 纯粹黑白图标方案</title>
+<style>
+  :root {
+    --bg-ground: #f8fafc;
+    --surface-card: #ffffff;
+    --border-subtle: #e2e8f0;
+    --text-primary: #000000;
+    --text-muted: #64748b;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg-ground: #0a0a0c;
+      --surface-card: #141417;
+      --border-subtle: #27272a;
+      --text-primary: #ffffff;
+      --text-muted: #a1a1aa;
+      color-scheme: dark;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg-ground: #0a0a0c;
+    --surface-card: #141417;
+    --border-subtle: #27272a;
+    --text-primary: #ffffff;
+    --text-muted: #a1a1aa;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg-ground);
+    color: var(--text-primary);
+    padding: 36px 20px;
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .container {
+    max-width: 1040px;
+    margin: 0 auto;
+  }
+
+  .header {
+    text-align: center;
+    margin-bottom: 36px;
+  }
+  .header h1 {
+    font-size: 26px;
+    font-weight: 800;
+    margin: 0 0 8px 0;
+    letter-spacing: -0.03em;
+  }
+  .header p {
+    font-size: 14px;
+    color: var(--text-muted);
+    max-width: 600px;
+    margin: 0 auto;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+    gap: 24px;
+    margin-bottom: 36px;
+  }
+
+  .card {
+    background: var(--surface-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 20px;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+    position: relative;
+  }
+
+  .badge-tag {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 20px;
+    background: #000000;
+    color: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    .badge-tag {
+      background: #ffffff;
+      color: #000000;
+    }
+  }
+
+  .card-title {
+    font-size: 17px;
+    font-weight: 800;
+    margin: 0 0 4px 0;
+    letter-spacing: -0.01em;
+  }
+  .card-subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0 0 20px 0;
+  }
+
+  .hero-icon-box {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 28px 0;
+    background: radial-gradient(circle at 50% 50%, rgba(0, 0, 0, 0.04), transparent 70%);
+    border-radius: 16px;
+    margin-bottom: 20px;
+  }
+
+  .hero-svg {
+    width: 128px;
+    height: 128px;
+    filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.18));
+    transition: transform 0.2s ease;
+  }
+  .hero-svg:hover {
+    transform: scale(1.06);
+  }
+
+  .section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+  }
+
+  .scale-preview {
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    padding: 16px;
+    background: rgba(0, 0, 0, 0.02);
+    border: 1px solid var(--border-subtle);
+    border-radius: 14px;
+    margin-bottom: 16px;
+  }
+  .scale-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .scale-caption {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: monospace;
+  }
+
+  .taskbar-sim {
+    padding: 12px 16px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .taskbar-dark {
+    background: #000000;
+    color: #e2e8f0;
+  }
+  .taskbar-light {
+    background: #ffffff;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+  }
+  .taskbar-sim-title {
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .feature-list {
+    list-style: none;
+    padding: 0;
+    margin: 14px 0 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .feature-list li {
+    margin-bottom: 6px;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .feature-list li::before {
+    content: "■";
+    font-size: 8px;
+    color: var(--text-primary);
+    margin-top: 3px;
+  }
+</style>
+
+<div class="container">
+  <div class="header">
+    <h1>VPS Switch 纯粹黑白（Monochrome）方案</h1>
+    <p>剥除所有杂色干扰。黑白是最高级的克制，以纯粹的高对比线条与负空间，雕琢终极耐看的 SSH 工具徽记。</p>
+  </div>
+
+  <div class="grid">
+    <!-- 方案 1：Termius 式黑白经典云端与终端 -->
+    <div class="card">
+      <span class="badge-tag">首推 · Termius 纯黑白神韵</span>
+      <h2 class="card-title">方案 1 · 云端终端符（Termius 单色重构）</h2>
+      <p class="card-subtitle">纯黑底块 · 纯白云端负空间 · 洗练终端光标 &gt; _</p>
+
+      <div class="hero-icon-box">
+        <!-- SVG 1: Termius 式纯黑白 -->
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- 纯黑圆角基底 -->
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <!-- 微光白边，在深色背景下轮廓分明 -->
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="1.5"/>
+
+          <!-- Termius 式极简云朵剪影轮廓 (VPS 云端) -->
+          <path d="M20 41 H44 C48.5 41 51 37.5 50 33.5 C49.5 30 46 28 42.5 28.5 C41.5 23 37.5 19 32 19 C27.5 19 23.5 22 22 26.5 C17.5 27 14.5 31 15 35 C15.5 39 18 41 20 41 Z" stroke="#FFFFFF" stroke-width="2.8" stroke-linejoin="round" fill="none"/>
+
+          <!-- 内部核心：极致干脆的终端提示符 > _ -->
+          <path d="M26 27 L32 32 L26 37" stroke="#FFFFFF" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <line x1="35" y1="37" x2="41" y2="37" stroke="#FFFFFF" stroke-width="4.2" stroke-linecap="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="48" height="48" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M20 41 H44 C48.5 41 51 37.5 50 33.5 C49.5 30 46 28 42.5 28.5 C41.5 23 37.5 19 32 19 C27.5 19 23.5 22 22 26.5 C17.5 27 14.5 31 15 35 C15.5 39 18 41 20 41 Z" stroke="#FFFFFF" stroke-width="2.8" stroke-linejoin="round" fill="none"/>
+            <path d="M26 27 L32 32 L26 37" stroke="#FFFFFF" stroke-width="4.2" stroke-linecap="round"/>
+            <line x1="35" y1="37" x2="41" y2="37" stroke="#FFFFFF" stroke-width="4.2" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">48px 窗口</span>
+        </div>
+        <div class="scale-item">
+          <svg width="32" height="32" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M26 27 L32 32 L26 37" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/>
+            <line x1="35" y1="37" x2="41" y2="37" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">32px 任务栏</span>
+        </div>
+        <div class="scale-item">
+          <svg width="20" height="20" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M23 26 L31 32 L23 38" stroke="#FFFFFF" stroke-width="5.5" stroke-linecap="round"/>
+            <line x1="33" y1="38" x2="41" y2="38" stroke="#FFFFFF" stroke-width="5.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">20px 托盘</span>
+        </div>
+      </div>
+
+      <div class="section-label">Windows 任务栏环境模拟</div>
+      <div class="taskbar-sim taskbar-dark">
+        <span class="taskbar-sim-title">深色任务栏</span>
+        <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M24 26 L31 32 L24 38" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/><line x1="34" y1="38" x2="40" y2="38" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/></svg>
+      </div>
+      <div class="taskbar-sim taskbar-light">
+        <span class="taskbar-sim-title">浅色任务栏</span>
+        <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000"/><path d="M24 26 L31 32 L24 38" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/><line x1="34" y1="38" x2="40" y2="38" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>就是 Termius 的纯粹黑白形态</strong>：云朵轮廓（云端 VPS）+ 终端字符 <code>&gt; _</code>，绝无多余点缀。</li>
+        <li><strong>零杂色</strong>：纯黑与纯白的最高对比，小到托盘就是一个清晰的白光终端符。</li>
+      </ul>
+    </div>
+
+    <!-- 方案 2：黑白极简折角穿梭 Switch (纯几何力量感) -->
+    <div class="card">
+      <span class="badge-tag">对标 Vercel / Next.js 极简刀锋</span>
+      <h2 class="card-title">方案 2 · 对冲穿梭折角（双向 Switch）</h2>
+      <p class="card-subtitle">极简双向命令提示符 · 纯黑底白光雕 · 锐利有力</p>
+
+      <div class="hero-icon-box">
+        <!-- SVG 2: 纯黑白对冲穿梭折角 -->
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="1.5"/>
+
+          <!-- 两个粗壮有力的对冲折角，形成极具动势的 Switch 负空间通道 -->
+          <!-- 左折角 > (实心粗体) -->
+          <path d="M17 19 L30 32 L17 45" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <!-- 右反向折角 < (半透明负空间白) -->
+          <path d="M47 45 L34 32 L47 19" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <!-- 中央连通核点 -->
+          <circle cx="32" cy="32" r="3.5" fill="#FFFFFF"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="48" height="48" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M17 19 L30 32 L17 45" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/>
+            <path d="M47 45 L34 32 L47 19" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="4.5" stroke-linecap="round"/>
+            <circle cx="32" cy="32" r="3.5" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">48px 窗口</span>
+        </div>
+        <div class="scale-item">
+          <svg width="32" height="32" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M17 19 L30 32 L17 45" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/>
+            <path d="M47 45 L34 32 L47 19" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="4.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">32px 任务栏</span>
+        </div>
+        <div class="scale-item">
+          <svg width="20" height="20" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M18 19 L31 32 L18 45" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+            <circle cx="44" cy="32" r="4.5" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">20px 托盘</span>
+        </div>
+      </div>
+
+      <div class="section-label">Windows 任务栏环境模拟</div>
+      <div class="taskbar-sim taskbar-dark">
+        <span class="taskbar-sim-title">深色任务栏</span>
+        <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M18 20 L30 32 L18 44" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/><circle cx="43" cy="32" r="4" fill="#FFFFFF"/></svg>
+      </div>
+      <div class="taskbar-sim taskbar-light">
+        <span class="taskbar-sim-title">浅色任务栏</span>
+        <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000"/><path d="M18 20 L30 32 L18 44" stroke="#FFFFFF" stroke-width="6.5" stroke-linecap="round"/><circle cx="43" cy="32" r="4" fill="#FFFFFF"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>极简几何动势</strong>：主折角 <code>&gt;</code> 搭配反向虚角，直接用终端字符构成极速切换（Switch）的节奏。</li>
+        <li><strong>高密度力量感</strong>：线条粗壮自信，没有任何轻飘飘的杂质。</li>
+      </ul>
+    </div>
+
+    <!-- 方案 3：纯白底瓷白 · 纯黑雕刻印章 (完全反色款) -->
+    <div class="card">
+      <span class="badge-tag">纯白底 · 黑标微浮雕</span>
+      <h2 class="card-title">方案 3 · 瓷白反色 · 极简黑印章</h2>
+      <p class="card-subtitle">纯白基底 · 纯黑雕刻印记 · 与浅色毛玻璃完美一体</p>
+
+      <div class="hero-icon-box">
+        <!-- SVG 3: 纯白底黑标 -->
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- 纯白圆角基底，带微冷灰边框 -->
+          <rect width="64" height="64" rx="16" fill="#FFFFFF"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#CBD5E1" stroke-width="1.5"/>
+
+          <!-- 内部纯黑 Termius 云端终端图腾 -->
+          <path d="M20 41 H44 C48.5 41 51 37.5 50 33.5 C49.5 30 46 28 42.5 28.5 C41.5 23 37.5 19 32 19 C27.5 19 23.5 22 22 26.5 C17.5 27 14.5 31 15 35 C15.5 39 18 41 20 41 Z" stroke="#000000" stroke-width="2.8" stroke-linejoin="round" fill="none"/>
+
+          <path d="M26 27 L32 32 L26 37" stroke="#000000" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <line x1="35" y1="37" x2="41" y2="37" stroke="#000000" stroke-width="4.2" stroke-linecap="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="48" height="48" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.5"/>
+            <path d="M20 41 H44 C48.5 41 51 37.5 50 33.5 C49.5 30 46 28 42.5 28.5 C41.5 23 37.5 19 32 19 C27.5 19 23.5 22 22 26.5 C17.5 27 14.5 31 15 35 C15.5 39 18 41 20 41 Z" stroke="#000000" stroke-width="2.8" stroke-linejoin="round" fill="none"/>
+            <path d="M26 27 L32 32 L26 37" stroke="#000000" stroke-width="4.2" stroke-linecap="round"/>
+            <line x1="35" y1="37" x2="41" y2="37" stroke="#000000" stroke-width="4.2" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">48px 窗口</span>
+        </div>
+        <div class="scale-item">
+          <svg width="32" height="32" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.5"/>
+            <path d="M26 27 L32 32 L26 37" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
+            <line x1="35" y1="37" x2="41" y2="37" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">32px 任务栏</span>
+        </div>
+        <div class="scale-item">
+          <svg width="20" height="20" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.5"/>
+            <path d="M23 26 L31 32 L23 38" stroke="#000000" stroke-width="5.5" stroke-linecap="round"/>
+            <line x1="33" y1="38" x2="41" y2="38" stroke="#000000" stroke-width="5.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">20px 托盘</span>
+        </div>
+      </div>
+
+      <div class="section-label">Windows 任务栏环境模拟</div>
+      <div class="taskbar-sim taskbar-dark">
+        <span class="taskbar-sim-title">深色任务栏</span>
+        <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#FFFFFF"/><path d="M24 26 L31 32 L24 38" stroke="#000000" stroke-width="5" stroke-linecap="round"/><line x1="34" y1="38" x2="40" y2="38" stroke="#000000" stroke-width="5" stroke-linecap="round"/></svg>
+      </div>
+      <div class="taskbar-sim taskbar-light">
+        <span class="taskbar-sim-title">浅色任务栏</span>
+        <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#FFFFFF" stroke="#94A3B8"/><path d="M24 26 L31 32 L24 38" stroke="#000000" stroke-width="5" stroke-linecap="round"/><line x1="34" y1="38" x2="40" y2="38" stroke="#000000" stroke-width="5" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>白底黑标</strong>：专为偏好浅色系、白瓷美学的用户打造。</li>
+        <li><strong>如印章般醒目</strong>：在深色任务栏上如一块纯净白玉，极为吸睛。</li>
+      </ul>
+    </div>
+  </div>
+</div>

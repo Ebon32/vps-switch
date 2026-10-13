@@ -1,9 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <rect width="64" height="64" rx="16" fill="#18181B"/>
-  <rect x="2" y="2" width="60" height="60" rx="14" stroke="white" stroke-opacity="0.1" stroke-width="2"/>
-  <!-- 终端折线 > -->
-  <path d="M17 21L28 32L17 43" stroke="white" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-  <!-- Switch 轨道与高光橙色节点 -->
-  <rect x="33" y="25" width="16" height="14" rx="7" fill="#27272A" stroke="#52525B" stroke-width="2"/>
-  <circle cx="42" cy="32" r="4.5" fill="#F97316"/>
+  <rect width="64" height="64" rx="16" fill="#000000"/>
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+  <path d="M16 18 H38 V26 H24 V40 H16 Z" fill="#FFFFFF"/>
+  <path d="M48 46 H26 V38 H40 V24 H48 Z" fill="#FFFFFF"/>
+  <circle cx="32" cy="32" r="3.5" fill="#FFFFFF"/>
 </svg>

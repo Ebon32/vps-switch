@@ -34,7 +34,7 @@ const MENU_ID_SHOW: &str = "app:show";
 const MENU_ID_QUIT: &str = "app:quit";
 const MENU_HOST_PREFIX: &str = "host:";
 
-/// 纯代码光栅化生成 64x64 高清抗锯齿 VPS Switch 图标（深色圆角矩形 + 白色 > 终端符 + 活力橙圆点）
+/// 纯代码光栅化生成 64x64 高清抗锯齿 VPS Switch 纯黑白拓扑互锁图标
 pub fn render_brand_icon_rgba(size: u32) -> Vec<u8> {
     let mut buf = vec![0u8; (size * size * 4) as usize];
     let s = size as f32;
@@ -44,41 +44,51 @@ pub fn render_brand_icon_rgba(size: u32) -> Vec<u8> {
             let fx = (x as f32 + 0.5) / s * 64.0;
             let fy = (y as f32 + 0.5) / s * 64.0;
 
-            // 1. 圆角方块底 (64x64, rx=15)
+            // 1. 纯黑圆角方块基底 (64x64, rx=14)
             let bg_dist = sd_rounded_box(fx - 32.0, fy - 32.0, 29.0, 29.0, 14.0);
             if bg_dist > 1.0 {
                 continue;
             }
             let bg_alpha = (0.5 - bg_dist).clamp(0.0, 1.0);
 
-            let mut r = 24.0;
-            let mut g = 24.0;
-            let mut b = 27.0;
+            let mut r = 0.0;
+            let mut g = 0.0;
+            let mut b = 0.0;
 
-            // 2. 左侧白色终端折线 > : (16, 20) -> (28, 32) -> (16, 44)
-            let d_seg1 = sd_segment(fx, fy, 16.0, 20.0, 27.5, 32.0) - 2.7;
-            let d_seg2 = sd_segment(fx, fy, 27.5, 32.0, 16.0, 44.0) - 2.7;
-            let d_chevron = d_seg1.min(d_seg2);
-            if d_chevron < 0.8 {
-                let w = (0.5 - d_chevron).clamp(0.0, 1.0);
-                r = r * (1.0 - w) + 250.0 * w;
-                g = g * (1.0 - w) + 250.0 * w;
-                b = b * (1.0 - w) + 250.0 * w;
+            // 外围 1px 微弱白光边框，在深色任务栏上保持轮廓分明
+            if bg_dist > -1.2 && bg_dist < 0.2 {
+                let border_w = (1.0 - (bg_dist + 0.5).abs()).clamp(0.0, 1.0) * 0.22;
+                r += 255.0 * border_w;
+                g += 255.0 * border_w;
+                b += 255.0 * border_w;
             }
 
-            // 3. 右侧活力橙 Switch 节点圆 (cx=43, cy=32, r=6.8)
-            let d_dot = ((fx - 43.0).powi(2) + (fy - 32.0).powi(2)).sqrt() - 6.8;
-            if d_dot < 0.8 {
-                let w = (0.5 - d_dot).clamp(0.0, 1.0);
-                r = r * (1.0 - w) + 249.0 * w;
-                g = g * (1.0 - w) + 115.0 * w;
-                b = b * (1.0 - w) + 22.0 * w;
+            // 2. 左上实心 L 型滑块 (M16 18 H38 V26 H24 V40 H16 Z)
+            let d_b1_horiz = sd_rounded_box(fx - 27.0, fy - 22.0, 11.0, 4.0, 1.5);
+            let d_b1_vert = sd_rounded_box(fx - 20.0, fy - 29.0, 4.0, 11.0, 1.5);
+            let d_b1 = d_b1_horiz.min(d_b1_vert);
+
+            // 3. 右下实心 L 型滑块 (M48 46 H26 V38 H40 V24 H48 Z)
+            let d_b2_horiz = sd_rounded_box(fx - 37.0, fy - 42.0, 11.0, 4.0, 1.5);
+            let d_b2_vert = sd_rounded_box(fx - 44.0, fy - 35.0, 4.0, 11.0, 1.5);
+            let d_b2 = d_b2_horiz.min(d_b2_vert);
+
+            // 4. 中央穿透的瞬切光核 (cx=32, cy=32, r=3.5)
+            let d_dot = ((fx - 32.0).powi(2) + (fy - 32.0).powi(2)).sqrt() - 3.5;
+
+            // 综合计算纯白图形距离场
+            let d_glyph = d_b1.min(d_b2).min(d_dot);
+            if d_glyph < 0.8 {
+                let w = (0.5 - d_glyph).clamp(0.0, 1.0);
+                r = r * (1.0 - w) + 255.0 * w;
+                g = g * (1.0 - w) + 255.0 * w;
+                b = b * (1.0 - w) + 255.0 * w;
             }
 
             let idx = ((y * size + x) * 4) as usize;
-            buf[idx] = r as u8;
-            buf[idx + 1] = g as u8;
-            buf[idx + 2] = b as u8;
+            buf[idx] = r.min(255.0) as u8;
+            buf[idx + 1] = g.min(255.0) as u8;
+            buf[idx + 2] = b.min(255.0) as u8;
             buf[idx + 3] = (bg_alpha * 255.0) as u8;
         }
     }
@@ -89,15 +99,6 @@ fn sd_rounded_box(px: f32, py: f32, bx: f32, by: f32, r: f32) -> f32 {
     let qx = px.abs() - bx + r;
     let qy = py.abs() - by + r;
     (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r
-}
-
-fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let pax = px - ax;
-    let pay = py - ay;
-    let bax = bx - ax;
-    let bay = by - ay;
-    let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay)).clamp(0.0, 1.0);
-    ((pax - bax * h).powi(2) + (pay - bay * h).powi(2)).sqrt()
 }
 
 fn build_tray_menu(state: &Arc<AppState>) -> Result<Menu> {

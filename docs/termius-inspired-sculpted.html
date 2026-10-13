@@ -1,0 +1,456 @@
+<title>VPS Switch 深度黑白实体设计</title>
+<style>
+  :root {
+    --bg-ground: #0a0a0c;
+    --surface-card: #141417;
+    --border-subtle: #27272a;
+    --text-primary: #ffffff;
+    --text-muted: #a1a1aa;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg-ground);
+    color: var(--text-primary);
+    padding: 36px 20px;
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .container {
+    max-width: 1080px;
+    margin: 0 auto;
+  }
+
+  .header {
+    text-align: center;
+    margin-bottom: 28px;
+  }
+  .header h1 {
+    font-size: 26px;
+    font-weight: 800;
+    margin: 0 0 8px 0;
+    letter-spacing: -0.03em;
+  }
+  .header p {
+    font-size: 14px;
+    color: var(--text-muted);
+    max-width: 640px;
+    margin: 0 auto;
+  }
+
+  .critique-box {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 16px 20px;
+    margin-bottom: 32px;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .critique-box strong {
+    color: #ffffff;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 20px;
+    margin-bottom: 36px;
+  }
+
+  .card {
+    background: var(--surface-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 20px;
+    padding: 22px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    position: relative;
+    transition: border-color 0.2s ease, transform 0.2s ease;
+  }
+  .card:hover {
+    border-color: #52525b;
+    transform: translateY(-2px);
+  }
+
+  .badge-tag {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: #ffffff;
+    color: #000000;
+  }
+
+  .card-title {
+    font-size: 16px;
+    font-weight: 800;
+    margin: 0 0 4px 0;
+    letter-spacing: -0.01em;
+  }
+  .card-subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0 0 16px 0;
+  }
+
+  .hero-icon-box {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 26px 0;
+    background: radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.06), transparent 70%);
+    border-radius: 14px;
+    margin-bottom: 18px;
+  }
+
+  .hero-svg {
+    width: 104px;
+    height: 104px;
+    filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.4));
+    transition: transform 0.2s ease;
+  }
+  .hero-svg:hover {
+    transform: scale(1.08);
+  }
+
+  .section-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }
+
+  .scale-preview {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    padding: 12px 14px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    margin-bottom: 12px;
+  }
+  .scale-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+  .scale-caption {
+    font-size: 9px;
+    color: var(--text-muted);
+    font-family: monospace;
+  }
+
+  .taskbar-sim {
+    padding: 10px 14px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+    background: #000000;
+    border: 1px solid #27272a;
+  }
+  .taskbar-sim-title {
+    font-size: 10px;
+    font-weight: 600;
+    color: #a1a1aa;
+  }
+
+  .feature-list {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 0 0;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .feature-list li {
+    margin-bottom: 4px;
+    display: flex;
+    align-items: flex-start;
+    gap: 5px;
+  }
+  .feature-list li::before {
+    content: "■";
+    font-size: 7px;
+    color: #ffffff;
+    margin-top: 4px;
+  }
+</style>
+
+<div class="container">
+  <div class="header">
+    <h1>告别单线条交叉 · 真正的实体级黑白徽记</h1>
+    <p>你说得太对了：两条简单的单线条一交错就成了一个 ×，根本谈不上设计。真正的黑白设计靠的是实体几何切面、负空间剪影与有辨识度的专属图腾。</p>
+  </div>
+
+  <div class="critique-box">
+    <strong>💡 重新审视「为什么 Termius 好看」以及「方案 2 原本的感觉在哪」：</strong><br>
+    • 方案 2 最初吸引你的是<strong>「一个带有机械感的开关机构动势（Switch Mechanism）」</strong>，而不是两条光秃秃的线条。<br>
+    • Termius 好看是因为它有<strong>具象饱满的实体剪影</strong>（云朵外轮廓 + 终端字符构成的整体印章）。<br>
+    以下 4 套方案全部采用<strong>实心雕刻几何（Solid Glyph）+ 负空间切面</strong>，彻底告别单线条与 × 的尴尬。
+  </div>
+
+  <div class="grid">
+    <!-- 设计 1：实体双向穿梭滑块 (真正的 Switch 机械机构) -->
+    <div class="card">
+      <span class="badge-tag">机械动势 · 实体剪影</span>
+      <h2 class="card-title">方案 A · 机械实体滑阀 Switch</h2>
+      <p class="card-subtitle">实心跑道滑轨 · 双向互锁滑块 · 机械穿梭感</p>
+
+      <div class="hero-icon-box">
+        <!-- SVG A: 实心 Switch 滑阀机构 -->
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+
+          <!-- 实心外框导轨 (纯白跑道) -->
+          <rect x="12" y="19" width="40" height="26" rx="13" stroke="#FFFFFF" stroke-width="3" fill="none"/>
+
+          <!-- 内部实体滑块：向右冲锋的实心纯白终端块，带有精密的负空间切口 -->
+          <!-- 左侧待机圆孔 (负空间) -->
+          <circle cx="25" cy="32" r="5" stroke="#FFFFFF" stroke-width="2.5" fill="none"/>
+
+          <!-- 右侧实心激活滑块：一个饱满有力的圆形实体，内部镂空一记向右的尖锐终端折角 > -->
+          <circle cx="39" cy="32" r="9" fill="#FFFFFF"/>
+          <path d="M37 27.5 L42.5 32 L37 36.5" stroke="#000000" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <rect x="12" y="19" width="40" height="26" rx="13" stroke="#FFFFFF" stroke-width="3"/>
+            <circle cx="25" cy="32" r="5" stroke="#FFFFFF" stroke-width="2.5"/>
+            <circle cx="39" cy="32" r="9" fill="#FFFFFF"/>
+            <path d="M37 27.5 L42.5 32 L37 36.5" stroke="#000000" stroke-width="2.8" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <rect x="12" y="19" width="40" height="26" rx="13" stroke="#FFFFFF" stroke-width="3.5"/>
+            <circle cx="25" cy="32" r="5" stroke="#FFFFFF" stroke-width="3"/>
+            <circle cx="39" cy="32" r="9" fill="#FFFFFF"/>
+            <path d="M37 27.5 L42.5 32 L37 36.5" stroke="#000000" stroke-width="3" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <rect x="12" y="19" width="40" height="26" rx="13" stroke="#FFFFFF" stroke-width="4"/>
+            <circle cx="39" cy="32" r="9" fill="#FFFFFF"/>
+            <path d="M37 27 L43 32 L37 37" stroke="#000000" stroke-width="3.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><rect x="12" y="19" width="40" height="26" rx="13" stroke="#FFFFFF" stroke-width="3.5"/><circle cx="39" cy="32" r="9" fill="#FFFFFF"/><path d="M37 27.5 L42.5 32 L37 36.5" stroke="#000000" stroke-width="3" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>机械实体感</strong>：不是简单的线条，是一个真正的实体开关滑道，有厚重沉稳的工业质感。</li>
+        <li><strong>精巧内嵌</strong>：右侧实心滑块内镂空终端命令符 <code>&gt;</code>，完美诠释「终端与开关」合二为一。</li>
+      </ul>
+    </div>
+
+    <!-- 设计 2：实体双折刃负空间穿梭 (重塑方案 2 的真正霸道力量) -->
+    <div class="card">
+      <span class="badge-tag">实心刀锋 · 绝非细线交叉</span>
+      <h2 class="card-title">方案 B · 实体错位穿梭折刃</h2>
+      <p class="card-subtitle">实心多边形厚重刀锋 · 错位不对称穿梭 · 绝对不是×</p>
+
+      <div class="hero-icon-box">
+        <!-- SVG B: 实心多边形厚重双刃，带有切面厚度 -->
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+
+          <!-- 主实体粗刃 (像一个实心的立体几何终端符 >) -->
+          <path d="M15 17 L29 17 L44 32 L29 47 L15 47 L27 32 Z" fill="#FFFFFF"/>
+
+          <!-- 穿梭反向回路：一个粗实心长条下划线与次级反向折刃，形成错落的工业层次 -->
+          <rect x="33" y="42" width="16" height="5" rx="2.5" fill="#FFFFFF"/>
+          <circle cx="36" cy="22" r="3.5" fill="#FFFFFF"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M15 17 L29 17 L44 32 L29 47 L15 47 L27 32 Z" fill="#FFFFFF"/>
+            <rect x="33" y="42" width="16" height="5" rx="2.5" fill="#FFFFFF"/>
+            <circle cx="36" cy="22" r="3.5" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M15 17 L29 17 L44 32 L29 47 L15 47 L27 32 Z" fill="#FFFFFF"/>
+            <rect x="33" y="42" width="16" height="5" rx="2.5" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M14 16 L29 16 L45 32 L29 48 L14 48 L27 32 Z" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M15 17 L29 17 L44 32 L29 47 L15 47 L27 32 Z" fill="#FFFFFF"/><rect x="33" y="42" width="16" height="5" rx="2.5" fill="#FFFFFF"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>实心填充几何</strong>：绝不是单线条，是具有面积感的厚重实心折刃，锐利且极具分量。</li>
+        <li><strong>绝对不撞脸 ×</strong>：主刀锋向右推进，搭配下部的命令光标基座，霸道清晰。</li>
+      </ul>
+    </div>
+
+    <!-- 设计 3：Termius 风格重构 · 实心云端嵌 Switch 拨杆 -->
+    <div class="card">
+      <span class="badge-tag">Termius 精髓 · 原创结合</span>
+      <h2 class="card-title">方案 C · 实心云端 · 实体 Switch 终端</h2>
+      <p class="card-subtitle">对标 Termius 饱满云轮廓 · 内部雕刻双向穿梭拨杆</p>
+
+      <div class="hero-icon-box">
+        <!-- SVG C: 饱满 Termius 式云廓 + 实体拨动开关 -->
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+
+          <!-- 实心饱满的纯白云朵 (VPS 云端之海) -->
+          <path d="M21 44 H44 C49.5 44 53 39.5 52 34.5 C51.2 30.5 47.5 28 43 28.5 C42 22 37.5 17.5 31.5 17.5 C26 17.5 21.5 21 20 26 C15 26.5 11.5 31 12 36 C12.5 41 16 44 21 44 Z" fill="#FFFFFF"/>
+
+          <!-- 内部黑色负空间雕刻：一个精密的 Switch 穿梭拨动开关 (左节点 + 右冲锋命令符) -->
+          <circle cx="25" cy="33" r="3.2" fill="#000000"/>
+          <path d="M28 33 H34" stroke="#000000" stroke-width="2.5" stroke-linecap="round"/>
+          <path d="M35 27.5 L40.5 33 L35 38.5" stroke="#000000" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M21 44 H44 C49.5 44 53 39.5 52 34.5 C51.2 30.5 47.5 28 43 28.5 C42 22 37.5 17.5 31.5 17.5 C26 17.5 21.5 21 20 26 C15 26.5 11.5 31 12 36 C12.5 41 16 44 21 44 Z" fill="#FFFFFF"/>
+            <circle cx="25" cy="33" r="3.2" fill="#000000"/>
+            <path d="M28 33 H34" stroke="#000000" stroke-width="2.5" stroke-linecap="round"/>
+            <path d="M35 27.5 L40.5 33 L35 38.5" stroke="#000000" stroke-width="3" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M21 44 H44 C49.5 44 53 39.5 52 34.5 C51.2 30.5 47.5 28 43 28.5 C42 22 37.5 17.5 31.5 17.5 C26 17.5 21.5 21 20 26 C15 26.5 11.5 31 12 36 C12.5 41 16 44 21 44 Z" fill="#FFFFFF"/>
+            <path d="M35 27.5 L40.5 33 L35 38.5" stroke="#000000" stroke-width="3.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M21 44 H44 C49.5 44 53 39.5 52 34.5 C51.2 30.5 47.5 28 43 28.5 C42 22 37.5 17.5 31.5 17.5 C26 17.5 21.5 21 20 26 C15 26.5 11.5 31 12 36 C12.5 41 16 44 21 44 Z" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M21 44 H44 C49.5 44 53 39.5 52 34.5 C51.2 30.5 47.5 28 43 28.5 C42 22 37.5 17.5 31.5 17.5 C26 17.5 21.5 21 20 26 C15 26.5 11.5 31 12 36 C12.5 41 16 44 21 44 Z" fill="#FFFFFF"/><path d="M35 28 L40 33 L35 38" stroke="#000000" stroke-width="3" stroke-linecap="round"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>实心剪影印章</strong>：纯白实心云朵极具视觉体量感，在黑色任务栏上像一个发光的浮雕印记。</li>
+        <li><strong>黑白负空间雕刻</strong>：内部黑色的穿梭滑块极其醒目，既有 Termius 的云端神髓，又有 Switch 的专属基因。</li>
+      </ul>
+    </div>
+
+    <!-- 设计 4：极简正负形交错开关闸刀 -->
+    <div class="card">
+      <span class="badge-tag">双色负形 · 工业闸刀</span>
+      <h2 class="card-title">方案 D · 拓扑穿梭网格锁</h2>
+      <p class="card-subtitle">两个实心 L 型几何咬合 · 形成流动互通隧道</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="64" height="64" rx="16" fill="#000000"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+
+          <!-- 两个实心交错的直角滑块（互锁又互通） -->
+          <path d="M16 18 H38 V26 H24 V40 H16 Z" fill="#FFFFFF"/>
+          <path d="M48 46 H26 V38 H40 V24 H48 Z" fill="#FFFFFF"/>
+          <!-- 中央穿透的瞬切光核 -->
+          <circle cx="32" cy="32" r="3.5" fill="#FFFFFF"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="40" height="40" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 18 H38 V26 H24 V40 H16 Z" fill="#FFFFFF"/>
+            <path d="M48 46 H26 V38 H40 V24 H48 Z" fill="#FFFFFF"/>
+            <circle cx="32" cy="32" r="3.5" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">40px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="28" height="28" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 18 H38 V26 H24 V40 H16 Z" fill="#FFFFFF"/>
+            <path d="M48 46 H26 V38 H40 V24 H48 Z" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">28px</span>
+        </div>
+        <div class="scale-item">
+          <svg width="18" height="18" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="#000000"/>
+            <path d="M16 18 H38 V26 H24 V40 H16 Z" fill="#FFFFFF"/>
+            <path d="M48 46 H26 V38 H40 V24 H48 Z" fill="#FFFFFF"/>
+          </svg>
+          <span class="scale-caption">18px 托盘</span>
+        </div>
+      </div>
+
+      <div class="taskbar-sim">
+        <span class="taskbar-sim-title">Windows 任务栏</span>
+        <svg width="22" height="22" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#000000" stroke="#FFFFFF" stroke-opacity="0.3"/><path d="M16 18 H38 V26 H24 V40 H16 Z" fill="#FFFFFF"/><path d="M48 46 H26 V38 H40 V24 H48 Z" fill="#FFFFFF"/></svg>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>正负形互锁</strong>：两个实体角块彼此咬合，勾勒出电路与交换机的逻辑结构。</li>
+        <li><strong>厚实块面</strong>：纯色块面填充，在微小托盘尺寸下绝不会糊掉。</li>
+      </ul>
+    </div>
+  </div>
+</div>

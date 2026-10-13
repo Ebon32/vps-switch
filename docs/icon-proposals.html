@@ -1,0 +1,477 @@
+<title>VPS Switch 视觉图标方案</title>
+<style>
+  :root {
+    --bg-ground: #f8fafc;
+    --surface-card: #ffffff;
+    --border-subtle: #e2e8f0;
+    --text-primary: #0f172a;
+    --text-muted: #64748b;
+    --accent-orange: #f97316;
+    --accent-emerald: #10b981;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg-ground: #0b0f17;
+      --surface-card: #151d2a;
+      --border-subtle: #243144;
+      --text-primary: #f8fafc;
+      --text-muted: #94a3b8;
+      color-scheme: dark;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg-ground: #0b0f17;
+    --surface-card: #151d2a;
+    --border-subtle: #243144;
+    --text-primary: #f8fafc;
+    --text-muted: #94a3b8;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg-ground);
+    color: var(--text-primary);
+    padding: 32px 20px;
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .container {
+    max-width: 1120px;
+    margin: 0 auto;
+  }
+
+  .header {
+    text-align: center;
+    margin-bottom: 36px;
+  }
+  .header h1 {
+    font-size: 26px;
+    font-weight: 700;
+    margin: 0 0 8px 0;
+    letter-spacing: -0.02em;
+  }
+  .header p {
+    font-size: 14px;
+    color: var(--text-muted);
+    max-width: 600px;
+    margin: 0 auto;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 24px;
+    margin-bottom: 32px;
+  }
+
+  .card {
+    background: var(--surface-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 20px;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.03);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .badge-rec {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    background: rgba(249, 115, 22, 0.12);
+    color: var(--accent-orange);
+    border: 1px solid rgba(249, 115, 22, 0.3);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 20px;
+  }
+
+  .card-title {
+    font-size: 16px;
+    font-weight: 700;
+    margin: 0 0 4px 0;
+  }
+  .card-subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0 0 20px 0;
+  }
+
+  .hero-icon-box {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 28px 0;
+    background: radial-gradient(circle at 50% 50%, rgba(241, 245, 249, 0.8), transparent 70%);
+    border-radius: 16px;
+    margin-bottom: 20px;
+  }
+
+  .hero-svg {
+    width: 128px;
+    height: 128px;
+    filter: drop-shadow(0 12px 24px rgba(0, 0, 0, 0.12));
+    transition: transform 0.2s ease;
+  }
+  .hero-svg:hover {
+    transform: scale(1.05);
+  }
+
+  .section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 700;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+  }
+
+  .scale-preview {
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    padding: 16px;
+    background: rgba(0, 0, 0, 0.02);
+    border: 1px solid var(--border-subtle);
+    border-radius: 14px;
+    margin-bottom: 16px;
+  }
+  .scale-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .scale-caption {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: monospace;
+  }
+
+  .taskbar-sim {
+    padding: 12px 16px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+  }
+  .taskbar-dark {
+    background: #1e1e24;
+    color: #e2e8f0;
+  }
+  .taskbar-light {
+    background: #f1f3f9;
+    color: #1e293b;
+    border: 1px solid #e2e8f0;
+  }
+  .taskbar-sim-title {
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .taskbar-sim-icons {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .feature-list {
+    list-style: none;
+    padding: 0;
+    margin: 16px 0 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .feature-list li {
+    margin-bottom: 6px;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .feature-list li::before {
+    content: "•";
+    color: var(--accent-orange);
+    font-weight: bold;
+  }
+</style>
+
+<div class="container">
+  <div class="header">
+    <h1>VPS Switch 品牌图标视觉重构</h1>
+    <p>彻底告别纯黑死板底色与通用命令行符，带来富有生命力、辨识度极高且深度贴合产品本质的原创品牌印记。</p>
+  </div>
+
+  <div class="grid">
+    <!-- 方向 1 -->
+    <div class="card">
+      <span class="badge-rec">首推方向</span>
+      <h2 class="card-title">方向 1 · 日落暖橙穿梭 S 轨</h2>
+      <p class="card-subtitle">活力炽热 · 现代基建软件质感 · 极高辨识度</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="g1" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FF5722"/>
+              <stop offset="50%" stop-color="#F97316"/>
+              <stop offset="100%" stop-color="#EA580C"/>
+            </linearGradient>
+            <linearGradient id="hl1" x1="0" y1="0" x2="0" y2="64" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.45"/>
+              <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.05"/>
+            </linearGradient>
+            <filter id="sd1" x="-10%" y="-10%" width="130%" height="130%">
+              <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#7C2D12" flood-opacity="0.35"/>
+            </filter>
+          </defs>
+          <rect width="64" height="64" rx="16" fill="url(#g1)"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="url(#hl1)" stroke-width="1.5"/>
+          <g filter="url(#sd1)">
+            <rect x="14" y="16" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <rect x="28" y="41" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <path d="M30 19.5 H37 C41 19.5 44 22.5 44 26.5 C44 30.5 41 33.5 37 33.5 H27 C23 33.5 20 36.5 20 40.5 C20 44.5 23 44.5 27 44.5 H34" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </g>
+          <circle cx="48" cy="19.5" r="3.5" fill="#10B981"/>
+          <circle cx="48" cy="19.5" r="4.5" stroke="#FFFFFF" stroke-width="1.5"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同系统尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="48" height="48" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g1)"/>
+            <rect x="14" y="16" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <rect x="28" y="41" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <path d="M30 19.5 H37 C41 19.5 44 22.5 44 26.5 C44 30.5 41 33.5 37 33.5 H27 C23 33.5 20 36.5 20 40.5 C20 44.5 23 44.5 27 44.5 H34" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round"/>
+            <circle cx="48" cy="19.5" r="3.5" fill="#10B981"/>
+          </svg>
+          <span class="scale-caption">48px 窗口</span>
+        </div>
+        <div class="scale-item">
+          <svg width="32" height="32" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g1)"/>
+            <rect x="14" y="16" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <rect x="28" y="41" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <path d="M30 19.5 H37 C41 19.5 44 22.5 44 26.5 C44 30.5 41 33.5 37 33.5 H27 C23 33.5 20 36.5 20 40.5 C20 44.5 23 44.5 27 44.5 H34" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round"/>
+            <circle cx="48" cy="19.5" r="3.5" fill="#10B981"/>
+          </svg>
+          <span class="scale-caption">32px 任务栏</span>
+        </div>
+        <div class="scale-item">
+          <svg width="20" height="20" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g1)"/>
+            <rect x="14" y="16" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <rect x="28" y="41" width="22" height="7" rx="3.5" fill="#FFFFFF"/>
+            <path d="M30 19.5 H37 C41 19.5 44 22.5 44 26.5 C44 30.5 41 33.5 37 33.5 H27 C23 33.5 20 36.5 20 40.5 C20 44.5 23 44.5 27 44.5 H34" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/>
+            <circle cx="48" cy="19.5" r="3.5" fill="#10B981"/>
+          </svg>
+          <span class="scale-caption">20px 托盘</span>
+        </div>
+      </div>
+
+      <div class="section-label">Windows 任务栏环境模拟</div>
+      <div class="taskbar-sim taskbar-dark">
+        <span class="taskbar-sim-title">深色任务栏</span>
+        <div class="taskbar-sim-icons">
+          <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="url(#g1)"/><rect x="14" y="16" width="22" height="7" rx="3.5" fill="#FFFFFF"/><rect x="28" y="41" width="22" height="7" rx="3.5" fill="#FFFFFF"/><circle cx="48" cy="19.5" r="4" fill="#10B981"/></svg>
+        </div>
+      </div>
+      <div class="taskbar-sim taskbar-light">
+        <span class="taskbar-sim-title">浅色任务栏</span>
+        <div class="taskbar-sim-icons">
+          <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="url(#g1)"/><rect x="14" y="16" width="22" height="7" rx="3.5" fill="#FFFFFF"/><rect x="28" y="41" width="22" height="7" rx="3.5" fill="#FFFFFF"/><circle cx="48" cy="19.5" r="4" fill="#10B981"/></svg>
+        </div>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>品牌张力</strong>：彻底消灭压抑黑底，暖橙珊瑚底色像一把利刃切出辨识度。</li>
+        <li><strong>意象</strong>：双层服务器切片被一道流线 S 串联，直观表达「在 VPS 之间极速切换」。</li>
+        <li><strong>微点</strong>：右上角常亮翡翠绿点，象征 29 台云端主机全天候在线守护。</li>
+      </ul>
+    </div>
+
+    <!-- 方向 2 -->
+    <div class="card">
+      <h2 class="card-title">方向 2 · 白瓷微光双色咬合 S 标</h2>
+      <p class="card-subtitle">极简克制 · 浑然一体 · 与毛玻璃界面完美呼应</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="g2" x1="0" y1="0" x2="0" y2="64" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FFFFFF"/>
+              <stop offset="100%" stop-color="#F1F5F9"/>
+            </linearGradient>
+            <linearGradient id="org2" x1="12" y1="14" x2="52" y2="34" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FF6B35"/>
+              <stop offset="100%" stop-color="#F97316"/>
+            </linearGradient>
+            <linearGradient id="emd2" x1="12" y1="30" x2="52" y2="50" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#10B981"/>
+              <stop offset="100%" stop-color="#059669"/>
+            </linearGradient>
+            <filter id="sd2" x="-10%" y="-10%" width="130%" height="130%">
+              <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0F172A" flood-opacity="0.08"/>
+            </filter>
+          </defs>
+          <rect width="64" height="64" rx="16" fill="url(#g2)"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#CBD5E1" stroke-width="1.2"/>
+          <g filter="url(#sd2)">
+            <path d="M20 30 C20 20.5 25.5 16 34 16 C43 16 47 21 47 27 C47 33 41 35 32 35" stroke="url(#org2)" stroke-width="5.5" stroke-linecap="round"/>
+            <path d="M44 34 C44 43.5 38.5 48 30 48 C21 48 17 43 17 37 C17 31 23 29 32 29" stroke="url(#emd2)" stroke-width="5.5" stroke-linecap="round"/>
+            <circle cx="32" cy="32" r="3.2" fill="#FFFFFF" stroke="#0F172A" stroke-width="1.2"/>
+          </g>
+        </svg>
+      </div>
+
+      <div class="section-label">不同系统尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="48" height="48" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g2)" stroke="#CBD5E1" stroke-width="1.2"/>
+            <path d="M20 30 C20 20.5 25.5 16 34 16 C43 16 47 21 47 27 C47 33 41 35 32 35" stroke="url(#org2)" stroke-width="5.5" stroke-linecap="round"/>
+            <path d="M44 34 C44 43.5 38.5 48 30 48 C21 48 17 43 17 37 C17 31 23 29 32 29" stroke="url(#emd2)" stroke-width="5.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">48px 窗口</span>
+        </div>
+        <div class="scale-item">
+          <svg width="32" height="32" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g2)" stroke="#CBD5E1" stroke-width="1.2"/>
+            <path d="M20 30 C20 20.5 25.5 16 34 16 C43 16 47 21 47 27 C47 33 41 35 32 35" stroke="url(#org2)" stroke-width="5.5" stroke-linecap="round"/>
+            <path d="M44 34 C44 43.5 38.5 48 30 48 C21 48 17 43 17 37 C17 31 23 29 32 29" stroke="url(#emd2)" stroke-width="5.5" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">32px 任务栏</span>
+        </div>
+        <div class="scale-item">
+          <svg width="20" height="20" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g2)" stroke="#CBD5E1" stroke-width="1.2"/>
+            <path d="M20 30 C20 20.5 25.5 16 34 16 C43 16 47 21 47 27 C47 33 41 35 32 35" stroke="url(#org2)" stroke-width="6" stroke-linecap="round"/>
+            <path d="M44 34 C44 43.5 38.5 48 30 48 C21 48 17 43 17 37 C21 31 23 29 32 29" stroke="url(#emd2)" stroke-width="6" stroke-linecap="round"/>
+          </svg>
+          <span class="scale-caption">20px 托盘</span>
+        </div>
+      </div>
+
+      <div class="section-label">Windows 任务栏环境模拟</div>
+      <div class="taskbar-sim taskbar-dark">
+        <span class="taskbar-sim-title">深色任务栏</span>
+        <div class="taskbar-sim-icons">
+          <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="url(#g2)"/><path d="M20 30 C20 20.5 25.5 16 34 16 C43 16 47 21 47 27 C47 33 41 35 32 35" stroke="url(#org2)" stroke-width="6" stroke-linecap="round"/><path d="M44 34 C44 43.5 38.5 48 30 48 C21 48 17 43 17 37" stroke="url(#emd2)" stroke-width="6" stroke-linecap="round"/></svg>
+        </div>
+      </div>
+      <div class="taskbar-sim taskbar-light">
+        <span class="taskbar-sim-title">浅色任务栏</span>
+        <div class="taskbar-sim-icons">
+          <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="url(#g2)" stroke="#CBD5E1" stroke-width="1.2"/><path d="M20 30 C20 20.5 25.5 16 34 16 C43 16 47 21 47 27 C47 33 41 35 32 35" stroke="url(#org2)" stroke-width="6" stroke-linecap="round"/><path d="M44 34 C44 43.5 38.5 48 30 48 C21 48 17 43 17 37" stroke="url(#emd2)" stroke-width="6" stroke-linecap="round"/></svg>
+        </div>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>白瓷通透</strong>：零黑色，纯白与微冷灰的浮雕质感，与软件界面 Reflex 风格完美呼应。</li>
+        <li><strong>双色环抱</strong>：橙色（命令与切换）与绿色（在线守护）咬合为一个莫比乌斯 S 环。</li>
+        <li><strong>现代优雅</strong>：类似 Linear / Raycast 团队的极简排版克制美学。</li>
+      </ul>
+    </div>
+
+    <!-- 方向 3 -->
+    <div class="card">
+      <h2 class="card-title">方向 3 · 等轴测多维晶体机架与光柱</h2>
+      <p class="card-subtitle">工程硬核 · 立体立体切面 · 极客象征</p>
+
+      <div class="hero-icon-box">
+        <svg class="hero-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="g3" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FFFFFF"/>
+              <stop offset="100%" stop-color="#E2E8F0"/>
+            </linearGradient>
+            <linearGradient id="bm3" x1="32" y1="10" x2="32" y2="50" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FF5722"/>
+              <stop offset="45%" stop-color="#F97316"/>
+              <stop offset="100%" stop-color="#10B981"/>
+            </linearGradient>
+          </defs>
+          <rect width="64" height="64" rx="16" fill="url(#g3)"/>
+          <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" stroke="#94A3B8" stroke-width="1.2"/>
+
+          <!-- 下层机架底盘 -->
+          <path d="M32 38 L48 29 L32 20 L16 29 Z" fill="#FFFFFF" fill-opacity="0.85" stroke="#64748B" stroke-width="1.6" stroke-linejoin="round"/>
+          <path d="M16 29 L32 38 V44 L16 35 Z" fill="#CBD5E1" stroke="#64748B" stroke-width="1.6" stroke-linejoin="round"/>
+          <path d="M48 29 L32 38 V44 L48 35 Z" fill="#94A3B8" stroke="#64748B" stroke-width="1.6" stroke-linejoin="round"/>
+
+          <!-- 贯穿两层的核心切换光柱 -->
+          <line x1="32" y1="9" x2="32" y2="47" stroke="url(#bm3)" stroke-width="5" stroke-linecap="round"/>
+
+          <!-- 上层悬浮晶体切面 -->
+          <path d="M32 24 L48 15 L32 6 L16 15 Z" fill="#FFFFFF" fill-opacity="0.9" stroke="#64748B" stroke-width="1.6" stroke-linejoin="round"/>
+          <path d="M16 15 L32 24 V27 L16 18 Z" fill="#E2E8F0" stroke="#64748B" stroke-width="1.6" stroke-linejoin="round"/>
+          <path d="M48 15 L32 24 V27 L48 18 Z" fill="#CBD5E1" stroke="#64748B" stroke-width="1.6" stroke-linejoin="round"/>
+
+          <!-- 光核节点 -->
+          <circle cx="32" cy="15" r="3.2" fill="#FF5722"/>
+          <circle cx="32" cy="38" r="3.2" fill="#10B981"/>
+        </svg>
+      </div>
+
+      <div class="section-label">不同系统尺寸实测</div>
+      <div class="scale-preview">
+        <div class="scale-item">
+          <svg width="48" height="48" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g3)" stroke="#94A3B8" stroke-width="1.2"/>
+            <path d="M32 38 L48 29 L32 20 L16 29 Z" fill="#FFFFFF" stroke="#64748B" stroke-width="1.6"/>
+            <line x1="32" y1="9" x2="32" y2="47" stroke="url(#bm3)" stroke-width="5" stroke-linecap="round"/>
+            <path d="M32 24 L48 15 L32 6 L16 15 Z" fill="#FFFFFF" stroke="#64748B" stroke-width="1.6"/>
+          </svg>
+          <span class="scale-caption">48px 窗口</span>
+        </div>
+        <div class="scale-item">
+          <svg width="32" height="32" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g3)" stroke="#94A3B8" stroke-width="1.2"/>
+            <path d="M32 38 L48 29 L32 20 L16 29 Z" fill="#FFFFFF" stroke="#64748B" stroke-width="1.6"/>
+            <line x1="32" y1="9" x2="32" y2="47" stroke="url(#bm3)" stroke-width="5" stroke-linecap="round"/>
+            <path d="M32 24 L48 15 L32 6 L16 15 Z" fill="#FFFFFF" stroke="#64748B" stroke-width="1.6"/>
+          </svg>
+          <span class="scale-caption">32px 任务栏</span>
+        </div>
+        <div class="scale-item">
+          <svg width="20" height="20" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="16" fill="url(#g3)" stroke="#94A3B8" stroke-width="1.2"/>
+            <line x1="32" y1="9" x2="32" y2="47" stroke="url(#bm3)" stroke-width="6" stroke-linecap="round"/>
+            <circle cx="32" cy="15" r="3.5" fill="#FF5722"/>
+            <circle cx="32" cy="38" r="3.5" fill="#10B981"/>
+          </svg>
+          <span class="scale-caption">20px 托盘</span>
+        </div>
+      </div>
+
+      <div class="section-label">Windows 任务栏环境模拟</div>
+      <div class="taskbar-sim taskbar-dark">
+        <span class="taskbar-sim-title">深色任务栏</span>
+        <div class="taskbar-sim-icons">
+          <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="url(#g3)"/><line x1="32" y1="9" x2="32" y2="47" stroke="url(#bm3)" stroke-width="6" stroke-linecap="round"/><circle cx="32" cy="15" r="3.5" fill="#FF5722"/><circle cx="32" cy="38" r="3.5" fill="#10B981"/></svg>
+        </div>
+      </div>
+      <div class="taskbar-sim taskbar-light">
+        <span class="taskbar-sim-title">浅色任务栏</span>
+        <div class="taskbar-sim-icons">
+          <svg width="24" height="24" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="url(#g3)" stroke="#94A3B8"/><line x1="32" y1="9" x2="32" y2="47" stroke="url(#bm3)" stroke-width="6" stroke-linecap="round"/><circle cx="32" cy="15" r="3.5" fill="#FF5722"/><circle cx="32" cy="38" r="3.5" fill="#10B981"/></svg>
+        </div>
+      </div>
+
+      <ul class="feature-list">
+        <li><strong>3D 空间感</strong>：等轴测视角呈现服务器机柜切片，透视感鲜明。</li>
+        <li><strong>纵向贯穿</strong>：激光瞬切光柱连通上下双层，体现「从本机穿透到远端」。</li>
+        <li><strong>极客属性</strong>：工业硬核感强，适合偏爱纯技术图腾的审美。</li>
+      </ul>
+    </div>
+  </div>
+</div>
