@@ -98,11 +98,30 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/mcp", post(api_mcp_rpc))
         .route("/api/mcp", post(api_mcp_rpc))
         .route("/api/window/show", post(api_show_window))
+        .route("/api/window/open-terminal", post(api_open_terminal_window))
         .route("/api/auth/status", get(api_auth_status))
         .route("/api/auth/login", post(api_auth_login))
         .route("/api/auth/logout", post(api_auth_logout))
         .merge(protected_api)
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct OpenTerminalWindowPayload {
+    #[serde(alias = "hostId")]
+    host_id: String,
+    #[serde(alias = "paneId")]
+    pane_id: Option<String>,
+}
+
+async fn api_open_terminal_window(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<OpenTerminalWindowPayload>,
+) -> impl IntoResponse {
+    state
+        .terminals
+        .notify_open_standalone_terminal(&payload.host_id, payload.pane_id.as_deref());
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 async fn api_show_window(State(state): State<Arc<AppState>>) -> impl IntoResponse {

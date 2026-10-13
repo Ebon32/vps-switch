@@ -356,8 +356,8 @@ impl Database {
                     id, name, kind, addr, port, username, auth_type,
                     encrypted_password, encrypted_private_key, encrypted_passphrase,
                     jump_host_id, role, tags_json, links_json,
-                    pinned, archived, sort_order, status, created_at, updated_at
-                ) VALUES (?1, ?2, 'ssh', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'unknown', ?17, ?17)",
+                    pinned, favorited, archived, sort_order, status, created_at, updated_at
+                ) VALUES (?1, ?2, 'ssh', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'unknown', ?18, ?18)",
                 params![
                     id,
                     name,
@@ -373,6 +373,7 @@ impl Database {
                     serde_json::to_string(&tags)?,
                     serde_json::to_string(&links)?,
                     if payload.pinned { 1 } else { 0 },
+                    if payload.favorited { 1 } else { 0 },
                     if payload.archived { 1 } else { 0 },
                     max_order + 1,
                     now
@@ -443,8 +444,8 @@ impl Database {
                     name = ?1, addr = ?2, port = ?3, username = ?4, auth_type = ?5,
                     encrypted_password = ?6, encrypted_private_key = ?7, encrypted_passphrase = ?8,
                     jump_host_id = ?9, role = ?10, tags_json = ?11, links_json = ?12,
-                    pinned = ?13, archived = ?14, updated_at = ?15
-                 WHERE id = ?16",
+                    pinned = ?13, favorited = ?14, archived = ?15, updated_at = ?16
+                 WHERE id = ?17",
                 params![
                     payload.name.trim(),
                     payload.addr.trim(),
@@ -459,6 +460,7 @@ impl Database {
                     serde_json::to_string(&tags)?,
                     serde_json::to_string(&links)?,
                     if payload.pinned { 1 } else { 0 },
+                    if payload.favorited { 1 } else { 0 },
                     if payload.archived { 1 } else { 0 },
                     now,
                     id

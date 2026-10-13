@@ -2,12 +2,12 @@
 
 use crate::{api::AppState, terminal::UiEvent};
 use anyhow::Result;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tao::{
     dpi::{LogicalSize, Size},
     event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
-    window::{Icon as WindowIcon, WindowBuilder},
+    window::{Icon as WindowIcon, Window, WindowBuilder, WindowId},
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -20,6 +20,14 @@ pub enum DesktopUserEvent {
     TrayIcon(TrayIconEvent),
     TrayMenu(MenuEvent),
     ShowWindow,
+    OpenStandaloneTerminal { host_id: String },
+}
+
+struct StandaloneTerminal {
+    window: Window,
+    #[allow(dead_code)]
+    webview: wry::WebView,
+    host_id: String,
 }
 
 const MENU_ID_SHOW: &str = "app:show";
@@ -153,8 +161,14 @@ pub fn run_desktop_window(
         rt_handle.spawn(async move {
             while let Ok(ev) = rx.recv().await {
                 match ev {
-                    UiEvent::RevealTerminal { .. } | UiEvent::ShowMainWindow => {
+                    UiEvent::RevealTerminal { host_id, .. } => {
+                        let _ = proxy_show.send_event(DesktopUserEvent::OpenStandaloneTerminal { host_id });
+                    }
+                    UiEvent::ShowMainWindow => {
                         let _ = proxy_show.send_event(DesktopUserEvent::ShowWindow);
+                    }
+                    UiEvent::OpenStandaloneTerminal { host_id, .. } => {
+                        let _ = proxy_show.send_event(DesktopUserEvent::OpenStandaloneTerminal { host_id });
                     }
                 }
             }
@@ -169,7 +183,7 @@ pub fn run_desktop_window(
         .with_title("VPS Switch")
         .with_inner_size(Size::Logical(LogicalSize::new(1280.0, 800.0)))
         .with_min_inner_size(Size::Logical(LogicalSize::new(920.0, 600.0)))
-        .with_window_icon(win_icon)
+        .with_window_icon(win_icon.clone())
         .build(&event_loop)?;
 
     let url = format!("http://127.0.0.1:{port}");
@@ -189,8 +203,10 @@ pub fn run_desktop_window(
     }));
 
     let mut tray_icon = None;
+    let mut standalone_windows: HashMap<WindowId, StandaloneTerminal> = HashMap::new();
+    let mut host_to_window: HashMap<String, WindowId> = HashMap::new();
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, event_loop_target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
@@ -206,16 +222,67 @@ pub fn run_desktop_window(
                 }
             }
             Event::WindowEvent {
+                window_id,
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                // 点击右上角 × 最小化驻留到系统托盘，保持后台 MCP Server 与已打开的终端不断连
-                window.set_visible(false);
+                if window_id == window.id() {
+                    // 点击主窗口右上角 × 最小化驻留到系统托盘，保持后台不断连
+                    window.set_visible(false);
+                } else if let Some(removed) = standalone_windows.remove(&window_id) {
+                    // 独立终端窗口点击 ×：完全关闭并销毁该窗口
+                    host_to_window.remove(&removed.host_id);
+                }
             }
             Event::UserEvent(DesktopUserEvent::ShowWindow) => {
                 window.set_visible(true);
                 window.set_minimized(false);
                 window.set_focus();
+            }
+            Event::UserEvent(DesktopUserEvent::OpenStandaloneTerminal { host_id }) => {
+                // 如果该主机已有打开的独立终端窗口，直接唤醒并聚焦
+                if let Some(&win_id) = host_to_window.get(&host_id) {
+                    if let Some(st_win) = standalone_windows.get(&win_id) {
+                        st_win.window.set_minimized(false);
+                        st_win.window.set_visible(true);
+                        st_win.window.set_focus();
+                        return;
+                    }
+                }
+
+                // 读取主机名作为窗口标题
+                let host_name = state
+                    .db
+                    .get_public_host(&host_id)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.name)
+                    .unwrap_or_else(|| host_id.clone());
+
+                let title = format!("{host_name} · 终端 · VPS Switch");
+                let win_builder = WindowBuilder::new()
+                    .with_title(&title)
+                    .with_inner_size(Size::Logical(LogicalSize::new(1080.0, 680.0)))
+                    .with_min_inner_size(Size::Logical(LogicalSize::new(600.0, 380.0)))
+                    .with_window_icon(win_icon.clone());
+
+                if let Ok(new_win) = win_builder.build(event_loop_target) {
+                    let terminal_url = format!("http://127.0.0.1:{port}/?standalone=1&hostId={host_id}");
+                    if let Ok(wv) = WebViewBuilder::new().with_url(&terminal_url).build(&new_win) {
+                        let win_id = new_win.id();
+                        new_win.set_visible(true);
+                        new_win.set_focus();
+                        host_to_window.insert(host_id.clone(), win_id);
+                        standalone_windows.insert(
+                            win_id,
+                            StandaloneTerminal {
+                                window: new_win,
+                                webview: wv,
+                                host_id,
+                            },
+                        );
+                    }
+                }
             }
             Event::UserEvent(DesktopUserEvent::TrayIcon(tray_ev)) => {
                 if let TrayIconEvent::Click {
@@ -236,25 +303,19 @@ pub fn run_desktop_window(
                     window.set_minimized(false);
                     window.set_focus();
                 } else if id_str == MENU_ID_QUIT {
+                    standalone_windows.clear();
+                    host_to_window.clear();
                     let _ = tray_icon.take();
                     *control_flow = ControlFlow::Exit;
                 } else if let Some(host_id) = id_str.strip_prefix(MENU_HOST_PREFIX) {
-                    // 托盘右键点选某台 VPS：立即唤醒主窗口并在界面上直接打开该主机的终端！
-                    window.set_visible(true);
-                    window.set_minimized(false);
-                    window.set_focus();
+                    // 托盘右键点选某台 VPS：打开专属独立终端窗口！
+                    let hid = host_id.to_string();
+                    let _ = proxy.send_event(DesktopUserEvent::OpenStandaloneTerminal { host_id: hid.clone() });
 
                     let st = state.clone();
-                    let hid = host_id.to_string();
                     rt_handle.spawn(async move {
-                        if let Some(existing) = st.terminals.find_active_pane_for_host(&hid) {
-                            st.terminals.reveal_pane_in_ui(&existing.id, None);
-                        } else if let Ok(created) = st
-                            .terminals
-                            .create_pane(&st.ssh_pool, &st.db, &hid, 100, 30, None, false)
-                            .await
-                        {
-                            st.terminals.reveal_pane_in_ui(&created.id, None);
+                        if st.terminals.find_active_pane_for_host(&hid).is_none() {
+                            let _ = st.terminals.create_pane(&st.ssh_pool, &st.db, &hid, 100, 30, None, false).await;
                         }
                     });
                 }

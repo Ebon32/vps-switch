@@ -27,6 +27,16 @@ interface OpenSessionTab {
   panes: PaneMeta[];
 }
 
+// 独立系统终端原生窗口模式判定 (?standalone=1&hostId=...)
+const urlParams = new URLSearchParams(window.location.search);
+const isStandalone = ref(
+  urlParams.get('standalone') === '1' || urlParams.get('mode') === 'terminal-standalone'
+);
+const standaloneHostId = ref<string | null>(urlParams.get('hostId'));
+
+// 舞台全宽沉浸式体验：是否在舞台打开时展开左侧主机列表（默认收起以提供 100% 独占全宽终端）
+const showSidebarInStage = ref(false);
+
 // 顶层页面状态：'workspace'（仓库+终端+文件主工作台） | 'settings'（独立设置页，不做弹窗）
 const activePage = ref<'workspace' | 'settings'>('workspace');
 
@@ -682,6 +692,25 @@ async function closeSessionTab(hostId: string) {
   }
 }
 
+async function handlePopoutTerminal(hostId: string) {
+  try {
+    const res = await fetch('/api/window/open-terminal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostId }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      const h = hostById(hostId);
+      showToast(`已在独立原生窗口打开「${h?.name || hostId}」终端`);
+    } else {
+      showToast(data.error || '打开独立窗口失败', 'err');
+    }
+  } catch (e) {
+    showToast(`打开独立窗口失败: ${(e as Error).message}`, 'err');
+  }
+}
+
 function prewarmHostFiles(host: PublicHost) {
   if (host.status === 'offline') return;
   void fetch('/api/files/prewarm', {
@@ -937,6 +966,27 @@ async function initAuthenticatedWorkspace() {
   await restoreExistingTerminals();
   await loadSettings();
   subscribeUiEvents();
+
+  if (isStandalone.value) {
+    const target = hosts.value.find((h) => h.id === standaloneHostId.value) || hosts.value[0];
+    if (target) {
+      stageHostId.value = target.id;
+      centerStage.value = 'terminal';
+      detailHostId.value = target.id;
+      let tab = openTabs.value.find((t) => t.hostId === target.id);
+      if (!tab) {
+        tab = {
+          hostId: target.id,
+          mode: 'terminal',
+          rightWing: null,
+          splitDirection: 'row',
+          panes: [],
+        };
+        openTabs.value.push(tab);
+      }
+      await ensureHostHasPane(tab);
+    }
+  }
 }
 
 onMounted(async () => {
@@ -1015,7 +1065,35 @@ onBeforeUnmount(() => {
     </div>
   </div>
 
-  <!-- 2. 已认证主应用 -->
+  <!-- 2. 独立系统原生终端窗口（100% 独占沉浸纯终端，无侧栏与管理后台杂质） -->
+  <div
+    v-else-if="authChecked && isStandalone"
+    class="flex h-full w-full flex-col overflow-hidden select-none bg-white dark:bg-[#0c0d10] text-zinc-900 dark:text-zinc-100"
+  >
+    <div
+      v-for="tab in openTabs"
+      :key="tab.hostId"
+      v-show="stageHostId === tab.hostId"
+      class="h-full w-full"
+    >
+      <TerminalStage
+        v-if="hostById(tab.hostId)"
+        :host="hostById(tab.hostId)!"
+        :panes="tab.panes"
+        :split-direction="tab.splitDirection"
+        :dark="terminalDark"
+        :right-wing="null"
+        :creating="creatingPane"
+        :standalone="true"
+        @split="handleSplitTerminal"
+        @close-pane="handleClosePane"
+        @toggle-dark="toggleTheme"
+        @meta-update="handlePaneMetaUpdate"
+      />
+    </div>
+  </div>
+
+  <!-- 3. 已认证常规主应用（仓库 + 工作台 + 设置） -->
   <div
     v-else-if="authChecked"
     class="flex h-full w-full flex-col overflow-hidden select-none text-zinc-900 dark:text-zinc-100"
@@ -1051,6 +1129,26 @@ onBeforeUnmount(() => {
           <span class="rounded-full bg-zinc-100 px-1.5 py-0.2 font-mono text-[10px] text-zinc-500 dark:bg-zinc-700 dark:text-zinc-300">
             {{ onlineCount }}/{{ totalActiveCount }}
           </span>
+        </button>
+
+        <!-- 侧栏显隐切换按钮（仅在打开终端或文件时展示，默认收起让终端独占全宽） -->
+        <button
+          v-if="activePage === 'workspace' && hasCenterStage"
+          type="button"
+          class="inline-flex shrink-0 items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-medium transition"
+          :class="
+            showSidebarInStage
+              ? 'border border-zinc-200/90 bg-white text-zinc-900 shadow-sm dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100'
+              : 'text-zinc-500 hover:bg-white/60 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/60 dark:hover:text-zinc-100'
+          "
+          :title="showSidebarInStage ? '收起侧边主机列表，终端全宽显示' : '展开侧边主机列表并排查看'"
+          @click="showSidebarInStage = !showSidebarInStage"
+        >
+          <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+            <line x1="9" y1="3" x2="9" y2="21" />
+          </svg>
+          <span class="hidden sm:inline">{{ showSidebarInStage ? '收起侧栏' : '展开侧栏' }}</span>
         </button>
 
         <!-- 左上角已打开的终端/文件会话标签页 -->
@@ -1653,7 +1751,11 @@ onBeforeUnmount(() => {
         <!-- 左栏：VPS 仓库 -->
         <section
           class="flex h-full min-h-0 flex-col overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
-          :class="hasCenterStage ? 'w-[336px] shrink-0' : 'min-w-0 flex-1'"
+          :class="
+            hasCenterStage
+              ? (showSidebarInStage ? 'w-[336px] shrink-0' : 'w-0 opacity-0 pointer-events-none p-0 overflow-hidden')
+              : 'min-w-0 flex-1'
+          "
         >
           <div class="flex-1 space-y-2 overflow-y-auto pr-1">
             <div
@@ -1668,6 +1770,7 @@ onBeforeUnmount(() => {
                 dragOverId === host.id ? 'border-dashed border-orange-400' : '',
               ]"
               @click="onCardClick(host)"
+              @dblclick="openTerminalStage(host)"
               @dragstart="onDragStart($event, host)"
               @dragover="onDragOver($event, host)"
               @drop="onDrop($event, host)"
@@ -1842,7 +1945,7 @@ onBeforeUnmount(() => {
           class="overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
           :class="
             hasCenterStage
-              ? 'ml-3.5 min-w-0 flex-1 opacity-100'
+              ? (showSidebarInStage ? 'ml-3.5 min-w-0 flex-1 opacity-100' : 'ml-0 min-w-0 flex-1 opacity-100')
               : 'ml-0 w-0 flex-none opacity-0 pointer-events-none'
           "
         >
@@ -1859,12 +1962,14 @@ onBeforeUnmount(() => {
                 :dark="terminalDark"
                 :right-wing="detailHostId === tab.hostId ? rightWing : null"
                 :creating="creatingPane"
+                :standalone="false"
                 @split="handleSplitTerminal"
                 @close-pane="handleClosePane"
                 @toggle-dark="terminalDark = !terminalDark"
                 @toggle-right-wing="toggleRightWing"
                 @collapse-stage="switchToHomeView"
                 @meta-update="handlePaneMetaUpdate"
+                @popout="handlePopoutTerminal(tab.hostId)"
               />
             </div>
           </template>

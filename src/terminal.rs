@@ -82,6 +82,10 @@ pub enum UiEvent {
         reason: Option<String>,
     },
     ShowMainWindow,
+    OpenStandaloneTerminal {
+        host_id: String,
+        pane_id: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -574,6 +578,13 @@ impl TerminalManager {
 
     pub fn notify_show_main_window(&self) {
         let _ = self.ui_events_tx.send(UiEvent::ShowMainWindow);
+    }
+
+    pub fn notify_open_standalone_terminal(&self, host_id: &str, pane_id: Option<&str>) {
+        let _ = self.ui_events_tx.send(UiEvent::OpenStandaloneTerminal {
+            host_id: host_id.to_string(),
+            pane_id: pane_id.map(|s| s.to_string()),
+        });
     }
 
     pub fn list_panes(&self, host_id_filter: Option<&str>, include_headless: bool) -> Vec<PaneMeta> {

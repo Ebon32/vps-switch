@@ -10,6 +10,7 @@ const props = defineProps<{
   dark: boolean;
   rightWing: 'detail' | 'files' | null;
   creating: boolean;
+  standalone?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -19,6 +20,7 @@ const emit = defineEmits<{
   toggleRightWing: [mode: 'files' | 'detail'];
   collapseStage: [];
   metaUpdate: [meta: PaneMeta];
+  popout: [];
 }>();
 
 const focusedPaneId = ref<string | null>(null);
@@ -155,7 +157,22 @@ const activePane = computed(() => {
           <span>详情图表</span>
         </button>
 
+        <!-- 弹出系统独立原生窗口 -->
         <button
+          v-if="!standalone"
+          type="button"
+          class="inline-flex items-center gap-1 rounded-xl border border-zinc-200/80 bg-white px-2.5 py-1 text-xs font-medium text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+          title="在独立的系统原生窗口中打开该终端"
+          @click="emit('popout')"
+        >
+          <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" />
+          </svg>
+          <span class="hidden sm:inline">独立窗口</span>
+        </button>
+
+        <button
+          v-if="!standalone"
           type="button"
           class="ml-0.5 rounded-lg p-1 text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-800 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
           title="收起舞台回到仓库（终端后台保活，可从左上角标签秒切回）"
