@@ -18,6 +18,7 @@ const emit = defineEmits<{
   focus: [];
   closePane: [paneId: string];
   metaUpdate: [meta: PaneMeta];
+  reconnect: [paneId: string];
 }>();
 
 const containerRef = ref<HTMLDivElement | null>(null);
@@ -331,20 +332,31 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <!-- 会话已退出提示条 -->
+    <!-- 会话已结束提示条：远端断开或进程退出都走这里。SSH 掉线无法在字节层恢复，
+         只能重建一个该主机的新会话（后端会在没有活终端时释放旧连接、重新登录）。 -->
     <div
       v-if="exited"
-      class="flex items-center justify-between border-t border-zinc-200/80 bg-zinc-50 px-3 py-1.5 text-xs text-zinc-500"
+      class="flex items-center justify-between gap-2 border-t border-zinc-200/80 bg-zinc-50 px-3 py-1.5 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-400"
     >
-      <span>终端进程已退出</span>
-      <button
-        v-if="showClose"
-        type="button"
-        class="rounded-md bg-zinc-900 px-2 py-0.5 text-white"
-        @click="emit('closePane', paneId)"
-      >
-        移除面板
-      </button>
+      <span>终端会话已结束（远端断开或进程退出）</span>
+      <div class="flex shrink-0 items-center gap-1.5">
+        <button
+          type="button"
+          class="rounded-md bg-zinc-900 px-2 py-0.5 text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
+          title="为该主机重新建立一个终端会话"
+          @click="emit('reconnect', paneId)"
+        >
+          重新连接
+        </button>
+        <button
+          v-if="showClose"
+          type="button"
+          class="rounded-md border border-zinc-300 bg-white px-2 py-0.5 text-zinc-600 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+          @click="emit('closePane', paneId)"
+        >
+          移除面板
+        </button>
+      </div>
     </div>
   </div>
 </template>

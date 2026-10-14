@@ -211,6 +211,13 @@ fn summarize_probe_output(raw: &str) -> String {
     }
 }
 
+/// 连接失败里区分"超时"与"被拒绝/认证失败"。
+/// 超时只说明这次没连上、可能只是线路慢（慢 VPS 的 SSH 握手常超过 8 秒），不能据此判离线；
+/// 被拒绝（Connection refused）或认证失败才是确定的"连不上"。
+fn connect_error_is_timeout(msg: &str) -> bool {
+    msg.contains("超时") || msg.contains("deadline has elapsed") || msg.contains("timed out")
+}
+
 impl InspectorEngine {
     pub fn new() -> Self {
         Self::default()
@@ -243,23 +250,28 @@ impl InspectorEngine {
             None => None,
         };
 
-        let started = Instant::now();
+        let connect_started = Instant::now();
         let session = match pool
             .get_or_connect(&record, jump.as_ref(), db.master_key())
             .await
         {
             Ok(s) => s,
             Err(err) => {
-                let _ = db.update_check_result(
-                    host_id,
-                    false,
-                    None,
-                    None,
-                    Some(format!("{err:#}")),
-                );
+                // 连不上要分两种情况：**超时**（不确定，可能只是线路慢）与**拒绝/认证失败**
+                // （确定连不上）。前者若也判离线，慢线路（zouter/lazy-* 这类）会长期误红，
+                // 所以记成 unknown 交给界面用灰灯表示"这次没判定出来"，绝不冒充"离线"。
+                let msg = format!("{err:#}");
+                let status = if connect_error_is_timeout(&msg) {
+                    "unknown"
+                } else {
+                    "offline"
+                };
+                let _ = db.update_check_result(host_id, status, None, None, Some(msg));
                 return Err(err);
             }
         };
+        // 「SSH 响应」只算连接（握手+认证）耗时，不含后面的排队与探针——否则探针慢会把延迟撑到几十秒。
+        let latency_ms = connect_started.elapsed().as_millis() as i64;
 
         let known_windows = record
             .os_info
@@ -307,32 +319,30 @@ impl InspectorEngine {
             break;
         }
 
-        let latency_ms = started.elapsed().as_millis() as i64;
         let (inspection, os_info) = match parsed {
             Some(v) => v,
             None => {
                 let detail = failures.join("；");
+                // 走到这里说明 SSH **已经连上**了（get_or_connect 成功）——这台机器是可连的。
+                // 探针跑不出来只代表"这次没采到数据"，不该把灯判成离线：慢/抖线路上 channel
+                // 中途掉一次（例如回退的 Windows 探针返回 Disconnected）就会让一台能连的主机
+                // 常年标红（zouter 已实测复现）。所以保持在线，把采集失败原因写进 last_error。
                 if exec_errored {
-                    // 连接层面出过错，池里这条连接不再可信
+                    // exec 层面出过错，池里这条连接不再可信，回收它下次重建
                     pool.invalidate_host(host_id).await;
-                    let _ =
-                        db.update_check_result(host_id, false, None, None, Some(detail.clone()));
-                } else {
-                    // SSH 通了、命令也跑了，只是两套脚本都认不出来：如实记成在线 + 错误原因，
-                    // 绝不像旧版那样按 Linux 解析出一堆 0 再谎报采集成功。
-                    let _ = db.update_check_result(
-                        host_id,
-                        true,
-                        Some(latency_ms),
-                        None,
-                        Some(detail.clone()),
-                    );
                 }
+                let _ = db.update_check_result(
+                    host_id,
+                    "online",
+                    Some(latency_ms),
+                    None,
+                    Some(detail.clone()),
+                );
                 return Err(anyhow!("探针无法识别远端系统：{detail}"));
             }
         };
 
-        let _ = db.update_check_result(host_id, true, Some(latency_ms), Some(os_info), None);
+        let _ = db.update_check_result(host_id, "online", Some(latency_ms), Some(os_info), None);
         self.latest_snapshots
             .lock()
             .unwrap()

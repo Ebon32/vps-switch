@@ -52,6 +52,9 @@ pub struct AppState {
     pub exec_tasks: Arc<ExecTaskManager>,
     pub sessions: Mutex<HashSet<String>>,
     pub port: u16,
+    /// 服务是否绑在本机回环。绑回环时 MCP 端点免 API Key（本机优先，对齐 1Shell）；
+    /// 只有真正对外部署（HOST=0.0.0.0）时才强制校验 Key。
+    pub bind_is_loopback: bool,
 }
 
 pub fn build_api_router(state: Arc<AppState>) -> Router {
@@ -986,31 +989,75 @@ struct LocalRemoteTransferPayload {
     remote_path: String,
 }
 
+/// UI 未指定本机落点时的默认路径：系统下载目录（Windows: %USERPROFILE%\Downloads），
+/// 取不到就退回当前目录。文件名沿用远端文件名。
+fn default_download_path(remote_path: &str) -> String {
+    let filename = remote_path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download.bin");
+    let base = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join("Downloads"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join(filename).to_string_lossy().to_string()
+}
+
 async fn api_create_local_remote_transfer(
     State(state): State<Arc<AppState>>,
     Json(p): Json<LocalRemoteTransferPayload>,
 ) -> impl IntoResponse {
-    match files::transfer_local_remote_file(
-        &state.ssh_pool,
-        &state.db,
-        &state.transfers,
-        &p.host_id,
-        &p.direction,
-        &p.local_path,
-        &p.remote_path,
-    )
-    .await
-    {
-        Ok(task) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "task": task,
-            })),
-        )
-            .into_response(),
-        Err(e) => err_response(StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    if p.direction != "upload" && p.direction != "download" {
+        return err_response(StatusCode::BAD_REQUEST, "direction 只能是 upload 或 download")
+            .into_response();
     }
+    if state.db.get_record(&p.host_id).ok().flatten().is_none() {
+        return err_response(StatusCode::BAD_REQUEST, "主机不存在").into_response();
+    }
+    let local_path = if p.local_path.trim().is_empty() {
+        if p.direction == "download" {
+            default_download_path(&p.remote_path)
+        } else {
+            return err_response(StatusCode::BAD_REQUEST, "上传需要指定本机文件路径")
+                .into_response();
+        }
+    } else {
+        p.local_path.trim().to_string()
+    };
+
+    // 后台跑：大文件不能把这条 HTTP 请求挂住。进度、速率、续传与校验状态都走
+    // /api/transfers 队列查询（前端会轮询）。这里立刻返回本机落点供界面提示。
+    let st = state.clone();
+    let host_id = p.host_id.clone();
+    let direction = p.direction.clone();
+    let remote_path = p.remote_path.clone();
+    let local_for_task = local_path.clone();
+    tokio::spawn(async move {
+        let _ = files::transfer_local_remote_file(
+            &st.ssh_pool,
+            &st.db,
+            &st.transfers,
+            &host_id,
+            &direction,
+            &local_for_task,
+            &remote_path,
+        )
+        .await;
+    });
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "started": true,
+            "localPath": local_path,
+        })),
+    )
+        .into_response()
 }
 
 async fn api_clear_transfers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1502,9 +1549,10 @@ async fn api_mcp_rpc(
         return err_response(StatusCode::FORBIDDEN, "MCP Server 当前已在设置中关闭").into_response();
     }
 
-    // API Key 一律校验。stdio 桥接同样走真实 Key（见 mcp.rs try_forward_to_daemon），
-    // 不再存在任何客户端可伪造的豁免请求头。
-    if settings.mcp_require_api_key {
+    // API Key 只在**非回环绑定**（真的对外部署）时才校验。绑在本机回环时，端点只有本机
+    // 进程够得着，和 1Shell 一样免校验——既符合"本机优先"的定位，也消除了"桥接进程与
+    // 守护进程解析到不同数据目录、key 对不上 → 401 → 永远握不上手"这类纯本机自伤。
+    if settings.mcp_require_api_key && !state.bind_is_loopback {
         let provided = extract_mcp_api_key(&headers);
         if provided.as_deref() != Some(settings.mcp_api_key.as_str()) {
             return err_response(

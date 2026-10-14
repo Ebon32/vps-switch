@@ -414,7 +414,10 @@ fn strip_terminal_queries(data: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn looks_like_interactive_prompt(line: &str) -> bool {
+/// 严格版：只认明确的关键词（password: / [y/n] / proceed? …）。
+/// 用于非交互 exec 的早退判定——那里没有 stdin，误判会直接掐断一条正常命令，
+/// 所以宁可漏判，也不能凭"以 ? / : 结尾"这种文本特征去猜（`Processing:` 就会被误伤）。
+pub fn looks_like_explicit_interactive_prompt(line: &str) -> bool {
     let lower = line.trim().to_lowercase();
     if lower.is_empty() {
         return false;
@@ -436,8 +439,19 @@ pub fn looks_like_interactive_prompt(line: &str) -> bool {
         "请确认",
         "请输入",
     ];
-    if patterns.iter().any(|p| lower.contains(p)) {
+    patterns.iter().any(|p| lower.contains(p))
+}
+
+/// 宽松版：明确关键词，或"以 ? / : 结尾且不像 shell 提示符"。
+/// 只用于交互式终端（vps_terminal）的屏幕状态判定——那里本来就在等用户输入，
+/// 多报一次 waiting_input 无伤大雅；非交互 exec 请用严格版。
+pub fn looks_like_interactive_prompt(line: &str) -> bool {
+    if looks_like_explicit_interactive_prompt(line) {
         return true;
+    }
+    let lower = line.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
     }
     (lower.ends_with('?') || lower.ends_with(':')) && !looks_like_shell_prompt(line)
 }
@@ -590,6 +604,10 @@ impl PaneHandle {
 pub struct TerminalManager {
     panes: Mutex<HashMap<String, Arc<PaneHandle>>>,
     ui_events_tx: broadcast::Sender<UiEvent>,
+    /// 每主机一把建 pane 的异步锁：串行化"检查有无活 pane → 释放旧连接 → 建新 pane"这段。
+    /// 否则两个并发 create（例如 agent 同时调 vps_terminal）会让后者的 drop_pane_session
+    /// 把前者刚建好的连接断掉，先建的那个 pane 立刻死。
+    create_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for TerminalManager {
@@ -604,6 +622,7 @@ impl TerminalManager {
         Self {
             panes: Mutex::new(HashMap::new()),
             ui_events_tx,
+            create_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -699,6 +718,15 @@ impl TerminalManager {
         let cols = cols.clamp(20, 500);
         let rows = rows.clamp(5, 200);
         let pane_id = format!("pane_{}", Uuid::new_v4());
+
+        // 串行化同一主机的并发建 pane（见 create_locks 注释）
+        let host_lock = {
+            let mut g = self.create_locks.lock().unwrap();
+            g.entry(host_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _create_guard = host_lock.lock().await;
 
         // 先回收该主机已退出的旧 pane。一个活的都不剩 = 上个终端已经关完了：
         // 释放终端连接，新 pane 会重新登录，登录横幅（MOTD）才会再次出现。

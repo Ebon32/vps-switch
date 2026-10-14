@@ -16,6 +16,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   split: [direction: 'row' | 'col'];
   closePane: [paneId: string];
+  reconnectPane: [paneId: string];
   toggleDark: [];
   toggleRightWing: [mode: 'files' | 'detail'];
   collapseStage: [];
@@ -123,6 +124,7 @@ const activePane = computed(() => {
 
         <!-- 在最右栏展开与左栏等宽(336px)的「文件管理」 -->
         <button
+          v-if="!standalone"
           type="button"
           class="inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-xs font-medium transition"
           :class="
@@ -141,6 +143,7 @@ const activePane = computed(() => {
 
         <!-- 在最右栏展开与左栏等宽(336px)的「详情图表」 -->
         <button
+          v-if="!standalone"
           type="button"
           class="inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-xs font-medium transition"
           :class="
@@ -201,6 +204,7 @@ const activePane = computed(() => {
           :show-close="panes.length > 1"
           @focus="focusedPaneId = pane.id"
           @close-pane="emit('closePane', $event)"
+          @reconnect="emit('reconnectPane', $event)"
           @meta-update="emit('metaUpdate', $event)"
         />
       </div>

@@ -763,6 +763,8 @@ async function checkSingleHost(host: PublicHost) {
       }
       if (data.host.status === 'online') {
         showToast(`${data.host.name} 在线 (${data.host.latencyMs ?? 0} ms)`);
+      } else if (data.host.status === 'unknown') {
+        showToast(`${data.host.name} 连接超时，未能判定（可能只是线路慢）`, 'err');
       } else {
         showToast(`${data.host.name} 离线`, 'err');
       }
@@ -1000,6 +1002,39 @@ async function handleClosePane(paneId: string) {
   tab.panes = tab.panes.filter((p) => p.id !== paneId);
   if (tab.panes.length === 0) {
     await closeSessionTab(tab.hostId);
+  }
+}
+
+// 终端会话结束后原地重连：为该主机新建一个 pane 顶替退出那个的位置。
+// 先建后删——后端 create_pane 会顺手回收同主机已退出的旧 pane，且该主机没有活终端时
+// 会释放旧的终端连接、重新登录（横幅照常出现）。
+async function handleReconnectPane(paneId: string) {
+  const tab = openTabs.value.find((t) => t.panes.some((p) => p.id === paneId));
+  if (!tab || paneCreationInFlight.has(tab.hostId)) return;
+  const idx = tab.panes.findIndex((p) => p.id === paneId);
+  const cwd = tab.panes[idx]?.cwd || undefined;
+  paneCreationInFlight.add(tab.hostId);
+  paneCreationCount.value += 1;
+  try {
+    const res = await fetch('/api/terminals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostId: tab.hostId, cols: 100, rows: 30, cwd: cwd || undefined }),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.pane) {
+      showToast(data.error || '重连失败', 'err');
+      return;
+    }
+    void fetch(`/api/terminals/${encodeURIComponent(paneId)}`, { method: 'DELETE' });
+    const at = tab.panes.findIndex((p) => p.id === paneId);
+    tab.panes.splice(at >= 0 ? at : idx, 1, data.pane as PaneMeta);
+    showToast('终端已重新连接');
+  } catch (e) {
+    showToast(`重连失败: ${(e as Error).message}`, 'err');
+  } finally {
+    paneCreationInFlight.delete(tab.hostId);
+    paneCreationCount.value = Math.max(0, paneCreationCount.value - 1);
   }
 }
 
@@ -1292,6 +1327,7 @@ onBeforeUnmount(() => {
         :standalone="true"
         @split="handleSplitTerminal"
         @close-pane="handleClosePane"
+        @reconnect-pane="handleReconnectPane"
         @toggle-dark="toggleTheme"
         @meta-update="handlePaneMetaUpdate"
       />
@@ -2490,6 +2526,7 @@ onBeforeUnmount(() => {
                 :standalone="false"
                 @split="handleSplitTerminal"
                 @close-pane="handleClosePane"
+                @reconnect-pane="handleReconnectPane"
                 @toggle-dark="terminalDark = !terminalDark"
                 @toggle-right-wing="toggleRightWing"
                 @collapse-stage="switchToHomeView"

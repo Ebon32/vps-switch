@@ -5,7 +5,7 @@ use crate::{
     guard::Verdict,
     models::{HostRecord, LOCAL_HOST_ID},
     ssh::open_host_channel,
-    terminal::looks_like_interactive_prompt,
+    terminal::looks_like_explicit_interactive_prompt,
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -257,7 +257,9 @@ impl ExecTaskManager {
                     return Ok(g.snapshot());
                 }
 
-                // 交互式提问早退保护：若命令输出末尾停在 [Y/n] / password: 等提问且静默超过 2 秒，立即中断提醒 Agent
+                // 交互式提问早退保护：只在命中**明确关键词**（[Y/n] / password: / proceed? …）时才判定。
+                // 早先这里用宽松版（"以 ? / : 结尾"也算），会把 `echo "Processing:"` 这类正常命令
+                // 在静默 2 秒后直接掐断并误报成 interactive_stall（已实测复现）。
                 if g.last_output_inst.elapsed() >= Duration::from_millis(2000)
                     && (!g.stdout.is_empty() || !g.stderr.is_empty())
                 {
@@ -267,7 +269,7 @@ impl ExecTaskManager {
                         String::from_utf8_lossy(&g.stderr)
                     );
                     if let Some(last_line) = combined.lines().rev().find(|l| !l.trim().is_empty()) {
-                        if looks_like_interactive_prompt(last_line) {
+                        if looks_like_explicit_interactive_prompt(last_line) {
                             if let Some(tx) = g.cancel_tx.take() {
                                 let _ = tx.send(());
                             }
@@ -1235,11 +1237,17 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
             pane.send_and_wait(bytes, max_lines, wait_ms).await
         }
         "key" => {
-            let key_name = args
+            let raw_input = args
                 .get("input")
                 .and_then(|v| v.as_str())
-                .unwrap_or("enter")
-                .to_lowercase();
+                .unwrap_or("enter");
+            // 护栏：key 分支的兜底分支会把未知字符串原样当按键发出去，等于一条不受检查的文本
+            // 通道（`key:"rm -rf /"` 再 `key:"enter"` 就能执行）。这里和 send 一样先过黑名单。
+            // 真正的控制键（ctrl+c/enter/…）不会命中名单，照常发送。
+            if let Verdict::Deny { why } = state.guard.check(raw_input) {
+                return Err(anyhow!("{why}"));
+            }
+            let key_name = raw_input.to_lowercase();
             let bytes: Vec<u8> = match key_name.as_str() {
                 "ctrl+c" | "c-c" | "sigint" => vec![0x03],
                 "ctrl+d" | "c-d" | "eof" => vec![0x04],
@@ -1520,13 +1528,24 @@ pub async fn run_stdio_bridge(state: Arc<AppState>, exec_tasks: Arc<ExecTaskMana
             continue;
         };
 
-        // 优先尝试转发给已运行的常驻 UI 主进程（以便共享 SshPool 与 UI 终端弹窗联动）；
-        // 带上与主进程共库的真实 API Key，不再依赖任何可伪造的"我是内部桥接"请求头
-        let api_key = state
-            .db
-            .get_app_settings()
-            .map(|s| s.mcp_api_key)
-            .unwrap_or_default();
+        let settings = state.db.get_app_settings().ok();
+        // 尊重 MCP 总开关（否则下面的进程内回退会绕过它）
+        if settings.as_ref().map(|s| !s.mcp_enabled).unwrap_or(false) {
+            let err = json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "error": { "code": -32000, "message": "MCP Server 已在设置中关闭" }
+            });
+            println!("{}", serde_json::to_string(&err)?);
+            continue;
+        }
+        let api_key = settings.map(|s| s.mcp_api_key).unwrap_or_default();
+
+        // 优先转发给已运行的常驻主进程（共享 SshPool 与 UI 终端联动）。只有转发**确实拿到了
+        // 一个可用的 JSON-RPC 响应**才采用它；否则回退到进程内处理。
+        // 此前是"拿到任何响应就原样打印"——当两个进程解析到不同的库、API Key 对不上时，
+        // 服务端回 401，桥接把那段错误文本当结果吐给客户端，客户端解析失败 → 永远握不上手
+        // （WorkBuddy 连不上的根因）。现在 401/403 之类会返回 None 触发回退。
         if let Some(resp_str) = try_forward_to_daemon(port, &api_key, trimmed).await {
             if !resp_str.trim().is_empty() {
                 println!("{}", resp_str.trim());
@@ -1541,6 +1560,9 @@ pub async fn run_stdio_bridge(state: Arc<AppState>, exec_tasks: Arc<ExecTaskMana
     Ok(())
 }
 
+/// 把一条请求转发给常驻主进程。返回 `Some(body)` 仅当对方回了一个可用的 JSON-RPC 响应
+/// （HTTP 200 + 含 `jsonrpc` 字段），或 `Some("")` 表示通知类已被接收（202 无响应体）。
+/// 其余情况（连不上、401/403、响应体不是 JSON-RPC）一律返回 `None`，让调用方回退到进程内处理。
 async fn try_forward_to_daemon(port: u16, api_key: &str, raw_json: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let addr = format!("127.0.0.1:{port}");
@@ -1561,8 +1583,20 @@ async fn try_forward_to_daemon(port: u16, api_key: &str, raw_json: &str) -> Opti
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).await.ok()?;
     let resp_str = String::from_utf8_lossy(&resp);
-    let (_, body) = resp_str.split_once("\r\n\r\n")?;
-    Some(body.trim().to_string())
+    let (head, body) = resp_str.split_once("\r\n\r\n")?;
+    let status_line = head.lines().next().unwrap_or("");
+    if status_line.contains(" 202 ") {
+        // 通知类请求：主进程已接收、本就不产生响应体
+        return Some(String::new());
+    }
+    if !status_line.contains(" 200 ") {
+        return None;
+    }
+    let body = body.trim();
+    if !body.contains("\"jsonrpc\"") {
+        return None;
+    }
+    Some(body.to_string())
 }
 
 // ==================== 自动写入 Claude Code (~/.claude.json) 与 Codex (~/.codex/config.toml) ====================

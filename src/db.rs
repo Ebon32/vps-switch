@@ -544,10 +544,14 @@ impl Database {
         Ok(())
     }
 
+    /// 记录一次检测结果。`status` 取 "online" | "offline" | "unknown"：
+    /// - online：SSH 已连上（探针是否采到数据不影响这个结论）；
+    /// - offline：确定连不上（连接被拒绝 / 认证失败）；
+    /// - unknown：无法判定（连接超时这类——可能只是线路慢，不直接判死）。
     pub fn update_check_result(
         &self,
         id: &str,
-        online: bool,
+        status: &str,
         latency_ms: Option<i64>,
         os_info: Option<OsInfo>,
         error: Option<String>,
@@ -556,9 +560,13 @@ impl Database {
             .get_record(id)?
             .ok_or_else(|| anyhow!("主机不存在: {id}"))?;
         let now = Utc::now().to_rfc3339();
-        let status = if online { "online" } else { "offline" };
+        let status = match status {
+            "online" => "online",
+            "offline" => "offline",
+            _ => "unknown",
+        };
         let merged_os = os_info.or(existing.os_info);
-        let last_connected = if online {
+        let last_connected = if status == "online" {
             Some(now.clone())
         } else {
             existing.last_connected_at

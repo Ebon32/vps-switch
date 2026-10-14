@@ -1350,6 +1350,18 @@ pub async fn transfer_local_remote_file(
                 return Err(anyhow!(msg));
             }
             None => {
+                // 远端算不出 SHA-256（没有 sha256sum/Get-FileHash）时，非续传的整文件下载
+                // 仍可接受（只是无法"宣称已校验"）；但**续传**的下载绝不能静默放行——
+                // 残片是不是这个源文件的前半段，唯一判据就是收尾这次对账，对不了账就
+                // 可能把旧残片拼进成品。宁可报失败，也不产出一个悄悄坏掉的文件。
+                if resume_from > 0 {
+                    let msg = format!(
+                        "本次从 {resume_from} 字节续传，但远端无法计算 SHA-256，无法确认残片与源文件一致；文件已保留，请人工核查后重传（或删除残片重下）"
+                    );
+                    transfers.fail_task(&task_id, &msg);
+                    transfers.set_verification(&task_id, Some(digest), None);
+                    return Err(anyhow!(msg));
+                }
                 transfers.set_verification(&task_id, Some(digest), None);
             }
         }

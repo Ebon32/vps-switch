@@ -109,9 +109,9 @@ const editorContent = ref('');
 const editorLoading = ref(false);
 const editorSaving = ref(false);
 
-// 新建/重命名/删除确认条
+// 新建/重命名/删除确认条 / 下载落点
 const inlinePrompt = ref<{
-  kind: 'mkdir' | 'touch' | 'rename' | 'delete';
+  kind: 'mkdir' | 'touch' | 'rename' | 'delete' | 'download';
   title: string;
   value: string;
   target?: FileEntry;
@@ -510,14 +510,8 @@ async function saveFileEditor() {
 
 function triggerDownload(item: FileEntry) {
   if (item.isDir) return;
-  ensureTransferPolling();
-  const url = `/api/files/download?hostId=${encodeURIComponent(props.host.id)}&path=${encodeURIComponent(item.path)}`;
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = item.name;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  // 改走带断点续传的传输引擎（见 openInlineAction('download')），不再用浏览器直下
+  openInlineAction('download', item);
 }
 
 function copyEntryPath(path: string) {
@@ -578,7 +572,7 @@ function onDropFiles(e: DragEvent) {
 }
 
 function openInlineAction(
-  kind: 'mkdir' | 'touch' | 'rename' | 'delete',
+  kind: 'mkdir' | 'touch' | 'rename' | 'delete' | 'download',
   target?: FileEntry
 ) {
   if (kind === 'mkdir') {
@@ -592,6 +586,15 @@ function openInlineAction(
       kind,
       title: `确认删除${target.isDir ? '目录' : '文件'}「${target.name}」？`,
       value: target.name,
+      target,
+    };
+  } else if (kind === 'download' && target) {
+    // 走带断点续传 + SHA-256 校验的传输引擎（不再是浏览器直下、断了只能从头）。
+    // 留空则落到系统下载目录。
+    inlinePrompt.value = {
+      kind,
+      title: `下载「${target.name}」到本机路径（留空 = 系统下载目录）`,
+      value: '',
       target,
     };
   }
@@ -670,6 +673,26 @@ async function submitInlineAction() {
         editorOpen.value = false;
       }
       emit('toast', `已删除 ${act.target.name}`);
+    } else if (act.kind === 'download' && act.target) {
+      const res = await fetch('/api/transfers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          hostId: props.host.id,
+          direction: 'download',
+          localPath: val,
+          remotePath: act.target.path,
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || '发起下载失败');
+      inlinePrompt.value = null;
+      ensureTransferPolling();
+      emit(
+        'toast',
+        `开始下载到 ${data.localPath || '系统下载目录'}（队列中看进度；中断后重下会自动续传）`
+      );
+      return;
     }
     inlinePrompt.value = null;
     invalidateCache(props.host.id, currentPath.value);

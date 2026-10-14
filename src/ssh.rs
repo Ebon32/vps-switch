@@ -562,7 +562,7 @@ pub async fn open_host_channel(
     let channel = pool
         .open_session_channel(&record, jump.as_ref(), db.master_key())
         .await?;
-    let _ = db.update_check_result(&record.id, true, None, None, None);
+    let _ = db.update_check_result(&record.id, "online", None, None, None);
     Ok((record, channel))
 }
 
@@ -595,6 +595,6 @@ pub async fn open_pane_channel(
                 .context("打开 SSH 会话通道失败")?
         }
     };
-    let _ = db.update_check_result(&record.id, true, None, None, None);
+    let _ = db.update_check_result(&record.id, "online", None, None, None);
     Ok((record, channel))
 }

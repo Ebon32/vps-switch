@@ -37,14 +37,26 @@ impl MasterKey {
         let key_path = data_dir.join("secret.key");
         if key_path.exists() {
             let raw = fs::read_to_string(&key_path).context("读取 secret.key 失败")?;
-            let decoded = B64
-                .decode(raw.trim())
-                .context("解码 secret.key base64 失败")?;
-            if decoded.len() == 32 {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let decoded = B64
+                    .decode(trimmed)
+                    .context("解码 secret.key base64 失败")?;
+                if decoded.len() != 32 {
+                    // 关键：绝不覆盖。旧实现遇到非法内容会直接生成新密钥盖掉原文件，
+                    // 那会让库里所有已加密的密码/私钥**永久**解不开，且毫无提示。
+                    // 宁可拒绝启动，让人工处理（真要从头开始就手动删掉这个文件）。
+                    return Err(anyhow!(
+                        "secret.key 存在但不是合法的 32 字节密钥（解出 {} 字节），已拒绝覆盖，\
+                         以免破坏库中已加密的凭据。请人工恢复该文件；确需重新开始请手动删除它。",
+                        decoded.len()
+                    ));
+                }
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&decoded);
                 return Ok(Self { key });
             }
+            // 空文件（例如上一次写入被中途打断）：当作尚未创建，走下面重新生成
         }
 
         let mut key = [0u8; 32];

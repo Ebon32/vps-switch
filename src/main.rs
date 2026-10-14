@@ -194,6 +194,11 @@ fn main() -> Result<()> {
     }
 
     let exec_tasks = Arc::new(ExecTaskManager::new());
+    // 绑定地址在构造 AppState 前先算出来：MCP 端点是否免 Key 取决于它（绑回环 = 本机 = 免校验）
+    let bind_ip: std::net::IpAddr = std::env::var("HOST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
     let state = Arc::new(AppState {
         db,
         guard: Arc::new(Guard::load_or_create(&data_dir)?),
@@ -204,6 +209,7 @@ fn main() -> Result<()> {
         exec_tasks: exec_tasks.clone(),
         sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
         port,
+        bind_is_loopback: bind_ip.is_loopback(),
     });
 
     if is_mcp_stdio {
