@@ -64,6 +64,8 @@ pub struct TransferTask {
     pub speed_bps: u64,
     pub state: String, // "running" | "completed" | "failed"
     pub error: Option<String>,
+    /// 本次是从残片的第几字节接着传的（0 = 从头传）
+    pub resumed_from: u64,
     /// 传输内容的 SHA-256（十六进制小写）
     pub sha256: Option<String>,
     /// 闭环校验结果：Some(true)=两端哈希一致；Some(false)=不一致（任务已判失败）；
@@ -116,6 +118,7 @@ impl TransferManager {
             speed_bps: 0,
             state: "running".to_string(),
             error: None,
+            resumed_from: 0,
             sha256: None,
             verified: None,
             started_at: Utc::now().to_rfc3339(),
@@ -139,8 +142,18 @@ impl TransferManager {
                 task.total_bytes = total;
             }
             if elapsed_secs > 0.05 {
-                task.speed_bps = (transferred as f64 / elapsed_secs) as u64;
+                // 速率只算本次真正搬动的字节：续传跳过的那段不是这次的功劳
+                let moved = transferred.saturating_sub(task.resumed_from);
+                task.speed_bps = (moved as f64 / elapsed_secs) as u64;
             }
+        }
+    }
+
+    /// 标记本次从残片的第几字节续传（残片对账通过后才调用）
+    pub fn set_resume(&self, id: &str, resumed_from: u64) {
+        if let Some(task) = self.store.lock().unwrap().tasks.get_mut(id) {
+            task.resumed_from = resumed_from;
+            task.transferred_bytes = resumed_from;
         }
     }
 
@@ -151,7 +164,8 @@ impl TransferManager {
                 task.total_bytes = final_bytes;
             }
             if elapsed_secs > 0.01 {
-                task.speed_bps = (final_bytes as f64 / elapsed_secs) as u64;
+                let moved = final_bytes.saturating_sub(task.resumed_from);
+                task.speed_bps = (moved as f64 / elapsed_secs) as u64;
             }
             task.state = "completed".to_string();
             task.ended_at = Some(Utc::now().to_rfc3339());
@@ -780,9 +794,60 @@ fn hash_timeout_for(bytes: u64) -> std::time::Duration {
     std::time::Duration::from_secs(secs.min(900))
 }
 
+/// 续传前把源端已经传过的前 N 字节读掉并喂进增量哈希。
+/// 这段字节省不掉——闭环校验的哈希必须覆盖整个文件；省掉的是把这 N 字节
+/// 重新写到目标端的那条慢链路。
+async fn consume_and_hash_prefix<R>(
+    reader: &mut R,
+    hasher: &mut sha2::Sha256,
+    mut remaining: u64,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use sha2::Digest;
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = tokio::time::timeout(STALL_TIMEOUT, reader.read(&mut buf[..want]))
+            .await
+            .map_err(|_| anyhow!("续传对账读取失速超时 (连续 12 秒无数据推进)"))??;
+        if n == 0 {
+            return Err(anyhow!("源数据在续传对账阶段提前结束：还差 {remaining} 字节"));
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// 把本机残片的内容喂进增量哈希，返回读到的字节数
+async fn feed_local_file_into_hasher(
+    path: &Path,
+    hasher: &mut sha2::Sha256,
+) -> Result<u64> {
+    use sha2::Digest;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok(total)
+}
+
 /// 从任意异步流（如 HTTP 上传流或本机文件流）高速写入目标主机，
-/// 写 `.part` 临时文件并在完成后原子改名，全程实时刷新速率与进度；
+/// 写 `.vps-part` 临时文件并在完成后原子改名，全程实时刷新速率与进度；
 /// 完成后做传输闭环校验：上传流增量 SHA-256 vs 落地文件重读 SHA-256。
+///
+/// 断点续传：残片名对同一个目标文件是固定的，失败时残片留在原地不删；
+/// 下次再传同一目标时，先用「远端残片整文件哈希 == 源文件前 N 字节哈希」对账，
+/// 对得上就 seek 到 N 接着写，对不上就清掉残片并如实报错（绝不拿错残片拼出一个坏文件）。
 pub async fn stream_upload_to_host<R>(
     pool: &SshPool,
     db: &Database,
@@ -803,16 +868,65 @@ where
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("无效的文件名"))?;
     let final_path = join_remote_path(remote_dir, safe_name);
-    let temp_path = format!("{final_path}.vps-part-{}", Uuid::new_v4().simple());
+    let temp_path = format!("{final_path}.vps-part");
     let started = Instant::now();
     let mut hasher = Sha256::new();
 
     if host_id == LOCAL_HOST_ID {
         let local_final = PathBuf::from(remote_dir).join(safe_name);
         let local_temp = PathBuf::from(remote_dir).join(format!(".{safe_name}.vps-part"));
-        let mut out_file = tokio::fs::File::create(&local_temp).await?;
+
+        // 续传对账：残片内容必须恰好等于源文件的前 N 字节
+        let mut resume_from = 0u64;
+        if expected_size > 0 {
+            if let Ok(pmeta) = tokio::fs::metadata(&local_temp).await {
+                let partial = pmeta.len();
+                if partial > 0 && partial < expected_size {
+                    let mut partial_hasher = Sha256::new();
+                    match feed_local_file_into_hasher(&local_temp, &mut partial_hasher).await {
+                        Ok(read) if read == partial => {
+                            let partial_digest = hex::encode(partial_hasher.finalize());
+                            if let Err(err) =
+                                consume_and_hash_prefix(&mut reader, &mut hasher, partial).await
+                            {
+                                transfers.fail_task(task_id, &err);
+                                return Err(err);
+                            }
+                            if hex::encode(hasher.clone().finalize()) == partial_digest {
+                                resume_from = partial;
+                                transfers.set_resume(task_id, resume_from);
+                            } else {
+                                let _ = tokio::fs::remove_file(&local_temp).await;
+                                let msg = format!(
+                                    "残片与源文件前 {partial} 字节不一致，已清除残片，请重新发起传输"
+                                );
+                                transfers.fail_task(task_id, &msg);
+                                return Err(anyhow!(msg));
+                            }
+                        }
+                        _ => {
+                            let _ = tokio::fs::remove_file(&local_temp).await;
+                        }
+                    }
+                } else {
+                    // 残片为空或已不小于源文件：不可信，清掉从头来
+                    let _ = tokio::fs::remove_file(&local_temp).await;
+                }
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&local_temp).await;
+        }
+
+        let mut out_file = if resume_from > 0 {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&local_temp)
+                .await?
+        } else {
+            tokio::fs::File::create(&local_temp).await?
+        };
         let mut buf = vec![0u8; STREAM_BUF_SIZE];
-        let mut transferred = 0u64;
+        let mut transferred = resume_from;
         loop {
             let n = reader.read(&mut buf).await?;
             if n == 0 {
@@ -831,8 +945,11 @@ where
         out_file.flush().await?;
         drop(out_file);
         if expected_size > 0 && transferred != expected_size {
-            let _ = tokio::fs::remove_file(&local_temp).await;
-            let msg = format!("传输字节数不符：预期 {expected_size}，实收 {transferred}");
+            // 残片留着：下次同源再传会对账后续写
+            let msg = format!(
+                "传输字节数不符：预期 {expected_size}，实收 {transferred}（残片已保留 {}，重传将自动续传）",
+                local_temp.display()
+            );
             transfers.fail_task(task_id, &msg);
             return Err(anyhow!(msg));
         }
@@ -861,16 +978,73 @@ where
     }
 
     let sftp = pool.get_or_open_sftp(db, host_id).await?;
+
+    // 续传对账：远端残片的整文件哈希必须等于源文件前 N 字节的哈希。
+    // 取不到残片哈希（例如远端没有 sha256sum）就不敢续，清掉残片从头传。
+    let mut resume_from = 0u64;
+    if expected_size > 0 {
+        if let Ok(meta) = sftp.metadata(&temp_path).await {
+            let partial = meta.size.unwrap_or(0);
+            if partial > 0 && partial < expected_size {
+                match crate::ssh::remote_sha256(
+                    pool,
+                    db,
+                    host_id,
+                    &temp_path,
+                    hash_timeout_for(partial),
+                )
+                .await
+                {
+                    Ok(partial_digest) => {
+                        if let Err(err) =
+                            consume_and_hash_prefix(&mut reader, &mut hasher, partial).await
+                        {
+                            transfers.fail_task(task_id, &err);
+                            return Err(err);
+                        }
+                        let prefix_digest = hex::encode(hasher.clone().finalize());
+                        if prefix_digest == partial_digest {
+                            resume_from = partial;
+                            transfers.set_resume(task_id, resume_from);
+                        } else {
+                            let _ = sftp.remove_file(&temp_path).await;
+                            let msg = format!(
+                                "残片与源文件前 {partial} 字节不一致（残片 {partial_digest}，源 {prefix_digest}），已清除残片，请重新发起传输"
+                            );
+                            transfers.fail_task(task_id, &msg);
+                            return Err(anyhow!(msg));
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("远端残片哈希不可用，放弃续传从头传: {err:#}");
+                        let _ = sftp.remove_file(&temp_path).await;
+                    }
+                }
+            } else if partial >= expected_size {
+                let _ = sftp.remove_file(&temp_path).await;
+            }
+        }
+    }
+
+    let open_flags = if resume_from > 0 {
+        OpenFlags::CREATE | OpenFlags::WRITE
+    } else {
+        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
+    };
     let mut remote_file = sftp
-        .open_with_flags(
-            &temp_path,
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-        )
+        .open_with_flags(&temp_path, open_flags)
         .await
         .with_context(|| format!("创建远端临时文件失败: {temp_path}"))?;
+    if resume_from > 0 {
+        use tokio::io::AsyncSeekExt;
+        remote_file
+            .seek(std::io::SeekFrom::Start(resume_from))
+            .await
+            .with_context(|| format!("定位远端残片续写位置失败: {temp_path}"))?;
+    }
 
     let mut buf = vec![0u8; STREAM_BUF_SIZE];
-    let mut transferred = 0u64;
+    let mut transferred = resume_from;
     let write_res: Result<()> = async {
         loop {
             let n = tokio::time::timeout(STALL_TIMEOUT, reader.read(&mut buf))
@@ -899,14 +1073,18 @@ where
     .await;
 
     if let Err(err) = write_res {
-        let _ = sftp.remove_file(&temp_path).await;
-        transfers.fail_task(task_id, &err);
+        // 残片留在远端，下次传同一个文件会对账后续写
+        transfers.fail_task(
+            task_id,
+            format!("{err:#}（已保留远端残片 {temp_path}，重传将自动续传）"),
+        );
         return Err(err);
     }
 
     if expected_size > 0 && transferred != expected_size {
-        let _ = sftp.remove_file(&temp_path).await;
-        let msg = format!("传输字节数不符：预期 {expected_size}，实收 {transferred}，临时文件已清除");
+        let msg = format!(
+            "传输字节数不符：预期 {expected_size}，实收 {transferred}（已保留远端残片 {temp_path}，重传将自动续传）"
+        );
         transfers.fail_task(task_id, &msg);
         return Err(anyhow!(msg));
     }
@@ -1063,10 +1241,51 @@ pub async fn transfer_local_remote_file(
         let started = Instant::now();
         let mut remote_file = sftp.open(remote_path).await?;
         let temp_local = format!("{local_path}.vps-part");
-        let mut out_file = tokio::fs::File::create(&temp_local).await?;
-        let mut buf = vec![0u8; STREAM_BUF_SIZE];
-        let mut transferred = 0u64;
         let mut hasher = Sha256::new();
+
+        // 续传：本机残片的字节先进增量哈希，再从远端的对应偏移接着读。
+        // 残片到底是不是这个源文件的前半段，由收尾那次「远端源哈希 vs 落地哈希」判定——
+        // 对不上就如实报校验失败，不会悄悄留下一个坏文件。
+        let mut resume_from = 0u64;
+        if total > 0 {
+            if let Ok(pmeta) = tokio::fs::metadata(&temp_local).await {
+                let partial = pmeta.len();
+                if partial > 0 && partial < total {
+                    match feed_local_file_into_hasher(Path::new(&temp_local), &mut hasher).await {
+                        Ok(read) if read == partial => {
+                            use tokio::io::AsyncSeekExt;
+                            remote_file
+                                .seek(std::io::SeekFrom::Start(partial))
+                                .await
+                                .with_context(|| {
+                                    format!("定位远端源文件续传偏移失败: {remote_path}")
+                                })?;
+                            resume_from = partial;
+                            transfers.set_resume(&task_id, resume_from);
+                        }
+                        _ => {
+                            hasher = Sha256::new();
+                            let _ = tokio::fs::remove_file(&temp_local).await;
+                        }
+                    }
+                } else {
+                    let _ = tokio::fs::remove_file(&temp_local).await;
+                }
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&temp_local).await;
+        }
+
+        let mut out_file = if resume_from > 0 {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&temp_local)
+                .await?
+        } else {
+            tokio::fs::File::create(&temp_local).await?
+        };
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
+        let mut transferred = resume_from;
 
         let res: Result<()> = async {
             loop {
@@ -1093,14 +1312,18 @@ pub async fn transfer_local_remote_file(
         .await;
 
         if let Err(err) = res {
-            let _ = tokio::fs::remove_file(&temp_local).await;
-            transfers.fail_task(&task_id, &err);
+            // 残片留着：下次下同一个文件会从这里接着下
+            transfers.fail_task(
+                &task_id,
+                format!("{err:#}（已保留本机残片 {temp_local}，重传将自动续传）"),
+            );
             return Err(err);
         }
 
         if total > 0 && transferred != total {
-            let _ = tokio::fs::remove_file(&temp_local).await;
-            let msg = format!("下载字节数不符：预期 {total}，实收 {transferred}，临时文件已清除");
+            let msg = format!(
+                "下载字节数不符：预期 {total}，实收 {transferred}（已保留本机残片 {temp_local}，重传将自动续传）"
+            );
             transfers.fail_task(&task_id, &msg);
             return Err(anyhow!(msg));
         }
@@ -1113,9 +1336,15 @@ pub async fn transfer_local_remote_file(
                 transfers.set_verification(&task_id, Some(digest), Some(true));
             }
             Some(remote) => {
-                let msg = format!(
-                    "SHA-256 校验不一致：远端源 {remote}，落地 {digest}（文件已保留，请人工核查）"
-                );
+                let msg = if resume_from > 0 {
+                    format!(
+                        "SHA-256 校验不一致：远端源 {remote}，落地 {digest}（本次从 {resume_from} 字节续传，残片很可能来自旧版源文件；文件已保留，请人工核查后重传）"
+                    )
+                } else {
+                    format!(
+                        "SHA-256 校验不一致：远端源 {remote}，落地 {digest}（文件已保留，请人工核查）"
+                    )
+                };
                 transfers.fail_task(&task_id, &msg);
                 transfers.set_verification(&task_id, Some(digest), Some(false));
                 return Err(anyhow!(msg));

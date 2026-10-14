@@ -424,6 +424,9 @@ async function loadAutostartSettings() {
 }
 
 async function saveAutostartSettings() {
+  // 开关是乐观翻转的：注册表写失败必须把界面翻回去，不能让"已开启"骗人
+  const prevAutostart = autostartEnabled.value;
+  const prevCloseAction = closeAction.value;
   savingAutostart.value = true;
   try {
     const res = await fetch('/api/system/autostart', {
@@ -436,6 +439,8 @@ async function saveAutostartSettings() {
     });
     const data = await res.json();
     if (!data.ok) {
+      autostartEnabled.value = prevAutostart;
+      closeAction.value = prevCloseAction;
       showToast(data.error || '保存自启与运行设置失败', 'err');
       return;
     }
@@ -443,6 +448,8 @@ async function saveAutostartSettings() {
     closeAction.value = data.closeAction === 'exit' ? 'exit' : 'tray';
     showToast('开机自启与后台常驻设置已生效');
   } catch (e) {
+    autostartEnabled.value = prevAutostart;
+    closeAction.value = prevCloseAction;
     showToast(`保存失败: ${(e as Error).message}`, 'err');
   } finally {
     savingAutostart.value = false;
@@ -495,6 +502,9 @@ async function checkAppUpdate() {
 }
 
 async function saveMcpSettings(regenerateKey = false) {
+  // 同上：MCP 总开关与鉴权开关都是乐观翻转，保存失败要翻回真实状态
+  const prevEnabled = mcpEnabled.value;
+  const prevRequireKey = mcpRequireApiKey.value;
   savingMcp.value = true;
   try {
     const res = await fetch('/api/settings/mcp', {
@@ -508,6 +518,8 @@ async function saveMcpSettings(regenerateKey = false) {
     });
     const data = await res.json();
     if (!data.ok) {
+      mcpEnabled.value = prevEnabled;
+      mcpRequireApiKey.value = prevRequireKey;
       showToast(data.error || '保存 MCP 设置失败', 'err');
       return;
     }
@@ -516,6 +528,8 @@ async function saveMcpSettings(regenerateKey = false) {
     mcpApiKey.value = data.settings.mcpApiKey || '';
     showToast(regenerateKey ? '已生成新的 MCP API Key' : 'MCP 设置已保存');
   } catch (e) {
+    mcpEnabled.value = prevEnabled;
+    mcpRequireApiKey.value = prevRequireKey;
     showToast(`保存失败: ${(e as Error).message}`, 'err');
   } finally {
     savingMcp.value = false;
@@ -556,12 +570,14 @@ async function triggerCliSync() {
   try {
     const res = await fetch('/api/mcp/status', { method: 'POST' });
     const data = await res.json();
-    if (data.ok && data.status) {
-      mcpStatus.value = data.status;
-      showToast('已同步写入本机 Claude Code 与 Codex 配置文件');
+    if (!data.ok || !data.status) {
+      showToast(data.error || '写入本机 CLI 配置失败', 'err');
+      return;
     }
-  } catch {
-    // ignore
+    mcpStatus.value = data.status;
+    showToast('已同步写入本机 Claude Code 与 Codex 配置文件');
+  } catch (e) {
+    showToast(`写入本机 CLI 配置失败: ${(e as Error).message}`, 'err');
   }
 }
 
@@ -1041,9 +1057,12 @@ async function handlePatchMeta(host: PublicHost, patch: Record<string, unknown>)
       body: JSON.stringify(patch),
     });
     const data = await res.json();
-    if (data.ok && data.host) {
-      replaceHostInList(data.host);
+    if (!data.ok || !data.host) {
+      showToast(data.error || '更新失败', 'err');
+      await fetchHosts();
+      return;
     }
+    replaceHostInList(data.host);
   } catch (e) {
     showToast(`更新失败: ${(e as Error).message}`, 'err');
   }
@@ -1063,17 +1082,22 @@ async function confirmDeleteHost() {
       method: 'DELETE',
     });
     const data = await res.json();
-    if (data.ok) {
-      await closeSessionTab(host.id);
-      if (detailHostId.value === host.id) {
-        detailHostId.value = null;
-        rightWing.value = null;
-      }
+    if (!data.ok) {
+      // 删不掉就得说，不能静默关掉对话框让人以为删了
+      showToast(data.error || `删除主机「${host.name}」失败`, 'err');
       await fetchHosts();
-      showToast(`已删除主机「${host.name}」`);
+      return;
     }
+    await closeSessionTab(host.id);
+    if (detailHostId.value === host.id) {
+      detailHostId.value = null;
+      rightWing.value = null;
+    }
+    await fetchHosts();
+    showToast(`已删除主机「${host.name}」`);
   } catch (e) {
     showToast(`删除失败: ${(e as Error).message}`, 'err');
+    await fetchHosts();
   }
 }
 
@@ -1125,11 +1149,15 @@ async function onDrop(e: DragEvent, target: PublicHost) {
       body: JSON.stringify({ orderedIds: currentIds }),
     });
     const data = await res.json();
-    if (data.ok && Array.isArray(data.hosts)) {
-      hosts.value = data.hosts;
+    if (!data.ok || !Array.isArray(data.hosts)) {
+      showToast(data.error || '排序未保存', 'err');
+      await fetchHosts();
+      return;
     }
-  } catch {
-    // ignore
+    hosts.value = data.hosts;
+  } catch (e) {
+    showToast(`排序未保存: ${(e as Error).message}`, 'err');
+    await fetchHosts();
   }
 }
 

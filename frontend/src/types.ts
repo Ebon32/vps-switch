@@ -107,6 +107,11 @@ export interface TransferTask {
   speedBps: number;
   state: 'running' | 'completed' | 'failed';
   error?: string | null;
+  /** 本次从残片的第几字节接着传（0 = 从头传） */
+  resumedFrom: number;
+  sha256?: string | null;
+  /** true=两端哈希一致；false=不一致（任务已判失败）；null=未校验 */
+  verified?: boolean | null;
   startedAt: string;
   endedAt?: string | null;
 }

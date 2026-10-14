@@ -748,7 +748,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "vps_transfer",
-            "description": "满速流式文件传输引擎（16MiB 通道窗口 + 64 路并发 SFTP 流水线 + 12 秒无推进失速看门狗）。支持三种方向：upload（本机路径 -> 远端路径）、download（远端路径 -> 本机路径）、cross（源 VPS 路径 -> 目标 VPS 路径，内存直传不落本机硬盘）。无需分片或 base64，一次调用直接完成。落盘走临时文件原子替换，完成后自动做 SHA-256 闭环校验（返回 sha256 与 verified 字段；校验不一致时任务判失败）。",
+            "description": "满速流式文件传输引擎（16MiB 通道窗口 + 64 路并发 SFTP 流水线 + 12 秒无推进失速看门狗）。支持三种方向：upload（本机路径 -> 远端路径）、download（远端路径 -> 本机路径）、cross（源 VPS 路径 -> 目标 VPS 路径，内存直传不落本机硬盘）。无需分片或 base64，一次调用直接完成。落盘走临时文件原子替换，完成后自动做 SHA-256 闭环校验（返回 sha256 与 verified 字段；校验不一致时任务判失败）。断点续传：中断时 `<目标>.vps-part` 残片保留不删，对同一个目标再调用一次即自动哈希对账后从残片末尾续传（返回 resumedFrom 字段说明本次从第几字节接上）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1177,9 +1177,9 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
 
     if action == "close" {
         if let Some(pid) = pane_id_arg {
-            state.terminals.close_pane(pid);
+            state.terminals.close_pane(&state.ssh_pool, pid).await;
         } else if let Some(pane) = state.terminals.find_active_pane_for_host(&host.id) {
-            state.terminals.close_pane(&pane.id);
+            state.terminals.close_pane(&state.ssh_pool, &pane.id).await;
         }
         return Ok(json!({ "ok": true, "host": host.name, "closed": true }));
     }

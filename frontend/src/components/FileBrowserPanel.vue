@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { FileEntry, PublicHost, TransferTask } from '../types';
+
+// CodeMirror 内核约 850KB，只有真要编辑文件时才值得加载，不拖累首屏
+const CodeEditor = defineAsyncComponent(() => import('./CodeEditor.vue'));
 
 interface DirCacheItem {
   path: string;
@@ -1167,13 +1170,11 @@ onBeforeUnmount(() => {
         <div v-if="editorLoading" class="flex flex-1 items-center justify-center text-xs text-zinc-400">
           正在读取文件内容...
         </div>
-        <textarea
+        <CodeEditor
           v-else
           v-model="editorContent"
-          spellcheck="false"
-          class="h-full w-full flex-1 resize-none bg-white p-3 font-mono text-xs leading-relaxed text-zinc-800 outline-none dark:bg-zinc-950 dark:text-zinc-100"
-          @keydown.ctrl.s.prevent="saveFileEditor"
-          @keydown.meta.s.prevent="saveFileEditor"
+          :filename="editorName"
+          @save="saveFileEditor"
         />
       </div>
     </div>
@@ -1204,13 +1205,18 @@ onBeforeUnmount(() => {
           <div class="flex items-center justify-between gap-2">
             <span class="truncate font-medium text-zinc-800">
               {{ t.direction === 'upload' ? '⬆' : '⬇' }} {{ t.filename }}
+              <span v-if="t.resumedFrom > 0" class="ml-1 font-normal text-zinc-400">
+                续传自 {{ formatBytes(t.resumedFrom) }}
+              </span>
             </span>
             <span class="shrink-0 font-mono text-[10px] text-zinc-500">
               <template v-if="t.state === 'running'">
                 {{ formatSpeed(t.speedBps) }} · {{ formatBytes(t.transferredBytes) }} / {{ formatBytes(t.totalBytes) }}
               </template>
               <template v-else-if="t.state === 'completed'">
-                <span class="text-emerald-600">✓ 完成 ({{ formatSpeed(t.speedBps) }})</span>
+                <span class="text-emerald-600">
+                  ✓ 完成 ({{ formatSpeed(t.speedBps) }}){{ t.verified ? ' 已校验' : '' }}
+                </span>
               </template>
               <template v-else>
                 <span class="text-red-600" :title="t.error || ''">✗ 失败</span>

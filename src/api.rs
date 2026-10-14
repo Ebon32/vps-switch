@@ -424,7 +424,7 @@ async fn close_terminal(
     State(state): State<Arc<AppState>>,
     Path(pane_id): Path<String>,
 ) -> impl IntoResponse {
-    let closed = state.terminals.close_pane(&pane_id);
+    let closed = state.terminals.close_pane(&state.ssh_pool, &pane_id).await;
     (
         StatusCode::OK,
         Json(json!({

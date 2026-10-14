@@ -1,7 +1,7 @@
 use crate::{
     db::Database,
     models::LOCAL_HOST_ID,
-    ssh::{open_host_channel, SshPool},
+    ssh::{open_pane_channel, SshPool},
 };
 use alacritty_terminal::{
     event::VoidListener,
@@ -10,9 +10,9 @@ use alacritty_terminal::{
     term::{Config as TermConfig, Term, TermMode},
     vte::ansi::Processor,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use russh::ChannelMsg;
+use russh::{ChannelMsg, ChannelWriteHalf, Pty};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -115,6 +115,8 @@ pub struct PaneInternalState {
     pub exited: bool,
     pub output_seq: u64,
     pub last_output_at: Instant,
+    /// shell 类型探针结果（OSC 777，注入时用来选钩子；读任务负责填）
+    pub shell_kind: Option<&'static str>,
     osc_tail: Vec<u8>,
 }
 
@@ -139,6 +141,7 @@ impl PaneInternalState {
             exited: false,
             output_seq: 0,
             last_output_at: Instant::now(),
+            shell_kind: None,
             osc_tail: Vec::new(),
         }
     }
@@ -211,34 +214,6 @@ impl PaneInternalState {
         (trimmed_screen, cursor_line)
     }
 
-    /// 光标所在屏幕行号（shell integration 注入时用于计算需要擦除的垃圾行数）
-    pub fn cursor_line_index(&self) -> i32 {
-        self.term.grid().cursor.point.line.0
-    }
-
-    /// 读取指定屏幕行的文本（去尾部空白）
-    pub fn line_text_at(&self, idx: i32) -> String {
-        let last_col = self.term.last_column();
-        self.term
-            .bounds_to_string(
-                Point::new(Line(idx), Column(0)),
-                Point::new(Line(idx), last_col),
-            )
-            .trim_end()
-            .to_string()
-    }
-
-    /// 从屏幕底部向上查找最近一行包含 needle 的行号
-    pub fn find_last_line_containing(&self, needle: &str) -> Option<i32> {
-        let bottom = self.term.bottommost_line().0;
-        let top = self.term.topmost_line().0;
-        for idx in (top..=bottom).rev() {
-            if self.line_text_at(idx).contains(needle) {
-                return Some(idx);
-            }
-        }
-        None
-    }
 
     fn scan_osc_sequences(&mut self, chunk: &[u8]) -> bool {        let mut changed = false;
         self.osc_tail.extend_from_slice(chunk);
@@ -303,6 +278,16 @@ impl PaneInternalState {
     }
 
     fn handle_osc_payload(&mut self, osc: &str) -> bool {
+        if let Some(rest) = osc.strip_prefix("777;vps-shell:") {
+            if self.shell_kind.is_none() {
+                if let Some(kind) = parse_shell_probe(rest) {
+                    self.shell_kind = Some(kind);
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if let Some(rest) = osc.strip_prefix("7;") {
             if let Some(path_part) = rest.strip_prefix("file://") {
                 if let Some(slash_idx) = path_part.find('/') {
@@ -676,17 +661,29 @@ impl TerminalManager {
         Some(meta)
     }
 
-    pub fn close_pane(&self, pane_id: &str) -> bool {
+    pub async fn close_pane(&self, pool: &SshPool, pane_id: &str) -> bool {
         let removed = {
             let mut guard = self.panes.lock().unwrap();
             guard.remove(pane_id)
         };
-        if let Some(pane) = removed {
-            let _ = pane.cmd_tx.send(PaneCommand::Close);
-            true
-        } else {
-            false
+        let Some(pane) = removed else {
+            return false;
+        };
+        let host_id = pane.host_id.clone();
+        let _ = pane.cmd_tx.send(PaneCommand::Close);
+        drop(pane);
+        if !self.has_live_pane(&host_id) {
+            pool.drop_pane_session(&host_id).await;
         }
+        true
+    }
+
+    /// 该主机是否还有活着的终端（pane 自己退出也算没了）。
+    fn has_live_pane(&self, host_id: &str) -> bool {
+        let guard = self.panes.lock().unwrap();
+        guard.values().any(|p| {
+            p.host_id == host_id && !p.state.lock().unwrap().exited
+        })
     }
 
     pub async fn create_pane(
@@ -702,6 +699,17 @@ impl TerminalManager {
         let cols = cols.clamp(20, 500);
         let rows = rows.clamp(5, 200);
         let pane_id = format!("pane_{}", Uuid::new_v4());
+
+        // 先回收该主机已退出的旧 pane。一个活的都不剩 = 上个终端已经关完了：
+        // 释放终端连接，新 pane 会重新登录，登录横幅（MOTD）才会再次出现。
+        let has_live = {
+            let mut guard = self.panes.lock().unwrap();
+            guard.retain(|_, p| !(p.host_id == host_id && p.state.lock().unwrap().exited));
+            guard.values().any(|p| p.host_id == host_id)
+        };
+        if !has_live && host_id != LOCAL_HOST_ID {
+            pool.drop_pane_session(host_id).await;
+        }
 
         let handle = if host_id == LOCAL_HOST_ID {
             spawn_local_conpty_pane(
@@ -729,8 +737,6 @@ impl TerminalManager {
         let meta = handle.snapshot_meta();
         {
             let mut guard = self.panes.lock().unwrap();
-            // 顺手回收该主机下已退出的旧 pane：否则反复打开终端会一直堆积 ring buffer 与终端网格
-            guard.retain(|_, p| !(p.host_id == host_id && p.state.lock().unwrap().exited));
             guard.insert(pane_id, handle);
         }
         Ok(meta)
@@ -895,9 +901,9 @@ fn spawn_local_conpty_pane(
 
 // ==================== 远端 Shell Integration 注入（OSC 133 / OSC 7，零安装） ====================
 //
-// 连接后先 `stty -echo` 关闭回显，再静默写入探针与钩子，最后按屏幕网格精确擦除
-// 注入过程留下的所有行——用户只看到干净的提示符。任一环节超时/异常都安全降级
-// （恢复回显、不擦屏），退回提示符启发式判定，绝不把终端弄坏。
+// 连接时在 pty-req 里就把远端回显关掉（`Pty::ECHO = 0`），随后静默写入探针与钩子——
+// 写进去的每一行都不会出现在屏幕上，因此没有任何东西需要擦除。注入结束（或中途放弃）
+// 时把回显还给用户。任一环节超时/异常都安全降级：退回提示符启发式判定，绝不把终端弄坏。
 
 /// 探测当前 shell（OSC 777 私有标记，对屏幕不可见）
 const SHELL_PROBE_LINE: &str = r#"printf '\033]777;vps-shell:%s|%s|%s|%s\007' "$0" "$BASH_VERSION" "$ZSH_VERSION" "$FISH_VERSION""#;
@@ -917,16 +923,9 @@ const INJECT_FISH: &str = r#"function __vps_pp --on-event fish_prompt; printf '\
 /// 因此只发不带退出码的 D——命令完成判定照常坚如磐石，但绝不伪造退出码。
 const INJECT_POSIX: &str = r#"__vps_pp(){ printf '\033]133;D\007\033]7;file://%s%s\007\033]133;A\007' "${HOSTNAME:-localhost}" "$PWD"; }; PS1='$(__vps_pp)'"$PS1""#;
 
-fn parse_shell_probe(buf: &[u8]) -> Option<&'static str> {
-    const NEEDLE: &[u8] = b"\x1b]777;vps-shell:";
-    let pos = buf.windows(NEEDLE.len()).rposition(|w| w == NEEDLE)?;
-    let rest = &buf[pos + NEEDLE.len()..];
-    let end = rest
-        .iter()
-        .position(|&b| b == 0x07)
-        .or_else(|| rest.windows(2).position(|w| w == b"\x1b\\"))?;
-    let s = std::str::from_utf8(&rest[..end]).ok()?;
-    let fields: Vec<&str> = s.split('|').collect();
+/// 解析 OSC 777 探针载荷（形如 `-bash|5.2.21(1)-release||`），得出 shell 类型。
+fn parse_shell_probe(payload: &str) -> Option<&'static str> {
+    let fields: Vec<&str> = payload.split('|').collect();
     let f0 = fields.first().copied().unwrap_or("");
     let has = |i: usize| fields.get(i).map(|v| !v.is_empty()).unwrap_or(false);
     if has(1) || f0.contains("bash") {
@@ -967,218 +966,105 @@ fn prompt_settled(g: &PaneInternalState, ms: u64) -> bool {
     looks_like_shell_prompt(&cursor)
 }
 
-/// 注入期间的单阶段等待：读通道 → 喂状态/广播 → 每 120ms 复查条件。
-/// Ok(true)=条件满足；Ok(false)=超时；Err=通道关闭。
-async fn prologue_wait<F>(
-    channel: &mut russh::Channel<russh::client::Msg>,
+/// 等状态满足条件（由常驻读任务喂状态，本函数不碰通道）。true=满足，false=超时。
+async fn wait_state<F>(
     state: &Arc<Mutex<PaneInternalState>>,
-    bcast: &broadcast::Sender<PaneBroadcast>,
-    pane_id: &str,
-    host_id: &str,
     timeout: Duration,
-    scan: &mut Vec<u8>,
     mut cond: F,
-) -> Result<bool>
+) -> bool
 where
-    F: FnMut(&PaneInternalState, &[u8]) -> bool,
+    F: FnMut(&PaneInternalState) -> bool,
 {
     let deadline = Instant::now() + timeout;
     loop {
         {
             let g = state.lock().unwrap();
-            if cond(&g, scan) {
-                return Ok(true);
+            if cond(&g) {
+                return true;
+            }
+            if g.exited {
+                return false;
             }
         }
         if Instant::now() >= deadline {
-            return Ok(false);
+            return false;
         }
-        tokio::select! {
-            msg_opt = channel.wait() => {
-                match msg_opt {
-                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        let chunk = data.to_vec();
-                        scan.extend_from_slice(&chunk);
-                        if scan.len() > 8192 {
-                            let drain = scan.len() - 8192;
-                            scan.drain(..drain);
-                        }
-                        let meta_opt = {
-                            let mut g = state.lock().unwrap();
-                            if g.feed_bytes(&chunk) {
-                                Some(build_meta_from_guard(pane_id, host_id, &g))
-                            } else {
-                                None
-                            }
-                        };
-                        let _ = bcast.send(PaneBroadcast::Output(chunk));
-                        if let Some(m) = meta_opt {
-                            let _ = bcast.send(PaneBroadcast::Meta(m));
-                        }
-                    }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                        return Err(anyhow!("SSH 通道已关闭"));
-                    }
-                    _ => {}
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
-        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
     }
 }
 
-/// 注入流程；返回 false 表示通道中途关闭（调用方直接走收尾）。
-/// 任何"不确认"的分支都选择保守降级：恢复回显、保留屏幕原样，绝不擦错行。
+/// Shell integration 注入（OSC 133 / OSC 7，零安装）。
+///
+/// 回显在 pty-req 阶段就已经关掉（`Pty::ECHO = 0`），注入写进去的每一行都不会出现在
+/// 屏幕上——没有需要擦除的东西，也就不存在"擦错行"。代价是：注入期间用户自己也看不见
+/// 输入，所以每一条退出路径都必须把回显还回去。
 async fn inject_shell_integration(
-    channel: &mut russh::Channel<russh::client::Msg>,
+    write: &ChannelWriteHalf<russh::client::Msg>,
     state: &Arc<Mutex<PaneInternalState>>,
-    bcast: &broadcast::Sender<PaneBroadcast>,
-    pane_id: &str,
-    host_id: &str,
-) -> bool {
-    let mut scan: Vec<u8> = Vec::new();
-
-    // P0：等首个提示符（屏幕原样不动，失败直接放弃）
-    match prologue_wait(
-        channel, state, bcast, pane_id, host_id,
-        Duration::from_secs(6), &mut scan,
-        |g, _| prompt_settled(g, 300),
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => return true,
-        Err(_) => return false,
+) {
+    /// 还回回显。注入的每一条退出路径都要经过这里。
+    async fn restore_echo(write: &ChannelWriteHalf<russh::client::Msg>) {
+        let _ = write.data(&b"stty echo 2>/dev/null\n"[..]).await;
     }
 
-    // Windows 原生 shell（PowerShell / cmd）：不注入，也不碰屏幕
-    {
+    // P0：等首个提示符。失败（超时/Windows 原生 shell）就把回显还回去、原地退出。
+    if !wait_state(state, Duration::from_secs(6), |g| prompt_settled(g, 300)).await {
+        restore_echo(write).await;
+        return;
+    }
+    let windows_shell = {
         let g = state.lock().unwrap();
         let (_, cursor) = g.read_screen_grid(5);
-        if prompt_is_windows_style(&cursor) {
-            return true;
-        }
+        prompt_is_windows_style(&cursor)
+    };
+    if windows_shell {
+        restore_echo(write).await;
+        return;
     }
 
-    // P1：关回显（这一行的回显会短暂可见，P4 统一擦除）
-    let seq_before = state.lock().unwrap().output_seq;
-    if channel.data(&b"stty -echo 2>/dev/null\n"[..]).await.is_err() {
-        return false;
-    }
-    match prologue_wait(
-        channel, state, bcast, pane_id, host_id,
-        Duration::from_secs(3), &mut scan,
-        move |g, _| g.output_seq > seq_before && prompt_settled(g, 250),
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = channel.data(&b"stty echo\n"[..]).await;
-            return true;
-        }
-        Err(_) => return false,
-    }
-
-    // P2：探测 shell 类型
-    if channel
+    // P1：探测 shell 类型（回显已关，这一行在屏幕上不可见）
+    if write
         .data(format!("{SHELL_PROBE_LINE}\n").as_bytes())
         .await
         .is_err()
     {
-        let _ = channel.data(&b"stty echo\n"[..]).await;
-        return false;
+        return;
     }
-    let shell = match prologue_wait(
-        channel, state, bcast, pane_id, host_id,
-        Duration::from_millis(2500), &mut scan,
-        |_, buf| parse_shell_probe(buf).is_some(),
-    )
+    let seq_before = state.lock().unwrap().output_seq;
+    if !wait_state(state, Duration::from_millis(2500), move |g| {
+        g.output_seq > seq_before && g.shell_kind.is_some()
+    })
     .await
     {
-        Ok(true) => parse_shell_probe(&scan),
-        Ok(false) => None,
-        Err(_) => return false,
+        restore_echo(write).await;
+        return;
+    }
+    let Some(shell) = state.lock().unwrap().shell_kind else {
+        restore_echo(write).await;
+        return;
     };
-    let Some(shell) = shell else {
-        let _ = channel.data(&b"stty echo\n"[..]).await;
-        return true;
-    };
-
-    // P3：写入钩子。等待条件带 output_seq 护栏——回显已关，上一阶段的提示符仍在
+    // P2：写入钩子。等待条件带 output_seq 护栏——回显已关，上一阶段的提示符仍在
     // 光标行上，没有护栏会在注入尚未执行时就误判"已完成"。
     let Some(inject_line) = injection_line_for(shell) else {
-        let _ = channel.data(&b"stty echo\n"[..]).await;
-        return true;
+        restore_echo(write).await;
+        return;
     };
     let seq_before_inject = state.lock().unwrap().output_seq;
-    if channel
+    if write
         .data(format!("{inject_line}\n").as_bytes())
         .await
         .is_err()
     {
-        let _ = channel.data(&b"stty echo\n"[..]).await;
-        return false;
+        return;
     }
-    match prologue_wait(
-        channel, state, bcast, pane_id, host_id,
-        Duration::from_secs(3), &mut scan,
-        move |g, _| g.output_seq > seq_before_inject && prompt_settled(g, 250),
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            // 注入疑似失败（可能有语法报错）：保留屏幕报错上下文，只恢复回显
-            let _ = channel.data(&b"stty echo\n"[..]).await;
-            return true;
-        }
-        Err(_) => return false,
-    }
+    let _ = wait_state(state, Duration::from_secs(3), move |g| {
+        g.output_seq > seq_before_inject && prompt_settled(g, 250)
+    })
+    .await;
 
-    // P4：擦除注入痕迹。用绝对定位（CUP \033[{行}H）逐行寻址 junk 行到光标行，
-    // 不依赖 printf 执行时光标落在哪——readline 回车时会自己补一个 \r\n，
-    // 相对上移的推算在真实 shell 里必然差一行（这正是"永远少擦一行"的根因）。
-    // 擦完从网格自校验，未擦净则重算索引再擦一次（至多两轮）。
-    for _ in 0..2u32 {
-        let (cursor_idx, junk_idx) = {
-            let g = state.lock().unwrap();
-            (g.cursor_line_index(), g.find_last_line_containing("stty -echo"))
-        };
-        let rows = match junk_idx {
-            Some(j) if cursor_idx > j && cursor_idx - j <= 12 => Some((j, cursor_idx)),
-            _ => None,
-        };
-        let mut erase = String::from("printf '");
-        if let Some((j, c)) = rows {
-            for idx in j..=c {
-                erase.push_str(&format!("\\033[{}H\\033[2K", idx + 1));
-            }
-            // 光标停在 junk 行，最终提示符将打印在 MOTD 正下方
-            erase.push_str(&format!("\\033[{}H", j + 1));
-        }
-        erase.push_str("'; stty echo\n");
-        let seq_before_erase = state.lock().unwrap().output_seq;
-        if channel.data(erase.as_bytes()).await.is_err() {
-            return false;
-        }
-        // 等擦除输出真正到达网格（output_seq 护栏：上一阶段的提示符仍满足
-        // "静默+提示符"条件，没有护栏会在擦除尚未执行时就立即返回），再等最终提示符落定
-        let _ = prologue_wait(
-            channel, state, bcast, pane_id, host_id,
-            Duration::from_secs(3), &mut scan,
-            move |g, _| g.output_seq > seq_before_erase && prompt_settled(g, 250),
-        )
-        .await;
-        let still = {
-            let g = state.lock().unwrap();
-            g.find_last_line_containing("stty -echo").is_some()
-        };
-        if !still {
-            break;
-        }
-    }
-    true
+    // P3：还回回显。注入疑似失败（例如 shell 语法报错）也照样还——报错上下文留在屏幕上
+    // 由用户自己看，绝不为了"擦干净"去动光标。
+    restore_echo(write).await;
 }
 
 async fn spawn_ssh_pty_pane(
@@ -1191,33 +1077,18 @@ async fn spawn_ssh_pty_pane(
     initial_cwd: Option<String>,
     headless: bool,
 ) -> Result<Arc<PaneHandle>> {
-    let (record, mut channel) = open_host_channel(pool, db, &host_id).await?;
+    let (record, channel) = open_pane_channel(pool, db, &host_id).await?;
 
-    channel
-        .request_pty(
-            false,
-            "xterm-256color",
-            cols as u32,
-            rows as u32,
-            0,
-            0,
-            &[],
-        )
-        .await
-        .context("请求 SSH PTY 失败")?;
-
-    channel
-        .request_shell(true)
-        .await
-        .context("启动远端 Shell 失败")?;
-
-    // Windows 主机（PowerShell / cmd）不注入 POSIX 钩子
-    let skip_injection = record
+    // 注入只服务于 agent 链路（MCP 的无头 pane）：手点开/托盘打开的交互式终端是纯 pty，
+    // 一个字节都不注入——终端是给人用的，不需要向里写任何东西。
+    // Windows 主机（PowerShell / cmd）也不注入 POSIX 钩子，也不去碰它的回显。
+    let is_windows = record
         .os_info
         .as_ref()
         .and_then(|o| o.os.as_deref())
         .map(|s| s.eq_ignore_ascii_case("windows"))
         .unwrap_or(false);
+    let skip_injection = !headless || is_windows;
 
     let state = Arc::new(Mutex::new(PaneInternalState::new(
         cols,
@@ -1236,99 +1107,111 @@ async fn spawn_ssh_pty_pane(
         broadcast_tx: broadcast_tx.clone(),
     });
 
-    let state_loop = state.clone();
-    let bcast_loop = broadcast_tx.clone();
-    let pid_loop = pane_id.clone();
-    let hid_loop = host_id.clone();
+    let (mut read_half, write_half) = channel.split();
 
-    tokio::spawn(async move {
-        // 进入主循环前静默完成 shell integration 注入；通道中途关闭则直接收尾
-        if !skip_injection
-            && !inject_shell_integration(&mut channel, &state_loop, &bcast_loop, &pid_loop, &hid_loop)
-                .await
-        {
+    // 读半边立刻独立成任务：从这一刻起服务端发出的每一个字节都会被记录。
+    // （此前是"先把 pty/shell 请求发完、再开始读"，落在那个窗口里的字节会静默丢掉——
+    //  登录横幅 MOTD 正是卡在这个窗口里没的。）
+    {
+        let state = state.clone();
+        let bcast = broadcast_tx.clone();
+        let pid = pane_id.clone();
+        let hid = host_id.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = read_half.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                        let chunk = data.to_vec();
+                        let meta_opt = {
+                            let mut guard = state.lock().unwrap();
+                            if guard.feed_bytes(&chunk) {
+                                Some(build_meta_from_guard(&pid, &hid, &guard))
+                            } else {
+                                None
+                            }
+                        };
+                        let _ = bcast.send(PaneBroadcast::Output(chunk));
+                        if let Some(m) = meta_opt {
+                            let _ = bcast.send(PaneBroadcast::Meta(m));
+                        }
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        let mut guard = state.lock().unwrap();
+                        guard.last_exit_code = Some(exit_status as i32);
+                    }
+                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
             let final_meta = {
-                let mut guard = state_loop.lock().unwrap();
+                let mut guard = state.lock().unwrap();
                 guard.exited = true;
                 guard.running = false;
-                build_meta_from_guard(&pid_loop, &hid_loop, &guard)
+                build_meta_from_guard(&pid, &hid, &guard)
             };
-            let _ = bcast_loop.send(PaneBroadcast::Meta(final_meta));
+            let _ = bcast.send(PaneBroadcast::Meta(final_meta));
+        });
+    }
+
+    // 写半边：请求 pty（注入前先把远端回显关掉，注入写进去的每一行都不会留痕）→ 请求 shell
+    // → 静默注入 shell integration → 进入输入/控制循环。
+    tokio::spawn(async move {
+        let modes: &[(Pty, u32)] = if skip_injection { &[] } else { &[(Pty::ECHO, 0)] };
+        if write_half
+            .request_pty(
+                false,
+                "xterm-256color",
+                cols as u32,
+                rows as u32,
+                0,
+                0,
+                modes,
+            )
+            .await
+            .is_err()
+        {
             return;
         }
+        if write_half.request_shell(true).await.is_err() {
+            return;
+        }
+        if !skip_injection {
+            inject_shell_integration(&write_half, &state).await;
+        }
 
-        loop {
-            tokio::select! {
-                msg_opt = channel.wait() => {
-                    match msg_opt {
-                        Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                            let chunk = data.to_vec();
-                            let meta_opt = {
-                                let mut guard = state_loop.lock().unwrap();
-                                let changed = guard.feed_bytes(&chunk);
-                                if changed {
-                                    Some(build_meta_from_guard(&pid_loop, &hid_loop, &guard))
-                                } else {
-                                    None
-                                }
-                            };
-                            let _ = bcast_loop.send(PaneBroadcast::Output(chunk));
-                            if let Some(m) = meta_opt {
-                                let _ = bcast_loop.send(PaneBroadcast::Meta(m));
-                            }
-                        }
-                        Some(ChannelMsg::ExitStatus { exit_status }) => {
-                            let mut guard = state_loop.lock().unwrap();
-                            guard.last_exit_code = Some(exit_status as i32);
-                        }
-                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                            break;
-                        }
-                        _ => {}
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                PaneCommand::Input(bytes) => {
+                    if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+                        state.lock().unwrap().running = true;
+                    }
+                    if write_half.data(&bytes[..]).await.is_err() {
+                        break;
                     }
                 }
-                cmd_opt = cmd_rx.recv() => {
-                    match cmd_opt {
-                        Some(PaneCommand::Input(bytes)) => {
-                            if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
-                                let mut guard = state_loop.lock().unwrap();
-                                guard.running = true;
-                            }
-                            if channel.data(&bytes[..]).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(PaneCommand::Paste(text)) => {
-                            let payload = encode_safe_paste(&state_loop, &text);
-                            if channel.data(&payload[..]).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(PaneCommand::Resize(c, r)) => {
-                            let meta = {
-                                let mut guard = state_loop.lock().unwrap();
-                                guard.resize(c, r);
-                                build_meta_from_guard(&pid_loop, &hid_loop, &guard)
-                            };
-                            let _ = channel.window_change(c.max(2) as u32, r.max(1) as u32, 0, 0).await;
-                            let _ = bcast_loop.send(PaneBroadcast::Meta(meta));
-                        }
-                        Some(PaneCommand::Close) | None => {
-                            let _ = channel.close().await;
-                            break;
-                        }
+                PaneCommand::Paste(text) => {
+                    let payload = encode_safe_paste(&state, &text);
+                    if write_half.data(&payload[..]).await.is_err() {
+                        break;
                     }
+                }
+                PaneCommand::Resize(c, r) => {
+                    let meta = {
+                        let mut guard = state.lock().unwrap();
+                        guard.resize(c, r);
+                        build_meta_from_guard(&pane_id, &host_id, &guard)
+                    };
+                    let _ = write_half
+                        .window_change(c.max(2) as u32, r.max(1) as u32, 0, 0)
+                        .await;
+                    let _ = broadcast_tx.send(PaneBroadcast::Meta(meta));
+                }
+                PaneCommand::Close => {
+                    let _ = write_half.close().await;
+                    break;
                 }
             }
         }
-
-        let final_meta = {
-            let mut guard = state_loop.lock().unwrap();
-            guard.exited = true;
-            guard.running = false;
-            build_meta_from_guard(&pid_loop, &hid_loop, &guard)
-        };
-        let _ = bcast_loop.send(PaneBroadcast::Meta(final_meta));
     });
 
     Ok(handle)

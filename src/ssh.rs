@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use russh::{
     client::{self, AuthResult, Config, Handle, KeyboardInteractiveAuthResponse, Msg},
     keys::{decode_secret_key, key::PrivateKeyWithHashAlg, PublicKeyOrCertificate},
-    Channel, ChannelMsg,
+    Channel, ChannelMsg, Disconnect,
 };
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use std::{
@@ -41,6 +41,12 @@ const MAX_CONCURRENT_EXEC_PER_HOST: usize = 6;
 #[derive(Default)]
 pub struct SshPool {
     sessions: Mutex<HashMap<String, Arc<Handle<SshClientHandler>>>>,
+    /// 终端专用连接：登录横幅（MOTD）是 sshd 挂在 **连接第一次会话** 上的东西——
+    /// 同一条连接上的第二个会话不会再打印它。执行/探针/SFTP 共用池里那条连接，
+    /// 横幅会被第一个用它的会话（通常是状态检查）吃掉，终端就再也看不到了。
+    /// 所以终端单独一条连接，且该主机最后一个终端关掉时释放：下次打开终端是全新连接，
+    /// 横幅必然出现（与普通 SSH 客户端一次登录一条连接的行为一致）。
+    pane_sessions: Mutex<HashMap<String, Arc<Handle<SshClientHandler>>>>,
     sftps: Mutex<HashMap<String, Arc<SftpSession>>>,
     home_dirs: Mutex<HashMap<String, String>>,
     dir_cache: Mutex<HashMap<(String, String), (Instant, crate::files::DirListing)>>,
@@ -51,6 +57,7 @@ impl SshPool {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            pane_sessions: Mutex::new(HashMap::new()),
             sftps: Mutex::new(HashMap::new()),
             home_dirs: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
@@ -162,6 +169,41 @@ impl SshPool {
         Ok(arc_handle)
     }
 
+    /// 终端专用连接（见 `pane_sessions` 注释）。与执行/SFTP 的连接完全分开。
+    pub async fn get_or_connect_pane(
+        &self,
+        host: &HostRecord,
+        jump_host: Option<&HostRecord>,
+        master_key: &MasterKey,
+    ) -> Result<Arc<Handle<SshClientHandler>>> {
+        {
+            let guard = self.pane_sessions.lock().await;
+            if let Some(existing) = guard.get(&host.id) {
+                if !existing.is_closed() {
+                    return Ok(existing.clone());
+                }
+            }
+        }
+
+        let handle = connect_single_or_jump(host, jump_host, master_key).await?;
+        let arc_handle = Arc::new(handle);
+        {
+            let mut guard = self.pane_sessions.lock().await;
+            guard.insert(host.id.clone(), arc_handle.clone());
+        }
+        Ok(arc_handle)
+    }
+
+    /// 该主机已无终端时释放终端连接：下次打开终端会重新登录，横幅才会再次出现。
+    pub async fn drop_pane_session(&self, host_id: &str) {
+        let removed = { self.pane_sessions.lock().await.remove(host_id) };
+        if let Some(handle) = removed {
+            let _ = handle
+                .disconnect(Disconnect::ByApplication, "no more terminals", "en")
+                .await;
+        }
+    }
+
     pub async fn open_session_channel(
         &self,
         host: &HostRecord,
@@ -185,6 +227,7 @@ impl SshPool {
     pub async fn invalidate_host(&self, host_id: &str) {
         self.sftps.lock().await.remove(host_id);
         self.sessions.lock().await.remove(host_id);
+        self.pane_sessions.lock().await.remove(host_id);
         self.exec_gates.lock().await.remove(host_id);
     }
 
@@ -519,6 +562,39 @@ pub async fn open_host_channel(
     let channel = pool
         .open_session_channel(&record, jump.as_ref(), db.master_key())
         .await?;
+    let _ = db.update_check_result(&record.id, true, None, None, None);
+    Ok((record, channel))
+}
+
+/// 终端 pane 专用：走该主机的终端连接（与执行/SFTP 那条分开），保证打开终端时的登录横幅。
+pub async fn open_pane_channel(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+) -> Result<(HostRecord, Channel<Msg>)> {
+    let record = db
+        .get_record(host_id)?
+        .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
+    let jump = match record.jump_host_id.as_deref() {
+        Some(jid) => db.get_record(jid)?,
+        None => None,
+    };
+    let handle = pool
+        .get_or_connect_pane(&record, jump.as_ref(), db.master_key())
+        .await?;
+    let channel = match handle.channel_open_session().await {
+        Ok(ch) => ch,
+        Err(_) => {
+            pool.drop_pane_session(host_id).await;
+            let fresh = pool
+                .get_or_connect_pane(&record, jump.as_ref(), db.master_key())
+                .await?;
+            fresh
+                .channel_open_session()
+                .await
+                .context("打开 SSH 会话通道失败")?
+        }
+    };
     let _ = db.update_check_result(&record.id, true, None, None, None);
     Ok((record, channel))
 }

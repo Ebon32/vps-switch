@@ -147,6 +147,70 @@ printf "UP=%s\nLOAD=%s %s %s\nCC=%s\nCPU1=%s\nCPU2=%s\nIFACE=%s\nNET=%s\nMEM=%s\
   "$UP" "$L1" "$L5" "$L15" "$CC" "$CPU1" "$CPU2" "$IFACE" "$NET" "$MEM" "$DISKS" "$MODEL" "$CORES" "${ID:-linux}" "${VERSION_ID:-}" "${PRETTY_NAME:-Linux}" "$UNAME_R" "$UNAME_M"
 "#;
 
+/// Windows 采集脚本：本机与远端共用一份（远端经 `-EncodedCommand` 送达）。
+/// 顺带带回 Caption / Version / PROCESSOR_ARCHITECTURE，让仓库里的系统信息是真读出来的。
+const WINDOWS_INSPECT_SCRIPT: &str = r#"$ProgressPreference = 'SilentlyContinue'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$os = Get-CimInstance Win32_OperatingSystem
+$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+$disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object { "$($_.DeviceID)/:$($_.Size):$($_.Size - $_.FreeSpace)" }
+$net = Get-NetAdapterStatistics | Where-Object { $_.ReceivedBytes -gt 0 } | Sort-Object ReceivedBytes -Descending | Select-Object -First 1
+$up = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
+$mt = [uint64]$os.TotalVisibleMemorySize * 1024
+$mf = [uint64]$os.FreePhysicalMemory * 1024
+$mu = if ($mt -gt $mf) { $mt - $mf } else { 0 }
+Write-Output "UP=$up"
+Write-Output "CPU_PCT=$($cpu.LoadPercentage)"
+Write-Output "CPU_NAME=$($cpu.Name)"
+Write-Output "CORES=$([Environment]::ProcessorCount)"
+Write-Output "MEM=$mt $mu"
+Write-Output "DISKS=$($disks -join '|')"
+Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
+Write-Output "OS_PRETTY=$($os.Caption)"
+Write-Output "OS_VER=$($os.Version)"
+Write-Output "ARCH=$($env:PROCESSOR_ARCHITECTURE)"
+"#;
+
+/// 远端 Windows 探针命令：UTF-16LE + base64，绕开 cmd.exe 转义与中文乱码。
+fn windows_inspect_command() -> String {
+    let utf16: Vec<u8> = WINDOWS_INSPECT_SCRIPT
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&utf16);
+    format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64}")
+}
+
+/// 两套探针脚本都以 `MEM=<总字节> <已用字节>` 开头报内存，真机上总量不可能为 0。
+/// 因此"有没有拿到正数的 MEM"就是"这套脚本跑对了没有"的唯一判据，不必为每个系统写一套判定。
+fn probe_output_usable(raw: &str) -> bool {
+    raw.lines()
+        .find_map(|l| l.trim_start().strip_prefix("MEM="))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|total| total > 0)
+        .unwrap_or(false)
+}
+
+/// 失败时把远端原话带回给调用方（含 agent），不做静默吞咽。
+fn summarize_probe_output(raw: &str) -> String {
+    let brief: String = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if brief.is_empty() {
+        "无任何输出".to_string()
+    } else if brief.chars().count() > 240 {
+        brief.chars().take(240).collect::<String>() + "…"
+    } else {
+        brief
+    }
+}
+
 impl InspectorEngine {
     pub fn new() -> Self {
         Self::default()
@@ -197,7 +261,7 @@ impl InspectorEngine {
             }
         };
 
-        let is_windows = record
+        let known_windows = record
             .os_info
             .as_ref()
             .and_then(|o| o.os.as_deref())
@@ -207,64 +271,67 @@ impl InspectorEngine {
         // 探针同样占用一条 session channel，纳入并发闸
         let _exec_permit = pool.acquire_exec_slot(host_id).await?;
 
-        let (inspection, os_info) = if is_windows {
-            let win_script = r#"$ProgressPreference = 'SilentlyContinue'
-try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
-$os = Get-CimInstance Win32_OperatingSystem
-$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-$disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object { "$($_.DeviceID)/:$($_.Size):$($_.Size - $_.FreeSpace)" }
-$net = Get-NetAdapterStatistics | Where-Object { $_.ReceivedBytes -gt 0 } | Sort-Object ReceivedBytes -Descending | Select-Object -First 1
-$up = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
-$mt = [uint64]$os.TotalVisibleMemorySize * 1024
-$mf = [uint64]$os.FreePhysicalMemory * 1024
-$mu = if ($mt -gt $mf) { $mt - $mf } else { 0 }
-Write-Output "UP=$up"
-Write-Output "CPU_PCT=$($cpu.LoadPercentage)"
-Write-Output "CPU_NAME=$($cpu.Name)"
-Write-Output "CORES=$([Environment]::ProcessorCount)"
-Write-Output "MEM=$mt $mu"
-Write-Output "DISKS=$($disks -join '|')"
-Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
-"#;
-            let utf16: Vec<u8> = win_script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&utf16);
-            let win_cmd = format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64}");
-
-            let raw = match exec_short_command(&session, &win_cmd).await {
+        // 探针本身就是 OS 探测器：先按仓库里记着的系统跑，输出不成形就换另一套再跑一次，
+        // 探到哪套算哪套并写回 os_info。手工新建的 Windows 主机因此第一次探测就被认出来
+        // （此前只有 1Shell 导入才带得进 osInfo），重装换系统的主机也会自动纠正。
+        let mut parsed: Option<(HostInspection, OsInfo)> = None;
+        let mut failures: Vec<String> = Vec::new();
+        let mut exec_errored = false;
+        for try_windows in [known_windows, !known_windows] {
+            let label = if try_windows { "Windows" } else { "Linux" };
+            let cmd = if try_windows {
+                windows_inspect_command()
+            } else {
+                LINUX_INSPECT_SCRIPT.to_string()
+            };
+            let raw = match exec_short_command(&session, &cmd).await {
                 Ok(r) => r,
                 Err(err) => {
-                    pool.invalidate_host(host_id).await;
-                    let _ = db.update_check_result(
-                        host_id,
-                        false,
-                        None,
-                        None,
-                        Some(format!("{err:#}")),
-                    );
-                    return Err(err);
+                    exec_errored = true;
+                    failures.push(format!("{label} 探针执行失败: {err:#}"));
+                    continue;
                 }
             };
-            self.parse_windows_inspection_text(host_id, &raw)?
-        } else {
-            let raw = match exec_short_command(&session, LINUX_INSPECT_SCRIPT).await {
-                Ok(r) => r,
-                Err(err) => {
-                    pool.invalidate_host(host_id).await;
-                    let _ = db.update_check_result(
-                        host_id,
-                        false,
-                        None,
-                        None,
-                        Some(format!("{err:#}")),
-                    );
-                    return Err(err);
-                }
-            };
-            self.parse_linux_inspection(host_id, &raw)?
-        };
+            if !probe_output_usable(&raw) {
+                failures.push(format!(
+                    "{label} 探针输出不可用: {}",
+                    summarize_probe_output(&raw)
+                ));
+                continue;
+            }
+            parsed = Some(if try_windows {
+                self.parse_windows_inspection_text(host_id, &raw)?
+            } else {
+                self.parse_linux_inspection(host_id, &raw)?
+            });
+            break;
+        }
 
         let latency_ms = started.elapsed().as_millis() as i64;
+        let (inspection, os_info) = match parsed {
+            Some(v) => v,
+            None => {
+                let detail = failures.join("；");
+                if exec_errored {
+                    // 连接层面出过错，池里这条连接不再可信
+                    pool.invalidate_host(host_id).await;
+                    let _ =
+                        db.update_check_result(host_id, false, None, None, Some(detail.clone()));
+                } else {
+                    // SSH 通了、命令也跑了，只是两套脚本都认不出来：如实记成在线 + 错误原因，
+                    // 绝不像旧版那样按 Linux 解析出一堆 0 再谎报采集成功。
+                    let _ = db.update_check_result(
+                        host_id,
+                        true,
+                        Some(latency_ms),
+                        None,
+                        Some(detail.clone()),
+                    );
+                }
+                return Err(anyhow!("探针无法识别远端系统：{detail}"));
+            }
+        };
+
         let _ = db.update_check_result(host_id, true, Some(latency_ms), Some(os_info), None);
         self.latest_snapshots
             .lock()
@@ -475,25 +542,13 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
     }
 
     async fn inspect_local_windows(&self) -> Result<HostInspection> {
-        let ps_script = r#"
-$os = Get-CimInstance Win32_OperatingSystem
-$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-$disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object { "$($_.DeviceID)/:$($_.Size):$($_.Size - $_.FreeSpace)" }
-$net = Get-NetAdapterStatistics | Where-Object { $_.ReceivedBytes -gt 0 } | Sort-Object ReceivedBytes -Descending | Select-Object -First 1
-$up = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
-$mt = [uint64]$os.TotalVisibleMemorySize * 1024
-$mf = [uint64]$os.FreePhysicalMemory * 1024
-$mu = if ($mt -gt $mf) { $mt - $mf } else { 0 }
-Write-Output "UP=$up"
-Write-Output "CPU_PCT=$($cpu.LoadPercentage)"
-Write-Output "CPU_NAME=$($cpu.Name)"
-Write-Output "CORES=$([Environment]::ProcessorCount)"
-Write-Output "MEM=$mt $mu"
-Write-Output "DISKS=$($disks -join '|')"
-Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
-"#;
         let mut cmd = tokio::process::Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps_script]);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_INSPECT_SCRIPT,
+        ]);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000);
         let out = cmd.output().await?;
@@ -641,10 +696,29 @@ Write-Output "NET=$($net.Name)|$($net.ReceivedBytes)|$($net.SentBytes)"
         let os_info = OsInfo {
             os: Some("windows".to_string()),
             distro_id: Some("windows".to_string()),
-            version_id: None,
-            pretty_name: Some("Windows".to_string()),
-            kernel: None,
-            arch: if cpu_cores >= 8 { Some("x86_64".to_string()) } else { Some("x86".to_string()) },
+            version_id: map
+                .get("OS_VER")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            pretty_name: Some(
+                map.get("OS_PRETTY")
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Windows".to_string()),
+            ),
+            kernel: map
+                .get("OS_VER")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            arch: map
+                .get("ARCH")
+                .filter(|s| !s.is_empty())
+                .map(|s| match s.to_ascii_uppercase().as_str() {
+                    "AMD64" => "x86_64".to_string(),
+                    "ARM64" => "aarch64".to_string(),
+                    "X86" => "i686".to_string(),
+                    other => other.to_ascii_lowercase(),
+                }),
             cpu_model,
             cpu_cores: Some(cpu_cores as u32),
             detected_at: Some(Utc::now().to_rfc3339()),
