@@ -42,23 +42,16 @@ use tracing::info;
 #[folder = "frontend/dist/"]
 struct EmbeddedFrontend;
 
+/// 数据目录固定落在 `%APPDATA%\vps-switch\data`，与 cwd、exe 位置都无关。
+/// 之前按 `cwd/data → exe同级/data → %APPDATA%` 的顺序找，导致同一个 exe 换个 cwd
+/// 就用另一套库（机器上真出现过两套互不相干的库 + 不同密钥，API Key 因此对不上、
+/// stdio 桥接 401）。统一到一处，杜绝分叉。
 fn resolve_data_dir() -> PathBuf {
-    let cwd_data = PathBuf::from("data");
-    if cwd_data.join("vps-switch.db").exists() {
-        return cwd_data;
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let exe_data = dir.join("data");
-            if exe_data.join("vps-switch.db").exists() {
-                return exe_data;
-            }
-        }
-    }
     if let Ok(appdata) = std::env::var("APPDATA") {
         return PathBuf::from(appdata).join("vps-switch").join("data");
     }
-    cwd_data
+    // 没有 APPDATA（非 Windows）时退回当前目录
+    PathBuf::from("data")
 }
 
 /// 静态资源相对路径白名单校验：拒绝 `..`、空段、反斜杠与盘符，杜绝跳出 frontend/dist 读本机任意文件
