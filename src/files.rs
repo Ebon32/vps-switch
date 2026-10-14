@@ -64,6 +64,11 @@ pub struct TransferTask {
     pub speed_bps: u64,
     pub state: String, // "running" | "completed" | "failed"
     pub error: Option<String>,
+    /// 传输内容的 SHA-256（十六进制小写）
+    pub sha256: Option<String>,
+    /// 闭环校验结果：Some(true)=两端哈希一致；Some(false)=不一致（任务已判失败）；
+    /// None=未校验（如哈希命令不可用，此时 sha256 为客户端侧增量哈希，仅作记录）
+    pub verified: Option<bool>,
     pub started_at: String,
     pub ended_at: Option<String>,
 }
@@ -111,6 +116,8 @@ impl TransferManager {
             speed_bps: 0,
             state: "running".to_string(),
             error: None,
+            sha256: None,
+            verified: None,
             started_at: Utc::now().to_rfc3339(),
             ended_at: None,
         };
@@ -156,6 +163,13 @@ impl TransferManager {
             task.state = "failed".to_string();
             task.error = Some(err_msg.to_string());
             task.ended_at = Some(Utc::now().to_rfc3339());
+        }
+    }
+
+    pub fn set_verification(&self, id: &str, sha256: Option<String>, verified: Option<bool>) {
+        if let Some(task) = self.store.lock().unwrap().tasks.get_mut(id) {
+            task.sha256 = sha256;
+            task.verified = verified;
         }
     }
 
@@ -588,36 +602,32 @@ fn detect_archive_kind(path: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
+/// 压缩/解压的远端命令执行：600 秒上限 + 并发闸 + 超时主动 close。
+/// 此前这里是无超时的 `while let Some(msg) = channel.wait()`——命令一旦挂住，
+/// channel 永不回收，反复调用会打满远端 MaxSessions。
 async fn run_ssh_exec_checked(pool: &SshPool, db: &Database, host_id: &str, cmd: &str) -> Result<String> {
-    let (_rec, mut channel) = crate::ssh::open_host_channel(pool, db, host_id).await?;
-    channel.exec(true, cmd).await?;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exit_code: Option<u32> = None;
-
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-            russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-            russh::ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
-            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
-            _ => {}
-        }
+    let cap = crate::ssh::exec_host_capture(
+        pool,
+        db,
+        host_id,
+        cmd,
+        std::time::Duration::from_secs(600),
+    )
+    .await?;
+    if cap.timed_out {
+        return Err(anyhow!("远端命令执行超时（600 秒），已强制中断"));
     }
-
-    let out_str = String::from_utf8_lossy(&stdout).trim().to_string();
-    let err_str = String::from_utf8_lossy(&stderr).trim().to_string();
-    if exit_code.unwrap_or(0) != 0 {
-        let msg = if !err_str.is_empty() {
-            err_str
-        } else if !out_str.is_empty() {
-            out_str
+    if cap.exit_code.unwrap_or(0) != 0 {
+        let msg = if !cap.stderr.is_empty() {
+            cap.stderr
+        } else if !cap.stdout.is_empty() {
+            cap.stdout
         } else {
-            format!("exit code {}", exit_code.unwrap_or(1))
+            format!("exit code {}", cap.exit_code.unwrap_or(1))
         };
         return Err(anyhow!(msg));
     }
-    Ok(out_str)
+    Ok(cap.stdout)
 }
 
 pub async fn compress_item(
@@ -748,8 +758,31 @@ pub async fn extract_item(
 
 // ==================== 板块四：满速流式传输核心（UI 与未来 MCP 共用） ====================
 
+/// 本地文件整读 SHA-256（落地对账用）
+async fn hash_local_file(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// 远端重读哈希的超时：基础 60 秒 + 按 20 MiB/s 估算，封顶 900 秒
+fn hash_timeout_for(bytes: u64) -> std::time::Duration {
+    let secs = 60 + bytes / (20 * 1024 * 1024);
+    std::time::Duration::from_secs(secs.min(900))
+}
+
 /// 从任意异步流（如 HTTP 上传流或本机文件流）高速写入目标主机，
-/// 写 `.part` 临时文件并在完成后原子改名，全程实时刷新速率与进度。
+/// 写 `.part` 临时文件并在完成后原子改名，全程实时刷新速率与进度；
+/// 完成后做传输闭环校验：上传流增量 SHA-256 vs 落地文件重读 SHA-256。
 pub async fn stream_upload_to_host<R>(
     pool: &SshPool,
     db: &Database,
@@ -764,6 +797,7 @@ pub async fn stream_upload_to_host<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    use sha2::{Digest, Sha256};
     let safe_name = Path::new(filename)
         .file_name()
         .and_then(|s| s.to_str())
@@ -771,6 +805,7 @@ where
     let final_path = join_remote_path(remote_dir, safe_name);
     let temp_path = format!("{final_path}.vps-part-{}", Uuid::new_v4().simple());
     let started = Instant::now();
+    let mut hasher = Sha256::new();
 
     if host_id == LOCAL_HOST_ID {
         let local_final = PathBuf::from(remote_dir).join(safe_name);
@@ -784,6 +819,7 @@ where
                 break;
             }
             out_file.write_all(&buf[..n]).await?;
+            hasher.update(&buf[..n]);
             transferred += n as u64;
             transfers.update_progress(
                 task_id,
@@ -794,8 +830,33 @@ where
         }
         out_file.flush().await?;
         drop(out_file);
+        if expected_size > 0 && transferred != expected_size {
+            let _ = tokio::fs::remove_file(&local_temp).await;
+            let msg = format!("传输字节数不符：预期 {expected_size}，实收 {transferred}");
+            transfers.fail_task(task_id, &msg);
+            return Err(anyhow!(msg));
+        }
         tokio::fs::rename(&local_temp, &local_final).await?;
+        let digest = hex::encode(hasher.finalize());
+        let landed = hash_local_file(&local_final).await;
         transfers.finish_task(task_id, transferred, started.elapsed().as_secs_f64());
+        match landed {
+            Ok(landed) if landed == digest => {
+                transfers.set_verification(task_id, Some(digest), Some(true));
+            }
+            Ok(landed) => {
+                let msg = format!(
+                    "SHA-256 校验不一致：传输流 {digest}，落地文件 {landed}（文件已保留，请人工核查）"
+                );
+                transfers.fail_task(task_id, &msg);
+                transfers.set_verification(task_id, Some(digest), Some(false));
+                return Err(anyhow!(msg));
+            }
+            Err(err) => {
+                tracing::warn!("本机落地文件重读哈希失败: {err:#}");
+                transfers.set_verification(task_id, Some(digest), None);
+            }
+        }
         return Ok(local_final.to_string_lossy().replace('\\', "/"));
     }
 
@@ -821,6 +882,7 @@ where
             tokio::time::timeout(STALL_TIMEOUT, remote_file.write_all(&buf[..n]))
                 .await
                 .map_err(|_| anyhow!("远端写入失速超时 (连续 12 秒无数据推进)"))??;
+            hasher.update(&buf[..n]);
             transferred += n as u64;
             transfers.update_progress(
                 task_id,
@@ -842,6 +904,13 @@ where
         return Err(err);
     }
 
+    if expected_size > 0 && transferred != expected_size {
+        let _ = sftp.remove_file(&temp_path).await;
+        let msg = format!("传输字节数不符：预期 {expected_size}，实收 {transferred}，临时文件已清除");
+        transfers.fail_task(task_id, &msg);
+        return Err(anyhow!(msg));
+    }
+
     // 原子替换目标文件
     if sftp.try_exists(&final_path).await.unwrap_or(false) {
         let _ = sftp.remove_file(&final_path).await;
@@ -852,7 +921,29 @@ where
         return Err(err.into());
     }
 
-    transfers.finish_task(task_id, transferred, started.elapsed().as_secs_f64());
+    let digest = hex::encode(hasher.finalize());
+    match crate::ssh::remote_sha256(pool, db, host_id, &final_path, hash_timeout_for(transferred))
+        .await
+    {
+        Ok(remote) if remote == digest => {
+            transfers.finish_task(task_id, transferred, started.elapsed().as_secs_f64());
+            transfers.set_verification(task_id, Some(digest), Some(true));
+        }
+        Ok(remote) => {
+            let msg = format!(
+                "SHA-256 校验不一致：传输流 {digest}，远端落地 {remote}（文件已保留，请人工核查）"
+            );
+            transfers.fail_task(task_id, &msg);
+            transfers.set_verification(task_id, Some(digest), Some(false));
+            return Err(anyhow!(msg));
+        }
+        Err(err) => {
+            // 远端哈希命令不可用时：任务照常完成，但不冒充"已校验"
+            tracing::warn!("远端落地文件哈希失败，跳过校验: {err:#}");
+            transfers.finish_task(task_id, transferred, started.elapsed().as_secs_f64());
+            transfers.set_verification(task_id, Some(digest), None);
+        }
+    }
     pool.invalidate_dir_cache(host_id).await;
     Ok(final_path)
 }
@@ -929,6 +1020,7 @@ pub async fn transfer_local_remote_file(
             .find(|t| t.id == task_id)
             .ok_or_else(|| anyhow!("读取传输任务状态失败"))
     } else {
+        use sha2::{Digest, Sha256};
         let sftp = pool.get_or_open_sftp(db, host_id).await?;
         let meta = sftp
             .metadata(remote_path)
@@ -950,12 +1042,31 @@ pub async fn transfer_local_remote_file(
             remote_path,
             total,
         );
+
+        // 闭环校验的基准：先取源文件哈希（失败则跳过校验，不阻塞传输本身）
+        let remote_hash = match crate::ssh::remote_sha256(
+            pool,
+            db,
+            host_id,
+            remote_path,
+            hash_timeout_for(total),
+        )
+        .await
+        {
+            Ok(h) => Some(h),
+            Err(err) => {
+                tracing::warn!("下载前取远端哈希失败，跳过闭环校验: {err:#}");
+                None
+            }
+        };
+
         let started = Instant::now();
         let mut remote_file = sftp.open(remote_path).await?;
         let temp_local = format!("{local_path}.vps-part");
         let mut out_file = tokio::fs::File::create(&temp_local).await?;
         let mut buf = vec![0u8; STREAM_BUF_SIZE];
         let mut transferred = 0u64;
+        let mut hasher = Sha256::new();
 
         let res: Result<()> = async {
             loop {
@@ -966,6 +1077,7 @@ pub async fn transfer_local_remote_file(
                     break;
                 }
                 out_file.write_all(&buf[..n]).await?;
+                hasher.update(&buf[..n]);
                 transferred += n as u64;
                 transfers.update_progress(
                     &task_id,
@@ -986,8 +1098,32 @@ pub async fn transfer_local_remote_file(
             return Err(err);
         }
 
+        if total > 0 && transferred != total {
+            let _ = tokio::fs::remove_file(&temp_local).await;
+            let msg = format!("下载字节数不符：预期 {total}，实收 {transferred}，临时文件已清除");
+            transfers.fail_task(&task_id, &msg);
+            return Err(anyhow!(msg));
+        }
+
         tokio::fs::rename(&temp_local, local_path).await?;
+        let digest = hex::encode(hasher.finalize());
         transfers.finish_task(&task_id, transferred, started.elapsed().as_secs_f64());
+        match remote_hash {
+            Some(remote) if remote == digest => {
+                transfers.set_verification(&task_id, Some(digest), Some(true));
+            }
+            Some(remote) => {
+                let msg = format!(
+                    "SHA-256 校验不一致：远端源 {remote}，落地 {digest}（文件已保留，请人工核查）"
+                );
+                transfers.fail_task(&task_id, &msg);
+                transfers.set_verification(&task_id, Some(digest), Some(false));
+                return Err(anyhow!(msg));
+            }
+            None => {
+                transfers.set_verification(&task_id, Some(digest), None);
+            }
+        }
 
         transfers
             .list_tasks(None)

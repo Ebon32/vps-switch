@@ -204,6 +204,9 @@ impl InspectorEngine {
             .map(|s| s.eq_ignore_ascii_case("windows"))
             .unwrap_or(false);
 
+        // 探针同样占用一条 session channel，纳入并发闸
+        let _exec_permit = pool.acquire_exec_slot(host_id).await?;
+
         let (inspection, os_info) = if is_windows {
             let win_script = r#"$ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}

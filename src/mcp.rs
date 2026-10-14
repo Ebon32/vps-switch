@@ -460,6 +460,18 @@ async fn run_ssh_exec_task(
     cmd: &str,
     cancel_rx: &mut oneshot::Receiver<()>,
 ) {
+    // 并发执行闸：permit 持有到本任务结束，保证同一主机上的 session channel 不超过 MaxSessions
+    let _exec_permit = match state.ssh_pool.acquire_exec_slot(&host.id).await {
+        Ok(p) => p,
+        Err(e) => {
+            let mut g = inner.lock().unwrap();
+            g.state = "failed".to_string();
+            g.stderr.extend_from_slice(format!("{e:#}").as_bytes());
+            g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+            return;
+        }
+    };
+
     let mut channel = match open_host_channel(&state.ssh_pool, &state.db, &host.id).await {
         Ok((_, ch)) => ch,
         Err(e) => {
@@ -504,8 +516,7 @@ async fn run_ssh_exec_task(
             }
             msg_opt = channel.wait() => {
                 match msg_opt {
-                    Some(ChannelMsg::Data { data }) => {
-                        let mut g = inner.lock().unwrap();
+                    Some(ChannelMsg::Data { data }) => {                        let mut g = inner.lock().unwrap();
                         append_capped(&mut g.stdout, &data);
                         g.last_output_inst = Instant::now();
                     }
@@ -522,7 +533,10 @@ async fn run_ssh_exec_task(
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status as i32);
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => break,
+                    // EOF 只表示"输出结束"：OpenSSH 的 exit-status 常在其之后到达，
+                    // 必须读到 Close 才收尾，否则高频丢退出码（旧构建靠谎报成功掩盖了它）
+                    Some(ChannelMsg::Eof) => {}
+                    Some(ChannelMsg::Close) => break,
                     // russh 在收到对端 CHANNEL_CLOSE 时会先投递显式的 Close/Eof，只有会话整体消失才会得到 None
                     None => {
                         connection_lost = true;
@@ -734,7 +748,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "vps_transfer",
-            "description": "满速流式文件传输引擎（16MiB 通道窗口 + 64 路并发 SFTP 流水线 + 12 秒无推进失速看门狗）。支持三种方向：upload（本机路径 -> 远端路径）、download（远端路径 -> 本机路径）、cross（源 VPS 路径 -> 目标 VPS 路径，内存直传不落本机硬盘）。无需分片或 base64，一次调用直接完成。",
+            "description": "满速流式文件传输引擎（16MiB 通道窗口 + 64 路并发 SFTP 流水线 + 12 秒无推进失速看门狗）。支持三种方向：upload（本机路径 -> 远端路径）、download（远端路径 -> 本机路径）、cross（源 VPS 路径 -> 目标 VPS 路径，内存直传不落本机硬盘）。无需分片或 base64，一次调用直接完成。落盘走临时文件原子替换，完成后自动做 SHA-256 闭环校验（返回 sha256 与 verified 字段；校验不一致时任务判失败）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

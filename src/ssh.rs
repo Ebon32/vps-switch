@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 pub struct SshClientHandler;
 
@@ -30,6 +30,11 @@ impl client::Handler for SshClientHandler {
     }
 }
 
+/// 同一 SSH 连接上的 session channel 总数受 sshd `MaxSessions`（默认 10）限制。
+/// 每个 vps_exec / 探针都会开一个 channel，高频并发调用（agent 并行工具调用）会打满上限
+/// 导致 channel open 失败。闸门只约束执行/探针类短通道；终端 pane 与 SFTP 不排队。
+const MAX_CONCURRENT_EXEC_PER_HOST: usize = 6;
+
 /// 单主机 SSH 与 SFTP 连接池：
 /// - 终端、执行、SFTP 文件浏览、高速上传下载、探针全部共用同一条底层 SSH 连接；
 /// - 通道窗口拉大到 16 MiB + SFTP 64 路并发流水线（255 KiB 大包），彻底跑满跨境高 RTT 带宽。
@@ -39,6 +44,7 @@ pub struct SshPool {
     sftps: Mutex<HashMap<String, Arc<SftpSession>>>,
     home_dirs: Mutex<HashMap<String, String>>,
     dir_cache: Mutex<HashMap<(String, String), (Instant, crate::files::DirListing)>>,
+    exec_gates: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl SshPool {
@@ -48,7 +54,27 @@ impl SshPool {
             sftps: Mutex::new(HashMap::new()),
             home_dirs: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
+            exec_gates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 申请该主机的执行通道额度；持有返回的 permit 直到 channel 用完为止。
+    pub async fn acquire_exec_slot(&self, host_id: &str) -> Result<OwnedSemaphorePermit> {
+        let sem = {
+            let mut gates = self.exec_gates.lock().await;
+            gates
+                .entry(host_id.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONCURRENT_EXEC_PER_HOST)))
+                .clone()
+        };
+        tokio::time::timeout(Duration::from_secs(60), sem.acquire_owned())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "该主机并发执行通道已满（{MAX_CONCURRENT_EXEC_PER_HOST} 路在用），请稍后重试"
+                )
+            })?
+            .map_err(|_| anyhow!("执行通道信号量已关闭"))
     }
 
     pub async fn get_cached_dir(
@@ -159,6 +185,7 @@ impl SshPool {
     pub async fn invalidate_host(&self, host_id: &str) {
         self.sftps.lock().await.remove(host_id);
         self.sessions.lock().await.remove(host_id);
+        self.exec_gates.lock().await.remove(host_id);
     }
 
     pub async fn invalidate_sftp(&self, host_id: &str) {
@@ -329,22 +356,152 @@ pub async fn connect_single_or_jump(
     }
 }
 
-pub async fn exec_short_command(session: &Handle<SshClientHandler>, cmd: &str) -> Result<String> {
+pub struct ExecCapture {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<u32>,
+    pub timed_out: bool,
+}
+
+/// 执行一条远端命令并完整收集 stdout / stderr / exit code。
+/// 关键：超时后必须显式 `channel.close()` —— russh 的 Channel 被 Drop 时不会发 CHANNEL_CLOSE，
+/// 直接丢弃会让服务端 channel 一直悬挂（远端命令不结束就不回收），高频调用会打满 MaxSessions。
+/// 主动 close 后 OpenSSH 会终止远端进程并立即回收该 channel。
+pub async fn exec_capture(
+    session: &Handle<SshClientHandler>,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<ExecCapture> {
     let mut channel = session.channel_open_session().await?;
     channel.exec(true, cmd).await?;
-    let mut out = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code: Option<u32> = None;
+    let mut timed_out = false;
     let collect = async {
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::Data { data } => out.extend_from_slice(&data),
-                ChannelMsg::ExtendedData { data, .. } => out.extend_from_slice(&data),
-                ChannelMsg::Eof | ChannelMsg::Close => break,
+                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+                // EOF 只表示"输出结束"：OpenSSH 的 exit-status 常在其之后到达，读到 Close 才收尾
+                ChannelMsg::Eof => {}
+                ChannelMsg::Close => break,
                 _ => {}
             }
         }
     };
-    let _ = tokio::time::timeout(Duration::from_secs(5), collect).await;
-    Ok(String::from_utf8_lossy(&out).trim().to_string())
+    if tokio::time::timeout(timeout, collect).await.is_err() {
+        timed_out = true;
+        let _ = channel.close().await;
+    }
+    Ok(ExecCapture {
+        stdout: String::from_utf8_lossy(&stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
+        exit_code,
+        timed_out,
+    })
+}
+
+/// 短命令采集（探针脚本等）：5 秒上限，输出合并为一段文本（保持原探针解析契约）。
+pub async fn exec_short_command(session: &Handle<SshClientHandler>, cmd: &str) -> Result<String> {
+    let cap = exec_capture(session, cmd, Duration::from_secs(5)).await?;
+    let mut merged = cap.stdout;
+    if !cap.stderr.is_empty() {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(&cap.stderr);
+    }
+    Ok(merged)
+}
+
+/// 主机级执行采集：并发闸 + 建连 + 完整输出/退出码。命令超时后主动 close channel。
+pub async fn exec_host_capture(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<ExecCapture> {
+    let _permit = pool.acquire_exec_slot(host_id).await?;
+    let record = db
+        .get_record(host_id)?
+        .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
+    let jump = match record.jump_host_id.as_deref() {
+        Some(jid) => db.get_record(jid)?,
+        None => None,
+    };
+    let handle = pool
+        .get_or_connect(&record, jump.as_ref(), db.master_key())
+        .await?;
+    exec_capture(&handle, cmd, timeout).await
+}
+
+fn ps_single_quote(val: &str) -> String {
+    format!("'{}'", val.replace('\'', "''"))
+}
+
+/// 计算远端文件的 SHA-256：Linux 走 `sha256sum`，Windows 走 `Get-FileHash`。
+/// 用于文件传输闭环校验：上传完成后重读目标文件对账；下载前先取源文件哈希。
+pub async fn remote_sha256(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let record = db
+        .get_record(host_id)?
+        .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
+    let is_windows = record
+        .os_info
+        .as_ref()
+        .and_then(|o| o.os.as_deref())
+        .map(|s| s.eq_ignore_ascii_case("windows"))
+        .unwrap_or(false);
+
+    let cmd = if is_windows {
+        let ps = format!(
+            "$h = (Get-FileHash -Algorithm SHA256 -LiteralPath {}).Hash; Write-Output $h.ToLower()",
+            ps_single_quote(path)
+        );
+        let utf16: Vec<u8> = ps.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&utf16);
+        format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64}")
+    } else {
+        format!("LC_ALL=C sha256sum {}", shell_quote_posix(path))
+    };
+
+    let cap = exec_host_capture(pool, db, host_id, &cmd, timeout).await?;
+    if cap.timed_out {
+        return Err(anyhow!("远端 SHA-256 计算超时"));
+    }
+    if cap.exit_code.unwrap_or(0) != 0 {
+        return Err(anyhow!(
+            "远端 SHA-256 计算失败: {}",
+            if cap.stderr.is_empty() {
+                format!("exit code {}", cap.exit_code.unwrap_or(1))
+            } else {
+                cap.stderr
+            }
+        ));
+    }
+    let hash = cap
+        .stdout
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("远端 SHA-256 输出异常: {}", cap.stdout));
+    }
+    Ok(hash)
+}
+
+fn shell_quote_posix(val: &str) -> String {
+    format!("'{}'", val.replace('\'', r"'\''"))
 }
 
 pub async fn open_host_channel(
