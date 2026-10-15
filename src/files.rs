@@ -249,7 +249,7 @@ async fn list_local_dir(dir_path: Option<&str>) -> Result<DirListing> {
     let raw = dir_path.unwrap_or("").trim();
 
     // Windows 顶层虚拟根目录 "drives"（此电脑）：列出 C:/ D:/ E:/ 等全部可用盘符
-    if raw.eq_ignore_ascii_case("drives") || raw == "/" || raw == "\\" {
+    if cfg!(windows) && (raw.eq_ignore_ascii_case("drives") || raw == "/" || raw == "\\") {
         let mut drives = Vec::new();
         for letter in b'A'..=b'Z' {
             let drive_str = format!("{}:/", letter as char);
@@ -276,7 +276,7 @@ async fn list_local_dir(dir_path: Option<&str>) -> Result<DirListing> {
         std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("C:/"))
+            .unwrap_or_else(|_| PathBuf::from(if cfg!(windows) { "C:/" } else { "/" }))
     } else if raw.len() == 2 && raw.as_bytes()[1] == b':' {
         PathBuf::from(format!("{raw}/"))
     } else {
@@ -326,7 +326,7 @@ async fn list_local_dir(dir_path: Option<&str>) -> Result<DirListing> {
             .parent()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .filter(|p| !p.is_empty() && p != &norm_path)
-            .or_else(|| Some("drives".to_string()))
+            .or_else(|| cfg!(windows).then(|| "drives".to_string()))
     };
 
     Ok(DirListing {

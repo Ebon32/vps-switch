@@ -121,6 +121,7 @@ const loadingMcpCalls = ref(false);
 const mcpStatus = ref<{
   exePath: string;
   port: number;
+  env: Record<string, string>;
   claudeCodePath: string;
   claudeCodeSynced: boolean;
   codexPath: string;
@@ -661,6 +662,7 @@ const displayedMcpConfigJson = computed(() => {
           type: 'stdio',
           command: mcpStatus.value?.exePath || 'vps-switch.exe',
           args: ['--mcp-stdio'],
+          env: mcpStatus.value?.env,
         },
       },
     },

@@ -14,7 +14,7 @@ import { nginx } from '@codemirror/legacy-modes/mode/nginx';
 import { properties } from '@codemirror/legacy-modes/mode/properties';
 import { toml } from '@codemirror/legacy-modes/mode/toml';
 import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile';
-import { sql } from '@codemirror/legacy-modes/mode/sql';
+import { standardSQL } from '@codemirror/legacy-modes/mode/sql';
 import { powerShell } from '@codemirror/legacy-modes/mode/powershell';
 import { xml } from '@codemirror/legacy-modes/mode/xml';
 import { diff } from '@codemirror/legacy-modes/mode/diff';
@@ -155,7 +155,7 @@ function languageFor(filename: string) {
     case 'toml':
       return StreamLanguage.define(toml);
     case 'sql':
-      return StreamLanguage.define(sql.standardSQL);
+      return StreamLanguage.define(standardSQL);
     case 'xml':
     case 'html':
     case 'htm':

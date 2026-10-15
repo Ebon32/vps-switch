@@ -1,8 +1,6 @@
 use crate::{
     db::Database,
-    files::{
-        self, join_remote_path, TransferManager,
-    },
+    files::{self, join_remote_path, TransferManager},
     inspector::InspectorEngine,
     mcp::{handle_mcp_request, sync_cli_mcp_configs, ExecTaskManager, JsonRpcRequest},
     models::{HostMetaPatch, HostUpsertPayload, ReorderPayload, LOCAL_HOST_ID},
@@ -31,14 +29,13 @@ use futures::{
 };
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
     time::Instant,
 };
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
@@ -60,7 +57,10 @@ pub struct AppState {
 pub fn build_api_router(state: Arc<AppState>) -> Router {
     let protected_api = Router::new()
         .route("/api/system/about", get(api_get_about))
-        .route("/api/system/autostart", get(api_get_autostart).post(api_set_autostart))
+        .route(
+            "/api/system/autostart",
+            get(api_get_autostart).post(api_set_autostart),
+        )
         .route("/api/system/check-update", post(api_check_update))
         .route("/api/mcp/status", get(api_mcp_status).post(api_mcp_sync))
         .route("/api/settings", get(api_get_settings))
@@ -383,9 +383,7 @@ async fn list_terminals(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListTerminalsQuery>,
 ) -> impl IntoResponse {
-    let panes = state
-        .terminals
-        .list_panes(query.host_id.as_deref(), false);
+    let panes = state.terminals.list_panes(query.host_id.as_deref(), false);
     (
         StatusCode::OK,
         Json(json!({
@@ -516,9 +514,9 @@ async fn handle_terminal_ws(socket: WebSocket, pane: Arc<PaneHandle>) {
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
                         if data.first() == Some(&0x01) && data.len() > 1 {
-                            let _ = pane.cmd_tx.send(PaneCommand::Input(data[1..].to_vec()));
+                            let _ = pane.cmd_tx.send(PaneCommand::Input { bytes: data[1..].to_vec(), sent: None });
                         } else if !data.is_empty() {
-                            let _ = pane.cmd_tx.send(PaneCommand::Input(data));
+                            let _ = pane.cmd_tx.send(PaneCommand::Input { bytes: data, sent: None });
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
@@ -707,7 +705,14 @@ async fn api_rename_item(
     State(state): State<Arc<AppState>>,
     Json(p): Json<RenamePayload>,
 ) -> impl IntoResponse {
-    match files::rename_item(&state.ssh_pool, &state.db, &p.host_id, &p.old_path, &p.new_path).await
+    match files::rename_item(
+        &state.ssh_pool,
+        &state.db,
+        &p.host_id,
+        &p.old_path,
+        &p.new_path,
+    )
+    .await
     {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(e) => err_response(StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
@@ -840,7 +845,15 @@ async fn api_stream_upload(
     }
 }
 
-/// 浏览器高速流式下载：直接把 64 路并发 SFTP 预读流作为 HTTP 响应输出，同时实时更新传输队列速率
+struct TemporaryDownload(std::path::PathBuf);
+
+impl Drop for TemporaryDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 浏览器下载沿用传输引擎，完成校验后通过 HTTP 交付，临时文件随响应关闭而清理。
 async fn api_stream_download(
     State(state): State<Arc<AppState>>,
     Query(q): Query<FileQuery>,
@@ -848,14 +861,6 @@ async fn api_stream_download(
     let Some(file_path) = q.path.filter(|s| !s.trim().is_empty()) else {
         return err_response(StatusCode::BAD_REQUEST, "缺少下载路径").into_response();
     };
-
-    let host_name = state
-        .db
-        .get_record(&q.host_id)
-        .ok()
-        .flatten()
-        .map(|h| h.name)
-        .unwrap_or_else(|| q.host_id.clone());
 
     let filename = file_path
         .rsplit(['/', '\\'])
@@ -876,82 +881,60 @@ async fn api_stream_download(
         return build_download_response(&filename, meta.len(), Body::from_stream(stream));
     }
 
-    let sftp = match state.ssh_pool.get_or_open_sftp(&state.db, &q.host_id).await {
-        Ok(s) => s,
+    let temp_dir =
+        std::env::temp_dir().join(format!("vps-switch-browser-download-{}", Uuid::new_v4()));
+    if let Err(e) = tokio::fs::create_dir(&temp_dir).await {
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    let cleanup = TemporaryDownload(temp_dir);
+    let local_path = cleanup.0.join("file");
+    let task = match files::transfer_local_remote_file(
+        &state.ssh_pool,
+        &state.db,
+        &state.transfers,
+        &q.host_id,
+        "download",
+        &local_path.to_string_lossy(),
+        &file_path,
+    )
+    .await
+    {
+        Ok(t) => t,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     };
-
-    let meta = match sftp.metadata(&file_path).await {
-        Ok(m) => m,
-        Err(e) => return err_response(StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
-    };
-    if meta.is_dir() {
-        return err_response(StatusCode::BAD_REQUEST, "不能直接下载文件夹").into_response();
-    }
-    let total_size = meta.size.unwrap_or(0);
-
-    let remote_file = match sftp.open(&file_path).await {
+    let file = match tokio::fs::File::open(&local_path).await {
         Ok(f) => f,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     };
-
-    let task_id = state.transfers.create_task(
-        &q.host_id,
-        &host_name,
-        "download",
-        &filename,
-        None,
-        &file_path,
-        total_size,
-    );
-
-    let transfers = state.transfers.clone();
-    let started = Instant::now();
-
-    let stream = futures::stream::unfold(
-        (remote_file, 0u64, task_id, transfers, false),
-        move |(mut rfile, mut transferred, tid, tm, done)| async move {
-            if done {
-                return None;
-            }
-            let mut buf = vec![0u8; 512 * 1024];
-            match rfile.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = rfile.close().await;
-                    tm.finish_task(&tid, transferred, started.elapsed().as_secs_f64());
-                    None
-                }
-                Ok(n) => {
-                    buf.truncate(n);
-                    transferred += n as u64;
-                    tm.update_progress(
-                        &tid,
-                        transferred,
-                        total_size,
-                        started.elapsed().as_secs_f64(),
-                    );
-                    Some((
-                        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(buf)),
-                        (rfile, transferred, tid, tm, false),
-                    ))
-                }
-                Err(err) => {
-                    tm.fail_task(&tid, &err);
-                    Some((Err(err), (rfile, transferred, tid, tm, true)))
-                }
-            }
-        },
-    );
-
-    build_download_response(&filename, total_size, Body::from_stream(stream))
+    let reader = tokio_util::io::ReaderStream::with_capacity(file, 512 * 1024);
+    let stream = futures::stream::unfold((reader, cleanup), |(mut reader, cleanup)| async move {
+        reader.next().await.map(|bytes| (bytes, (reader, cleanup)))
+    });
+    build_download_response(&filename, task.transferred_bytes, Body::from_stream(stream))
 }
 
 fn build_download_response(filename: &str, size: u64, body: Body) -> Response {
     let safe_ascii: String = filename
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let disposition = format!("attachment; filename=\"{safe_ascii}\"");
+    let encoded: String = filename
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let disposition = format!("attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{encoded}");
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1013,8 +996,11 @@ async fn api_create_local_remote_transfer(
     Json(p): Json<LocalRemoteTransferPayload>,
 ) -> impl IntoResponse {
     if p.direction != "upload" && p.direction != "download" {
-        return err_response(StatusCode::BAD_REQUEST, "direction 只能是 upload 或 download")
-            .into_response();
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "direction 只能是 upload 或 download",
+        )
+        .into_response();
     }
     if state.db.get_record(&p.host_id).ok().flatten().is_none() {
         return err_response(StatusCode::BAD_REQUEST, "主机不存在").into_response();
@@ -1071,7 +1057,10 @@ async fn api_clear_transfers(State(state): State<Arc<AppState>>) -> impl IntoRes
 const SESSION_COOKIE_NAME: &str = "vps_switch_session";
 
 fn extract_session_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(tok) = auth.strip_prefix("Bearer ") {
             if !tok.trim().is_empty() {
                 return Some(tok.trim().to_string());
@@ -1149,12 +1138,13 @@ async fn api_auth_login(
     State(state): State<Arc<AppState>>,
     Json(p): Json<LoginPayload>,
 ) -> Response {
-    match state
-        .db
-        .verify_admin_credentials(&p.username, &p.password)
-    {
+    match state.db.verify_admin_credentials(&p.username, &p.password) {
         Ok(true) => {
-            let token = format!("sess_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            let token = format!(
+                "sess_{}{}",
+                Uuid::new_v4().simple(),
+                Uuid::new_v4().simple()
+            );
             state.sessions.lock().unwrap().insert(token.clone());
             let cookie = format!(
                 "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
@@ -1178,10 +1168,7 @@ async fn api_auth_login(
     }
 }
 
-async fn api_auth_logout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn api_auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(tok) = extract_session_token(&headers) {
         state.sessions.lock().unwrap().remove(&tok);
     }
@@ -1200,7 +1187,12 @@ fn check_autostart_enabled() -> bool {
     #[cfg(windows)]
     {
         std::process::Command::new("reg")
-            .args(["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "VPSSwitch"])
+            .args([
+                "query",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v",
+                "VPSSwitch",
+            ])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map(|o| o.status.success())
@@ -1327,62 +1319,72 @@ async fn api_get_about(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn api_check_update() -> impl IntoResponse {
     let current_version = env!("CARGO_PKG_VERSION");
-
+    let started = Instant::now();
+    let mut command = tokio::process::Command::new("gh");
+    command.args([
+        "release",
+        "view",
+        "--repo",
+        "weidu12123/vps-switch",
+        "--json",
+        "tagName,name,publishedAt,body,url",
+    ]);
     #[cfg(windows)]
-    let gh_res = std::process::Command::new("gh")
-        .args([
-            "release",
-            "view",
-            "--repo",
-            "weidu12123/vps-switch",
-            "--json",
-            "tagName,name,publishedAt,body,url",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-
-    #[cfg(not(windows))]
-    let gh_res = std::process::Command::new("gh")
-        .args([
-            "release",
-            "view",
-            "--repo",
-            "weidu12123/vps-switch",
-            "--json",
-            "tagName,name,publishedAt,body,url",
-        ])
-        .output();
-
-    if let Ok(out) = gh_res {
-        if out.status.success() {
-            if let Ok(info) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                let tag = info["tagName"].as_str().unwrap_or("").trim_start_matches('v');
-                let has_update = !tag.is_empty() && tag != current_version;
-                return (
-                    StatusCode::OK,
-                    Json(json!({
-                        "ok": true,
-                        "currentVersion": format!("v{current_version}"),
-                        "latestVersion": info["tagName"].as_str().unwrap_or(&format!("v{current_version}")),
-                        "hasUpdate": has_update,
-                        "publishedAt": info["publishedAt"].as_str(),
-                        "releaseNotes": info["body"].as_str(),
-                        "releaseUrl": info["url"].as_str(),
-                    })),
-                );
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = None;
+    let error = match command.output().await {
+        Ok(out) => {
+            stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            exit_code = out.status.code();
+            if out.status.success() {
+                match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    Ok(info)
+                        if info["tagName"]
+                            .as_str()
+                            .is_some_and(|s| !s.trim().is_empty()) =>
+                    {
+                        let tag = info["tagName"].as_str().unwrap().trim_start_matches('v');
+                        let has_update = !tag.is_empty() && tag != current_version;
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "ok": true,
+                                "currentVersion": format!("v{current_version}"),
+                                "latestVersion": info["tagName"].as_str().unwrap_or(&format!("v{current_version}")),
+                                "hasUpdate": has_update,
+                                "publishedAt": info["publishedAt"].as_str(),
+                                "releaseNotes": info["body"].as_str(),
+                                "releaseUrl": info["url"].as_str(),
+                                "stdout": stdout,
+                                "stderr": stderr,
+                                "exitCode": exit_code,
+                                "durationMs": started.elapsed().as_millis() as u64,
+                            })),
+                        );
+                    }
+                    Ok(_) => "更新响应缺少版本号".to_string(),
+                    Err(e) => format!("无法解析更新响应: {e}"),
+                }
+            } else {
+                format!("更新查询失败（退出码 {:?}）: {}", exit_code, stderr.trim())
             }
         }
-    }
+        Err(e) => format!("无法运行 gh 查询更新: {e}"),
+    };
 
     (
-        StatusCode::OK,
+        StatusCode::BAD_GATEWAY,
         Json(json!({
-            "ok": true,
+            "ok": false,
             "currentVersion": format!("v{current_version}"),
-            "latestVersion": format!("v{current_version}"),
-            "hasUpdate": false,
-            "message": "当前已是最新版本",
-            "releaseUrl": "https://github.com/weidu12123/vps-switch",
+            "error": error,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exitCode": exit_code,
+            "durationMs": started.elapsed().as_millis() as u64,
         })),
     )
 }
@@ -1432,7 +1434,11 @@ async fn api_update_auth_settings(
     {
         Ok(settings) => {
             // 若刚开启了登录保护，自动为当前管理员签发会话 Cookie，避免改完设置立刻被踢出
-            let token = format!("sess_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            let token = format!(
+                "sess_{}{}",
+                Uuid::new_v4().simple(),
+                Uuid::new_v4().simple()
+            );
             state.sessions.lock().unwrap().insert(token.clone());
             let cookie = format!(
                 "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
@@ -1467,11 +1473,10 @@ async fn api_update_mcp_settings(
     State(state): State<Arc<AppState>>,
     Json(p): Json<UpdateMcpSettingsPayload>,
 ) -> impl IntoResponse {
-    match state.db.update_mcp_settings(
-        p.mcp_enabled,
-        p.mcp_require_api_key,
-        p.regenerate_key,
-    ) {
+    match state
+        .db
+        .update_mcp_settings(p.mcp_enabled, p.mcp_require_api_key, p.regenerate_key)
+    {
         Ok(settings) => (
             StatusCode::OK,
             Json(json!({
@@ -1519,7 +1524,10 @@ async fn api_update_guard(
 }
 
 fn extract_mcp_api_key(headers: &HeaderMap) -> Option<String> {
-    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(k) = auth.strip_prefix("Bearer ") {
             if !k.trim().is_empty() {
                 return Some(k.trim().to_string());
@@ -1544,7 +1552,8 @@ async fn api_mcp_rpc(
     };
 
     if !settings.mcp_enabled {
-        return err_response(StatusCode::FORBIDDEN, "MCP Server 当前已在设置中关闭").into_response();
+        return err_response(StatusCode::FORBIDDEN, "MCP Server 当前已在设置中关闭")
+            .into_response();
     }
 
     // API Key 只在**非回环绑定**（真的对外部署）时才校验。绑在本机回环时，端点只有本机
@@ -1626,4 +1635,3 @@ async fn api_sse_events(State(state): State<Arc<AppState>>) -> impl IntoResponse
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
-

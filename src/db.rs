@@ -161,10 +161,10 @@ impl Database {
                 .or_else(|_| std::env::var("USER"))
                 .unwrap_or_else(|_| "local".to_string());
             let os_info = OsInfo {
-                os: Some("windows".to_string()),
-                distro_id: Some("windows".to_string()),
-                version_id: Some("11".to_string()),
-                pretty_name: Some("Windows 11 Local".to_string()),
+                os: Some(std::env::consts::OS.to_string()),
+                distro_id: Some(std::env::consts::OS.to_string()),
+                version_id: None,
+                pretty_name: Some(format!("{} Local", std::env::consts::OS)),
                 arch: Some(std::env::consts::ARCH.to_string()),
                 kernel: None,
                 cpu_model: None,
@@ -191,17 +191,35 @@ impl Database {
                     now
                 ],
             )?;
+        } else if !cfg!(windows) {
+            let raw: Option<String> = conn.query_row(
+                "SELECT os_json FROM hosts WHERE id = ?1",
+                params![LOCAL_HOST_ID],
+                |row| row.get(0),
+            )?;
+            if let Some(mut os) = raw.and_then(|s| serde_json::from_str::<OsInfo>(&s).ok()) {
+                if os.os.as_deref() == Some("windows") {
+                    os.os = Some(std::env::consts::OS.to_string());
+                    os.distro_id = Some(std::env::consts::OS.to_string());
+                    os.version_id = None;
+                    os.pretty_name = Some(format!("{} Local", std::env::consts::OS));
+                    os.arch = Some(std::env::consts::ARCH.to_string());
+                    conn.execute(
+                        "UPDATE hosts SET os_json = ?1 WHERE id = ?2",
+                        params![serde_json::to_string(&os)?, LOCAL_HOST_ID],
+                    )?;
+                }
+            }
         }
         Ok(())
     }
 
     pub fn count_ssh_hosts(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM hosts WHERE kind = 'ssh'",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM hosts WHERE kind = 'ssh'", [], |row| {
+                row.get(0)
+            })?;
         Ok(count as usize)
     }
 
@@ -212,9 +230,7 @@ impl Database {
 
         let tags: Vec<String> = serde_json::from_str(&tags_raw).unwrap_or_default();
         let links: Vec<HostLink> = serde_json::from_str(&links_raw).unwrap_or_default();
-        let os_info: Option<OsInfo> = os_raw
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
+        let os_info: Option<OsInfo> = os_raw.as_deref().and_then(|s| serde_json::from_str(s).ok());
 
         Ok(HostRecord {
             id: row.get("id")?,
@@ -284,9 +300,13 @@ impl Database {
 
     pub fn get_record(&self, id: &str) -> Result<Option<HostRecord>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
-        conn.query_row("SELECT * FROM hosts WHERE id = ?1", params![id], Self::row_to_record)
-            .optional()
-            .map_err(Into::into)
+        conn.query_row(
+            "SELECT * FROM hosts WHERE id = ?1",
+            params![id],
+            Self::row_to_record,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn get_public_host(&self, id: &str) -> Result<Option<PublicHost>> {
@@ -624,8 +644,9 @@ impl Database {
 
     /// 从本机旧版 1Shell (%APPDATA%\1Shell\data\1shell.db) 导入全部主机与偏好
     pub fn import_from_1shell(&self) -> Result<usize> {
-        let db_path = find_1shell_db_path()
-            .ok_or_else(|| anyhow!("未找到本机 1Shell 数据库 (%APPDATA%\\1Shell\\data\\1shell.db)"))?;
+        let db_path = find_1shell_db_path().ok_or_else(|| {
+            anyhow!("未找到本机 1Shell 数据库 (%APPDATA%\\1Shell\\data\\1shell.db)")
+        })?;
 
         let src_conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("只读打开 1Shell 数据库失败: {}", db_path.display()))?;
@@ -817,8 +838,12 @@ impl Database {
                 [],
             )?;
             conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES ('auth_enabled', 'false')",
-                [],
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('auth_enabled', ?1)",
+                params![if default_auth_enabled() {
+                    "true"
+                } else {
+                    "false"
+                }],
             )?;
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_username', 'admin')",
@@ -902,17 +927,17 @@ impl Database {
     }
 
     pub fn get_app_settings(&self) -> Result<AppSettings> {
-        let is_vps_mode = !cfg!(windows)
-            || std::env::var("HOST")
-                .map(|h| h == "0.0.0.0")
-                .unwrap_or(false);
+        let is_vps_mode = default_auth_enabled();
 
         let auth_enabled = match self.get_setting("auth_enabled")? {
             Some(v) => v == "true",
             None => {
                 // Windows 本机默认关闭，VPS/Linux 部署（或绑定 0.0.0.0）默认开启
                 let default_enabled = is_vps_mode;
-                let _ = self.set_setting("auth_enabled", if default_enabled { "true" } else { "false" });
+                self.set_setting(
+                    "auth_enabled",
+                    if default_enabled { "true" } else { "false" },
+                )?;
                 default_enabled
             }
         };
@@ -931,8 +956,8 @@ impl Database {
             _ => {
                 // 若是 VPS 部署且从未设置过密码，自动初始化一个初始密码 "vps-switch"
                 if is_vps_mode {
-                    if let Ok(Some(enc)) = self.master_key.encrypt("vps-switch") {
-                        let _ = self.set_setting("admin_password_enc", &enc);
+                    if let Some(enc) = self.master_key.encrypt("vps-switch")? {
+                        self.set_setting("admin_password_enc", &enc)?;
                         true
                     } else {
                         false
@@ -1004,7 +1029,10 @@ impl Database {
         }
 
         self.set_setting("admin_username", clean_user)?;
-        self.set_setting("auth_enabled", if final_auth_enabled { "true" } else { "false" })?;
+        self.set_setting(
+            "auth_enabled",
+            if final_auth_enabled { "true" } else { "false" },
+        )?;
         self.get_app_settings()
     }
 
@@ -1052,6 +1080,15 @@ pub struct AppSettings {
     pub mcp_api_key: String,
 }
 
+fn default_auth_enabled() -> bool {
+    !cfg!(windows)
+        || std::env::var("HOST")
+            .ok()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .map(|ip| !ip.is_loopback())
+            .unwrap_or(false)
+}
+
 fn generate_api_key() -> String {
     format!(
         "vpsk_{}{}",
@@ -1062,7 +1099,10 @@ fn generate_api_key() -> String {
 
 fn find_1shell_db_path() -> Option<PathBuf> {
     if let Ok(appdata) = std::env::var("APPDATA") {
-        let candidate = PathBuf::from(appdata).join("1Shell").join("data").join("1shell.db");
+        let candidate = PathBuf::from(appdata)
+            .join("1Shell")
+            .join("data")
+            .join("1shell.db");
         if candidate.exists() {
             return Some(candidate);
         }
@@ -1100,4 +1140,69 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_test_database() -> (PathBuf, Database) {
+        let dir = std::env::temp_dir().join(format!("vps-switch-db-test-{}", Uuid::new_v4()));
+        let key = MasterKey::load_or_create(&dir).unwrap();
+        let db = Database::open(&dir, key).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn first_start_auth_and_local_metadata_match_platform() {
+        let (dir, db) = open_test_database();
+        let settings = db.get_app_settings().unwrap();
+        if !cfg!(windows) {
+            assert!(settings.auth_enabled);
+            assert!(settings.has_admin_password);
+            assert!(db.verify_admin_credentials("admin", "vps-switch").unwrap());
+        } else if std::env::var("HOST").is_err() {
+            assert!(!settings.auth_enabled);
+        }
+        let local = db.get_record(LOCAL_HOST_ID).unwrap().unwrap();
+        assert_eq!(
+            local.os_info.unwrap().os.as_deref(),
+            Some(std::env::consts::OS)
+        );
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn existing_auth_choice_survives_restart() {
+        let (dir, db) = open_test_database();
+        db.set_setting("auth_enabled", "false").unwrap();
+        drop(db);
+        let db = Database::open(&dir, MasterKey::load_or_create(&dir).unwrap()).unwrap();
+        assert!(!db.get_app_settings().unwrap().auth_enabled);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_reopen_repairs_legacy_windows_local_metadata() {
+        let (dir, db) = open_test_database();
+        db.conn.lock().unwrap().execute(
+            "UPDATE hosts SET os_json = ?1 WHERE id = ?2",
+            params![r#"{"os":"windows","distroId":"windows","versionId":"11","prettyName":"Windows 11 Local"}"#, LOCAL_HOST_ID]
+        ).unwrap();
+        drop(db);
+        let db = Database::open(&dir, MasterKey::load_or_create(&dir).unwrap()).unwrap();
+        let os = db
+            .get_record(LOCAL_HOST_ID)
+            .unwrap()
+            .unwrap()
+            .os_info
+            .unwrap();
+        assert_eq!(os.os.as_deref(), Some("linux"));
+        assert_eq!(os.version_id, None);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

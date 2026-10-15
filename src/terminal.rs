@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 const RING_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
@@ -95,7 +95,10 @@ pub enum PaneBroadcast {
 }
 
 pub enum PaneCommand {
-    Input(Vec<u8>),
+    Input {
+        bytes: Vec<u8>,
+        sent: Option<oneshot::Sender<Result<u64>>>,
+    },
     Paste(String),
     Resize(u16, u16),
     Close,
@@ -214,8 +217,8 @@ impl PaneInternalState {
         (trimmed_screen, cursor_line)
     }
 
-
-    fn scan_osc_sequences(&mut self, chunk: &[u8]) -> bool {        let mut changed = false;
+    fn scan_osc_sequences(&mut self, chunk: &[u8]) -> bool {
+        let mut changed = false;
         self.osc_tail.extend_from_slice(chunk);
         if self.osc_tail.len() > 4096 {
             let keep = 1024;
@@ -500,6 +503,7 @@ pub struct PaneHandle {
     pub state: Arc<Mutex<PaneInternalState>>,
     pub cmd_tx: mpsc::UnboundedSender<PaneCommand>,
     pub broadcast_tx: broadcast::Sender<PaneBroadcast>,
+    input_lock: tokio::sync::Mutex<()>,
 }
 
 impl PaneHandle {
@@ -562,14 +566,22 @@ impl PaneHandle {
         bytes: Vec<u8>,
         max_lines: usize,
         wait_ms: u64,
-    ) -> ScreenSnapshot {
-        let seq_before = self.state.lock().unwrap().output_seq;
-        let _ = self.cmd_tx.send(PaneCommand::Input(bytes));
+    ) -> Result<ScreenSnapshot> {
+        let _input_guard = self.input_lock.lock().await;
+        let (sent, received) = oneshot::channel();
+        self.cmd_tx
+            .send(PaneCommand::Input {
+                bytes,
+                sent: Some(sent),
+            })
+            .map_err(|_| anyhow::anyhow!("终端输入通道已关闭"))?;
+        // 基线来自真正写入 PTY 的时刻：初始化/注入输出不能冒充本次输入的响应。
+        let seq_before = received.await.context("终端在发送输入前已关闭")??;
 
         let deadline = Instant::now() + Duration::from_millis(wait_ms.clamp(200, 60_000));
         loop {
             tokio::time::sleep(Duration::from_millis(80)).await;
-            let (exited, seq_now, quiet_ms, running, cursor_line) = {
+            let (exited, seq_now, quiet_ms, running, integrated, cursor_line) = {
                 let g = self.state.lock().unwrap();
                 let (_, cl) = g.read_screen_grid(5);
                 (
@@ -577,6 +589,7 @@ impl PaneHandle {
                     g.output_seq,
                     g.last_output_at.elapsed().as_millis() as u64,
                     g.running,
+                    g.shell_kind.is_some(),
                     cl,
                 )
             };
@@ -588,7 +601,9 @@ impl PaneHandle {
                 if looks_like_interactive_prompt(&cursor_line) && quiet_ms >= 550 {
                     break;
                 }
-                if (!running || looks_like_shell_prompt(&cursor_line)) && quiet_ms >= 350 {
+                if (!running || (!integrated && looks_like_shell_prompt(&cursor_line)))
+                    && quiet_ms >= 350
+                {
                     break;
                 }
             }
@@ -597,7 +612,7 @@ impl PaneHandle {
             }
         }
 
-        self.read_screen_snapshot(max_lines)
+        Ok(self.read_screen_snapshot(max_lines))
     }
 }
 
@@ -641,7 +656,11 @@ impl TerminalManager {
         });
     }
 
-    pub fn list_panes(&self, host_id_filter: Option<&str>, include_headless: bool) -> Vec<PaneMeta> {
+    pub fn list_panes(
+        &self,
+        host_id_filter: Option<&str>,
+        include_headless: bool,
+    ) -> Vec<PaneMeta> {
         let guard = self.panes.lock().unwrap();
         guard
             .values()
@@ -700,9 +719,9 @@ impl TerminalManager {
     /// 该主机是否还有活着的终端（pane 自己退出也算没了）。
     fn has_live_pane(&self, host_id: &str) -> bool {
         let guard = self.panes.lock().unwrap();
-        guard.values().any(|p| {
-            p.host_id == host_id && !p.state.lock().unwrap().exited
-        })
+        guard
+            .values()
+            .any(|p| p.host_id == host_id && !p.state.lock().unwrap().exited)
     }
 
     pub async fn create_pane(
@@ -809,7 +828,10 @@ fn spawn_local_conpty_pane(
     let cmd = {
         let mut c = CommandBuilder::new("powershell.exe");
         let init_hook = r#"$global:__vps_orig_prompt = $function:prompt; function global:prompt { $ec = if ($?) { 0 } else { if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 } }; $p = ($executionContext.SessionState.Path.CurrentLocation.Path -replace '\\','/'); [Console]::Write("$([char]27)]133;D;$ec$([char]7)$([char]27)]7;file://localhost/$p$([char]7)$([char]27)]133;A$([char]7)"); & $global:__vps_orig_prompt }"#;
-        c.args(["-NoLogo", "-NoExit", "-Command", init_hook]);
+        c.args(["-NoLogo", "-NoExit"]);
+        if headless {
+            c.args(["-Command", init_hook]);
+        }
         c.env("TERM", "xterm-256color");
         c.env("TERM_PROGRAM", "vps-switch");
         if let Some(ref cwd) = initial_cwd {
@@ -862,6 +884,7 @@ fn spawn_local_conpty_pane(
         state: state.clone(),
         cmd_tx,
         broadcast_tx: broadcast_tx.clone(),
+        input_lock: tokio::sync::Mutex::new(()),
     });
 
     let state_read = state.clone();
@@ -904,15 +927,32 @@ fn spawn_local_conpty_pane(
     let state_cmd = state.clone();
     let bcast_cmd = broadcast_tx.clone();
     tokio::spawn(async move {
+        let mut initial_input = true;
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                PaneCommand::Input(bytes) => {
+                PaneCommand::Input { bytes, sent } => {
+                    if initial_input && sent.is_some() {
+                        if !wait_state(&state_cmd, Duration::from_secs(6), |g| {
+                            prompt_settled(g, 250)
+                        })
+                        .await
+                        {
+                            let _ = sent
+                                .unwrap()
+                                .send(Err(anyhow::anyhow!("终端初始提示符尚未就绪")));
+                            continue;
+                        }
+                    }
+                    initial_input = false;
+                    let seq_before = state_cmd.lock().unwrap().output_seq;
                     if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
                         let mut guard = state_cmd.lock().unwrap();
                         guard.running = true;
                     }
-                    let _ = writer.write_all(&bytes);
-                    let _ = writer.flush();
+                    let result = writer.write_all(&bytes).and_then(|_| writer.flush());
+                    if let Some(sent) = sent {
+                        let _ = sent.send(result.map(|_| seq_before).map_err(Into::into));
+                    }
                 }
                 PaneCommand::Paste(text) => {
                     let payload = encode_safe_paste(&state_cmd, &text);
@@ -1048,13 +1088,22 @@ async fn inject_shell_integration(
     state: &Arc<Mutex<PaneInternalState>>,
 ) {
     /// 还回回显。注入的每一条退出路径都要经过这里。
-    async fn restore_echo(write: &ChannelWriteHalf<russh::client::Msg>) {
-        let _ = write.data(&b"stty echo 2>/dev/null\n"[..]).await;
+    async fn restore_echo(
+        write: &ChannelWriteHalf<russh::client::Msg>,
+        state: &Arc<Mutex<PaneInternalState>>,
+    ) {
+        let seq_before = state.lock().unwrap().output_seq;
+        if write.data(&b"stty echo 2>/dev/null\n"[..]).await.is_ok() {
+            let _ = wait_state(state, Duration::from_secs(3), |g| {
+                g.output_seq > seq_before && prompt_settled(g, 250)
+            })
+            .await;
+        }
     }
 
     // P0：等首个提示符。失败（超时/Windows 原生 shell）就把回显还回去、原地退出。
     if !wait_state(state, Duration::from_secs(6), |g| prompt_settled(g, 300)).await {
-        restore_echo(write).await;
+        restore_echo(write, state).await;
         return;
     }
     let windows_shell = {
@@ -1063,11 +1112,12 @@ async fn inject_shell_integration(
         prompt_is_windows_style(&cursor)
     };
     if windows_shell {
-        restore_echo(write).await;
+        restore_echo(write, state).await;
         return;
     }
 
     // P1：探测 shell 类型（回显已关，这一行在屏幕上不可见）
+    let seq_before = state.lock().unwrap().output_seq;
     if write
         .data(format!("{SHELL_PROBE_LINE}\n").as_bytes())
         .await
@@ -1075,23 +1125,22 @@ async fn inject_shell_integration(
     {
         return;
     }
-    let seq_before = state.lock().unwrap().output_seq;
     if !wait_state(state, Duration::from_millis(2500), move |g| {
         g.output_seq > seq_before && g.shell_kind.is_some()
     })
     .await
     {
-        restore_echo(write).await;
+        restore_echo(write, state).await;
         return;
     }
     let Some(shell) = state.lock().unwrap().shell_kind else {
-        restore_echo(write).await;
+        restore_echo(write, state).await;
         return;
     };
     // P2：写入钩子。等待条件带 output_seq 护栏——回显已关，上一阶段的提示符仍在
     // 光标行上，没有护栏会在注入尚未执行时就误判"已完成"。
     let Some(inject_line) = injection_line_for(shell) else {
-        restore_echo(write).await;
+        restore_echo(write, state).await;
         return;
     };
     let seq_before_inject = state.lock().unwrap().output_seq;
@@ -1109,7 +1158,7 @@ async fn inject_shell_integration(
 
     // P3：还回回显。注入疑似失败（例如 shell 语法报错）也照样还——报错上下文留在屏幕上
     // 由用户自己看，绝不为了"擦干净"去动光标。
-    restore_echo(write).await;
+    restore_echo(write, state).await;
 }
 
 async fn spawn_ssh_pty_pane(
@@ -1150,6 +1199,7 @@ async fn spawn_ssh_pty_pane(
         state: state.clone(),
         cmd_tx,
         broadcast_tx: broadcast_tx.clone(),
+        input_lock: tokio::sync::Mutex::new(()),
     });
 
     let (mut read_half, write_half) = channel.split();
@@ -1201,7 +1251,11 @@ async fn spawn_ssh_pty_pane(
     // 写半边：请求 pty（注入前先把远端回显关掉，注入写进去的每一行都不会留痕）→ 请求 shell
     // → 静默注入 shell integration → 进入输入/控制循环。
     tokio::spawn(async move {
-        let modes: &[(Pty, u32)] = if skip_injection { &[] } else { &[(Pty::ECHO, 0)] };
+        let modes: &[(Pty, u32)] = if skip_injection {
+            &[]
+        } else {
+            &[(Pty::ECHO, 0)]
+        };
         if write_half
             .request_pty(
                 false,
@@ -1226,11 +1280,17 @@ async fn spawn_ssh_pty_pane(
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                PaneCommand::Input(bytes) => {
+                PaneCommand::Input { bytes, sent } => {
+                    let seq_before = state.lock().unwrap().output_seq;
                     if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
                         state.lock().unwrap().running = true;
                     }
-                    if write_half.data(&bytes[..]).await.is_err() {
+                    let result = write_half.data(&bytes[..]).await;
+                    let failed = result.is_err();
+                    if let Some(sent) = sent {
+                        let _ = sent.send(result.map(|_| seq_before).map_err(Into::into));
+                    }
+                    if failed {
                         break;
                     }
                 }
@@ -1264,10 +1324,7 @@ async fn spawn_ssh_pty_pane(
 
 fn encode_safe_paste(state: &Arc<Mutex<PaneInternalState>>, text: &str) -> Vec<u8> {
     let bracketed = state.lock().unwrap().bracketed_paste_enabled();
-    let sanitized: String = text
-        .chars()
-        .filter(|&c| c != '\x1b' && c != '\0')
-        .collect();
+    let sanitized: String = text.chars().filter(|&c| c != '\x1b' && c != '\0').collect();
     if bracketed {
         let mut out = Vec::with_capacity(sanitized.len() + 12);
         out.extend_from_slice(b"\x1b[200~");

@@ -84,6 +84,8 @@ pub struct ExecTaskSnapshot {
     pub duration_ms: u64,
     pub stdout: String,
     pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     pub hint: Option<String>,
     pub started_at: String,
 }
@@ -120,6 +122,8 @@ impl ExecTaskInner {
             duration_ms: dur,
             stdout: String::from_utf8_lossy(&self.stdout).to_string(),
             stderr: String::from_utf8_lossy(&self.stderr).to_string(),
+            stdout_truncated: self.stdout.len() > MAX_OUTPUT_BYTES,
+            stderr_truncated: self.stderr.len() > MAX_OUTPUT_BYTES,
             hint: self.hint.clone(),
             started_at: self.started_at.clone(),
         }
@@ -137,7 +141,7 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TASKS: usize = 60;
 
 fn append_capped(buf: &mut Vec<u8>, chunk: &[u8]) {
-    if buf.len() >= MAX_OUTPUT_BYTES {
+    if buf.len() > MAX_OUTPUT_BYTES || chunk.is_empty() {
         return;
     }
     let room = MAX_OUTPUT_BYTES - buf.len();
@@ -187,17 +191,38 @@ impl ExecTaskManager {
         map.values().map(|t| t.lock().unwrap().snapshot()).collect()
     }
 
-    pub fn cancel_task(&self, task_id: &str) -> Option<ExecTaskSnapshot> {
-        let arc = self.tasks.lock().unwrap().get(task_id).cloned()?;
-        let mut g = arc.lock().unwrap();
-        if let Some(tx) = g.cancel_tx.take() {
-            let _ = tx.send(());
+    pub async fn cancel_task(&self, task_id: &str) -> Result<ExecTaskSnapshot> {
+        let arc = self
+            .tasks
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("未找到可取消的命令任务: {task_id}"))?;
+        {
+            let mut g = arc.lock().unwrap();
+            if g.state != "running" {
+                return Ok(g.snapshot());
+            }
+            if let Some(tx) = g.cancel_tx.take() {
+                let _ = tx.send(());
+            }
         }
-        if g.state == "running" {
-            g.state = "cancelled".to_string();
-            g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let g = arc.lock().unwrap();
+                if g.state != "running" {
+                    return Ok(g.snapshot());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "取消请求已发送，但尚未确认命令停止（taskId: {task_id}）"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Some(g.snapshot())
     }
 
     pub async fn exec_with_wait(
@@ -369,7 +394,8 @@ async fn run_local_exec_task(
         }
         tokio::select! {
             _ = &mut *cancel_rx => {
-                let _ = child.kill().await;
+                let killed = child.kill().await;
+                finish_exec_cancellation(&inner, killed.err().map(|e| format!("终止本机进程失败: {e}")));
                 return;
             }
             res = stdout.read(&mut out_buf), if !out_eof => {
@@ -488,7 +514,14 @@ async fn run_ssh_exec_task(
     cancel_rx: &mut oneshot::Receiver<()>,
 ) {
     // 并发执行闸：permit 持有到本任务结束，保证同一主机上的 session channel 不超过 MaxSessions
-    let _exec_permit = match state.ssh_pool.acquire_exec_slot(&host.id).await {
+    let slot = tokio::select! {
+        _ = &mut *cancel_rx => {
+            finish_exec_cancellation(&inner, None);
+            return;
+        }
+        result = state.ssh_pool.acquire_exec_slot(&host.id) => result,
+    };
+    let _exec_permit = match slot {
         Ok(p) => p,
         Err(e) => {
             let mut g = inner.lock().unwrap();
@@ -499,7 +532,14 @@ async fn run_ssh_exec_task(
         }
     };
 
-    let mut channel = match open_host_channel(&state.ssh_pool, &state.db, &host.id).await {
+    let opened = tokio::select! {
+        _ = &mut *cancel_rx => {
+            finish_exec_cancellation(&inner, None);
+            return;
+        }
+        result = open_host_channel(&state.ssh_pool, &state.db, &host.id) => result,
+    };
+    let mut channel = match opened {
         Ok((_, ch)) => ch,
         Err(e) => {
             let mut g = inner.lock().unwrap();
@@ -518,11 +558,23 @@ async fn run_ssh_exec_task(
         .map(|s| s.eq_ignore_ascii_case("windows"))
         .unwrap_or(false);
 
+    let pid_prefix = format!("\u{1e}vps-exec:{}:", inner.lock().unwrap().id);
     let final_cmd = if is_windows {
         wrap_windows_remote_command(cmd)
     } else {
-        cmd.to_string()
+        // 记录这一条 exec 的进程组，不改用户命令的 shell、输出通道或退出码。
+        format!(
+            "printf '\\036vps-exec:{}:%s\\037' \"$$\" >&2; eval '{}'",
+            inner.lock().unwrap().id,
+            cmd.replace('\'', "'\\''")
+        )
     };
+
+    if cancel_rx.try_recv().is_ok() {
+        let _ = channel.close().await;
+        finish_exec_cancellation(&inner, None);
+        return;
+    }
 
     if let Err(e) = channel.exec(true, final_cmd.as_str()).await {
         let mut g = inner.lock().unwrap();
@@ -534,11 +586,30 @@ async fn run_ssh_exec_task(
     }
 
     let mut exit_code: Option<i32> = None;
+    let mut exit_signal = None;
+    let mut cancel_deadline = None;
     let mut connection_lost = false;
+    let mut remote_pid = None;
+    let mut pid_pending = !is_windows;
+    let mut pid_buffer = Vec::new();
+    let mut group_kill_sent = false;
+    let mut cancel_error = None;
     loop {
         tokio::select! {
-            _ = &mut *cancel_rx => {
+            _ = &mut *cancel_rx, if cancel_deadline.is_none() => {
+                // CHANNEL_CLOSE 不会终止远端进程。发送 SSH signal 请求，随后等服务端确认退出。
+                if let Err(e) = channel.signal(russh::Sig::KILL).await {
+                    let _ = channel.close().await;
+                    finish_exec_cancellation(&inner, Some(format!("发送远端终止信号失败，无法确认命令停止: {e}")));
+                    return;
+                }
+                cancel_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                cancel_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400))
+            )), if cancel_deadline.is_some() => {
                 let _ = channel.close().await;
+                finish_exec_cancellation(&inner, Some(cancel_error.unwrap_or_else(|| "远端未确认终止信号，无法保证命令已停止".to_string())));
                 return;
             }
             msg_opt = channel.wait() => {
@@ -548,17 +619,22 @@ async fn run_ssh_exec_task(
                         g.last_output_inst = Instant::now();
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        let mut g = inner.lock().unwrap();
                         let cleaned = if is_windows {
                             clean_clixml_stderr(&data)
+                        } else if pid_pending {
+                            consume_remote_pid(&mut pid_buffer, &mut pid_pending, &mut remote_pid, &pid_prefix, &data)
                         } else {
                             data.to_vec()
                         };
+                        let mut g = inner.lock().unwrap();
                         append_capped(&mut g.stderr, &cleaned);
                         g.last_output_inst = Instant::now();
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status as i32);
+                    }
+                    Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                        exit_signal = Some(signal_name);
                     }
                     // EOF 只表示"输出结束"：OpenSSH 的 exit-status 常在其之后到达，
                     // 必须读到 Close 才收尾，否则高频丢退出码（旧构建靠谎报成功掩盖了它）
@@ -573,6 +649,24 @@ async fn run_ssh_exec_task(
                 }
             }
         }
+        if cancel_deadline.is_some() && !group_kill_sent {
+            if let Some(pid) = remote_pid {
+                group_kill_sent = true;
+                // 某些 OpenSSH 忽略 signal 请求；用同一连接的短控制 channel 终止已确认的进程组。
+                if let Err(e) = kill_remote_exec_group(state, &host.id, pid).await {
+                    cancel_error = Some(format!("终止远端进程组失败，无法确认命令停止: {e:#}"));
+                }
+            }
+        }
+    }
+
+    if !pid_buffer.is_empty() {
+        append_capped(&mut inner.lock().unwrap().stderr, &pid_buffer);
+    }
+
+    if cancel_deadline.is_some() && matches!(exit_signal, Some(russh::Sig::KILL)) {
+        finish_exec_cancellation(&inner, None);
+        return;
     }
 
     let mut g = inner.lock().unwrap();
@@ -610,6 +704,90 @@ async fn run_ssh_exec_task(
                 }
             }
         }
+    }
+}
+
+fn consume_remote_pid(
+    buffer: &mut Vec<u8>,
+    pending: &mut bool,
+    pid: &mut Option<u32>,
+    prefix: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    buffer.extend_from_slice(data);
+    if let Some(start) = buffer
+        .windows(prefix.len())
+        .position(|w| w == prefix.as_bytes())
+    {
+        let value_start = start + prefix.len();
+        if let Some(end_rel) = buffer[value_start..].iter().position(|b| *b == 0x1f) {
+            let end = value_start + end_rel;
+            if let Some(value) = std::str::from_utf8(&buffer[value_start..end])
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|pid| *pid > 1 && *pid <= i32::MAX as u32)
+            {
+                *pid = Some(value);
+                buffer.drain(start..=end);
+                *pending = false;
+                return std::mem::take(buffer);
+            }
+        }
+    }
+    if buffer.len() > 4096 {
+        *pending = false;
+        return std::mem::take(buffer);
+    }
+    Vec::new()
+}
+
+async fn kill_remote_exec_group(state: &Arc<AppState>, host_id: &str, pid: u32) -> Result<()> {
+    let (_, mut channel) = tokio::time::timeout(
+        Duration::from_secs(3),
+        open_host_channel(&state.ssh_pool, &state.db, host_id),
+    )
+    .await??;
+    // /proc 的进程组必须仍是这条 SSH exec 自己的组，不能对共享会话发送组信号。
+    let command = format!("IFS= read -r s < /proc/{pid}/stat || exit 1; s=${{s##*) }}; set -- $s; [ \"$3\" = \"{pid}\" ] || exit 2; kill -KILL -- -{pid}");
+    channel.exec(true, command.as_str()).await?;
+    let mut exit_code = None;
+    let mut output = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    output.extend_from_slice(&data)
+                }
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    let _ = channel.close().await;
+    result?;
+    if exit_code != Some(0) {
+        return Err(anyhow!(
+            "控制命令退出码 {:?}: {}",
+            exit_code,
+            String::from_utf8_lossy(&output)
+        ));
+    }
+    Ok(())
+}
+
+fn finish_exec_cancellation(inner: &Arc<Mutex<ExecTaskInner>>, error: Option<String>) {
+    let mut g = inner.lock().unwrap();
+    if g.state == "running" {
+        g.state = if error.is_some() {
+            "failed"
+        } else {
+            "cancelled"
+        }
+        .to_string();
+        g.hint = error;
+        g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
     }
 }
 
@@ -1030,8 +1208,15 @@ async fn dispatch_tool_call(
 }
 
 async fn tool_vps_list(state: &Arc<AppState>, args: Value) -> Result<Value> {
-    let refresh = args.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
-    let role_filter = args.get("role").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let refresh = args
+        .get("refresh")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let role_filter = args
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let search_q = args
         .get("search")
         .and_then(|v| v.as_str())
@@ -1167,7 +1352,7 @@ async fn tool_vps_inspect(state: &Arc<AppState>, args: Value) -> Result<Value> {
         .await;
 
     Ok(json!({
-        "ok": true,
+        "ok": results.iter().all(|r| r["ok"] == true),
         "results": results,
     }))
 }
@@ -1210,7 +1395,9 @@ async fn tool_vps_exec(
         }
     }
     if host_queries.is_empty() {
-        return Err(anyhow!("请提供 host 或 hosts 参数（直接传主机名，如 'vip-hk'）"));
+        return Err(anyhow!(
+            "请提供 host 或 hosts 参数（直接传主机名，如 'vip-hk'）"
+        ));
     }
 
     let mut targets = Vec::new();
@@ -1248,6 +1435,8 @@ async fn tool_vps_exec(
                         duration_ms: 0,
                         stdout: String::new(),
                         stderr: format!("{e:#}"),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         hint: None,
                         started_at: Utc::now().to_rfc3339(),
                     })
@@ -1288,10 +1477,22 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
     let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(6000);
 
     let pane_id_arg = args.get("pane_id").and_then(|v| v.as_str());
+    let specified_pane = pane_id_arg
+        .map(|pid| {
+            let pane = state
+                .terminals
+                .get_pane(pid)
+                .ok_or_else(|| anyhow!("指定的终端 pane 不存在: {pid}"))?;
+            if pane.host_id != host.id {
+                return Err(anyhow!("终端 {pid} 不属于目标主机「{}」", host.name));
+            }
+            Ok(pane)
+        })
+        .transpose()?;
 
     if action == "close" {
-        if let Some(pid) = pane_id_arg {
-            state.terminals.close_pane(&state.ssh_pool, pid).await;
+        if let Some(pane) = specified_pane {
+            state.terminals.close_pane(&state.ssh_pool, &pane.id).await;
         } else if let Some(pane) = state.terminals.find_active_pane_for_host(&host.id) {
             state.terminals.close_pane(&state.ssh_pool, &pane.id).await;
         }
@@ -1299,11 +1500,8 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
     }
 
     // 查找或自动创建该主机的终端会话（默认 headless=true 无头运行，除非 reveal_ui=true）
-    let pane = if let Some(pid) = pane_id_arg {
-        state
-            .terminals
-            .get_pane(pid)
-            .ok_or_else(|| anyhow!("指定的终端 pane 不存在: {pid}"))?
+    let pane = if let Some(pane) = specified_pane {
+        pane
     } else if let Some(existing) = state.terminals.find_active_pane_for_host(&host.id) {
         existing
     } else {
@@ -1323,8 +1521,6 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
             .terminals
             .get_pane(&created.id)
             .ok_or_else(|| anyhow!("创建终端后获取句柄失败"))?;
-        // 等待远端初始 shell 提示符就绪
-        tokio::time::sleep(Duration::from_millis(450)).await;
         handle
     };
 
@@ -1346,7 +1542,7 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
             if submit {
                 bytes.push(b'\r');
             }
-            pane.send_and_wait(bytes, max_lines, wait_ms).await
+            pane.send_and_wait(bytes, max_lines, wait_ms).await?
         }
         "key" => {
             let raw_input = args
@@ -1375,7 +1571,7 @@ async fn tool_vps_terminal(state: &Arc<AppState>, args: Value) -> Result<Value> 
                 "left" => b"\x1b[D".to_vec(),
                 other => other.as_bytes().to_vec(),
             };
-            pane.send_and_wait(bytes, max_lines, wait_ms).await
+            pane.send_and_wait(bytes, max_lines, wait_ms).await?
         }
         other => return Err(anyhow!("未知的 vps_terminal action: {other}")),
     };
@@ -1402,7 +1598,8 @@ async fn tool_vps_fs(state: &Arc<AppState>, args: Value) -> Result<Value> {
 
     match action {
         "list" => {
-            let listing = files::list_dir(&state.ssh_pool, &state.db, &host.id, Some(path), false).await?;
+            let listing =
+                files::list_dir(&state.ssh_pool, &state.db, &host.id, Some(path), false).await?;
             Ok(json!({
                 "ok": true,
                 "host": host.name,
@@ -1448,7 +1645,10 @@ async fn tool_vps_fs(state: &Arc<AppState>, args: Value) -> Result<Value> {
             Ok(json!({ "ok": true, "host": host.name, "oldPath": path, "newPath": new_path }))
         }
         "remove" => {
-            let is_dir = args.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_dir = args
+                .get("is_dir")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             files::remove_item(&state.ssh_pool, &state.db, &host.id, path, is_dir).await?;
             Ok(json!({ "ok": true, "host": host.name, "removed": path }))
         }
@@ -1591,7 +1791,10 @@ async fn tool_vps_task(
     exec_tasks: &Arc<ExecTaskManager>,
     args: Value,
 ) -> Result<Value> {
-    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list");
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     // 阻塞等待秒数：>0 时等到任务结束或超时再返回，**一次调用**即拿到最终结果，
     // 取代"查询→running→再查询"的轮询（旧设计里 vps_task 无阻塞模式，是死循环的另一半）。
@@ -1625,7 +1828,7 @@ async fn tool_vps_task(
                         }
                     }
                 }
-                Ok(json!({ "ok": true, "task": snap }))
+                Ok(json!({ "ok": snap.state == "completed", "task": snap }))
             } else {
                 let mut t = state
                     .transfers
@@ -1656,14 +1859,12 @@ async fn tool_vps_task(
                         }
                     }
                 }
-                Ok(json!({ "ok": true, "transfer": t }))
+                Ok(json!({ "ok": t.state == "completed", "transfer": t }))
             }
         }
         "cancel" => {
-            let t = exec_tasks
-                .cancel_task(task_id)
-                .ok_or_else(|| anyhow!("未找到可取消的命令任务: {task_id}"))?;
-            Ok(json!({ "ok": true, "task": t }))
+            let t = exec_tasks.cancel_task(task_id).await?;
+            Ok(json!({ "ok": t.state == "cancelled" || t.state == "completed", "task": t }))
         }
         _ => Ok(json!({
             "ok": true,
@@ -1675,7 +1876,11 @@ async fn tool_vps_task(
 
 /// `--mcp-stdio` 本地模式：若常驻主进程正在监听则直接桥接过去（与桌面 UI 共享连接池、探针缓存和终端唤起事件），
 /// 若主进程未运行则在当前进程内直接处理。
-pub async fn run_stdio_bridge(state: Arc<AppState>, exec_tasks: Arc<ExecTaskManager>, port: u16) -> Result<()> {
+pub async fn run_stdio_bridge(
+    state: Arc<AppState>,
+    exec_tasks: Arc<ExecTaskManager>,
+    port: u16,
+) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut lines = tokio::io::BufReader::new(stdin).lines();
 
@@ -1766,6 +1971,7 @@ async fn try_forward_to_daemon(port: u16, api_key: &str, raw_json: &str) -> Opti
 pub struct CliSyncStatus {
     pub exe_path: String,
     pub port: u16,
+    pub env: std::collections::BTreeMap<String, String>,
     pub claude_code_path: String,
     pub claude_code_synced: bool,
     pub codex_path: String,
@@ -1792,12 +1998,22 @@ pub fn sync_cli_mcp_configs(port: u16) -> CliSyncStatus {
     let claude_path = home.join(".claude.json");
     let codex_path = home.join(".codex").join("config.toml");
 
-    let claude_ok = sync_claude_json(&claude_path, &exe_path).unwrap_or(false);
-    let codex_ok = sync_codex_toml(&codex_path, &exe_path).unwrap_or(false);
+    let data_dir = std::path::absolute(crate::resolve_data_dir())
+        .unwrap_or_else(|_| crate::resolve_data_dir());
+    let env = std::collections::BTreeMap::from([
+        ("PORT".to_string(), port.to_string()),
+        (
+            "DATA_DIR".to_string(),
+            data_dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    let claude_ok = sync_claude_json(&claude_path, &exe_path, &env).unwrap_or(false);
+    let codex_ok = sync_codex_toml(&codex_path, &exe_path, &env).unwrap_or(false);
 
     CliSyncStatus {
         exe_path,
         port,
+        env,
         claude_code_path: claude_path.to_string_lossy().to_string(),
         claude_code_synced: claude_ok,
         codex_path: codex_path.to_string_lossy().to_string(),
@@ -1805,7 +2021,11 @@ pub fn sync_cli_mcp_configs(port: u16) -> CliSyncStatus {
     }
 }
 
-fn sync_claude_json(claude_path: &std::path::Path, exe_path: &str) -> Result<bool> {
+fn sync_claude_json(
+    claude_path: &std::path::Path,
+    exe_path: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<bool> {
     if !claude_path.exists() {
         return Ok(false);
     }
@@ -1818,12 +2038,11 @@ fn sync_claude_json(claude_path: &std::path::Path, exe_path: &str) -> Result<boo
     let desired = json!({
         "type": "stdio",
         "command": exe_path,
-        "args": ["--mcp-stdio"]
+        "args": ["--mcp-stdio"],
+        "env": env,
     });
 
-    let mcp_servers = obj
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
+    let mcp_servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
     if let Some(servers_obj) = mcp_servers.as_object_mut() {
         if servers_obj.get("vps-switch") == Some(&desired) {
             return Ok(true);
@@ -1837,20 +2056,22 @@ fn sync_claude_json(claude_path: &std::path::Path, exe_path: &str) -> Result<boo
     Ok(true)
 }
 
-fn sync_codex_toml(codex_path: &std::path::Path, exe_path: &str) -> Result<bool> {
+fn sync_codex_toml(
+    codex_path: &std::path::Path,
+    exe_path: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<bool> {
     if !codex_path.exists() {
         return Ok(false);
     }
     let raw = std::fs::read_to_string(codex_path)?;
     let posix_exe = exe_path.replace('\\', "/");
     let desired_block = format!(
-        "[mcp_servers.vps-switch]\ncommand = \"{}\"\nargs = [\"--mcp-stdio\"]",
-        posix_exe
+        "[mcp_servers.vps-switch]\ncommand = {}\nargs = [\"--mcp-stdio\"]\nenv = {{ DATA_DIR = {}, PORT = {} }}",
+        serde_json::to_string(&posix_exe)?,
+        serde_json::to_string(&env["DATA_DIR"] )?,
+        serde_json::to_string(&env["PORT"] )?,
     );
-
-    if raw.contains(&desired_block) {
-        return Ok(true);
-    }
 
     let updated = if let Some(start_idx) = raw.find("[mcp_servers.vps-switch]") {
         let after_header = start_idx + "[mcp_servers.vps-switch]".len();
@@ -1874,7 +2095,104 @@ fn sync_codex_toml(codex_path: &std::path::Path, exe_path: &str) -> Result<bool>
     };
 
     let tmp_path = codex_path.with_extension("toml.vps-switch-tmp");
+    if updated == std::fs::read_to_string(codex_path)? {
+        return Ok(true);
+    }
     std::fs::write(&tmp_path, updated)?;
     std::fs::rename(&tmp_path, codex_path)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_pid_header_handles_split_frames_and_preserves_command_stderr() {
+        let mut buffer = Vec::new();
+        let mut pending = true;
+        let mut pid = None;
+        let prefix = "\u{1e}vps-exec:test-id:";
+        assert!(consume_remote_pid(
+            &mut buffer,
+            &mut pending,
+            &mut pid,
+            prefix,
+            b"startup warning\n\x1evps-exec:test-id:12"
+        )
+        .is_empty());
+        let output = consume_remote_pid(
+            &mut buffer,
+            &mut pending,
+            &mut pid,
+            prefix,
+            b"34\x1fcommand stderr\n",
+        );
+        assert_eq!(pid, Some(1234));
+        assert!(!pending);
+        assert_eq!(output, b"startup warning\ncommand stderr\n");
+    }
+
+    #[test]
+    fn invalid_remote_pid_does_not_remove_stderr_or_target_a_process_group() {
+        let mut buffer = Vec::new();
+        let mut pending = true;
+        let mut pid = None;
+        let prefix = "\u{1e}vps-exec:test-id:";
+        let mut raw = b"\x1evps-exec:test-id:0\x1f".to_vec();
+        raw.extend(vec![b'A'; 4096]);
+        let output = consume_remote_pid(&mut buffer, &mut pending, &mut pid, prefix, &raw);
+        assert_eq!(output, raw);
+        assert!(pid.is_none());
+        assert!(!pending);
+    }
+
+    #[test]
+    fn output_limit_reports_loss_at_exact_chunk_boundary() {
+        let mut output = vec![b'A'; MAX_OUTPUT_BYTES];
+        append_capped(&mut output, &[]);
+        assert_eq!(output.len(), MAX_OUTPUT_BYTES);
+        append_capped(&mut output, b"lost bytes");
+        assert!(String::from_utf8_lossy(&output).ends_with("[输出超过 1 MiB，已截断]"));
+        let marked_size = output.len();
+        append_capped(&mut output, b"more lost bytes");
+        assert_eq!(output.len(), marked_size);
+    }
+
+    #[test]
+    fn output_limit_marks_crossing_chunk_and_preserves_short_output() {
+        let mut output = "完整 output".as_bytes().to_vec();
+        append_capped(&mut output, b"\n");
+        assert_eq!(String::from_utf8(output).unwrap(), "完整 output\n");
+        let mut output = vec![b'A'; MAX_OUTPUT_BYTES - 2];
+        append_capped(&mut output, b"BCDE");
+        assert_eq!(&output[MAX_OUTPUT_BYTES - 2..MAX_OUTPUT_BYTES], b"BC");
+        assert!(output.len() > MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn cli_configs_keep_daemon_environment_and_neighbor_entries() {
+        let dir = std::env::temp_dir().join(format!("vps-switch-config-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = dir.join("claude.json");
+        let codex = dir.join("codex.toml");
+        std::fs::write(&claude, r#"{"mcpServers":{"other":{"command":"keep"}}}"#).unwrap();
+        std::fs::write(&codex, "model = \"keep\"\n[mcp_servers.vps-switch]\ncommand = \"old\"\nargs = []\n[mcp_servers.other]\ncommand = \"keep\"\n").unwrap();
+        let env = std::collections::BTreeMap::from([
+            ("PORT".to_string(), "18881".to_string()),
+            ("DATA_DIR".to_string(), "C:\\数据\\quoted\"dir".to_string()),
+        ]);
+        sync_claude_json(&claude, "C:\\tools\\vps-switch.exe", &env).unwrap();
+        sync_codex_toml(&codex, "C:\\tools\\vps-switch.exe", &env).unwrap();
+        let json: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+        assert_eq!(json["mcpServers"]["other"]["command"], "keep");
+        assert_eq!(json["mcpServers"]["vps-switch"]["env"], json!(env));
+        let first = std::fs::read_to_string(&codex).unwrap();
+        assert!(first.contains("PORT = \"18881\""));
+        assert!(first.contains(&serde_json::to_string(&env["DATA_DIR"]).unwrap()));
+        assert!(first.contains("[mcp_servers.other]\ncommand = \"keep\""));
+        sync_codex_toml(&codex, "C:\\tools\\vps-switch.exe", &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&codex).unwrap(), first);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

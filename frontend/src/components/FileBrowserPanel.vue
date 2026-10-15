@@ -124,7 +124,7 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 // 可点击的面包屑分段：如 /root/123 -> [/] [root] [123]；本机 Windows -> [此电脑] [C:] [Users]
 const breadcrumbs = computed<BreadcrumbSegment[]>(() => {
   const p = currentPath.value.trim();
-  const isLocalWin = props.host.kind === 'local';
+  const isLocalWin = props.host.kind === 'local' && props.host.osInfo?.os === 'windows';
 
   if (isLocalWin) {
     const crumbs: BreadcrumbSegment[] = [{ label: '此电脑', path: 'drives' }];
@@ -510,7 +510,19 @@ async function saveFileEditor() {
 
 function triggerDownload(item: FileEntry) {
   if (item.isDir) return;
-  // 改走带断点续传的传输引擎（见 openInlineAction('download')），不再用浏览器直下
+  if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(window.location.hostname)) {
+    // 公网 Web 的本机是浏览器所在机器，交付给浏览器自身的流式下载链路。
+    const params = new URLSearchParams({ hostId: props.host.id, path: item.path });
+    const link = document.createElement('a');
+    link.href = `/api/files/download?${params}`;
+    link.download = item.name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    ensureTransferPolling();
+    emit('toast', `已发起下载 ${item.name}，请在浏览器下载列表中查看`);
+    return;
+  }
   openInlineAction('download', item);
 }
 
