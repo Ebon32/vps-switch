@@ -288,9 +288,11 @@ impl ExecTaskManager {
             if Instant::now() >= deadline {
                 let mut g = inner.lock().unwrap();
                 if g.state == "running" {
+                    // 只交代现状与"一次等待"的入口，绝不暗示反复查询：旧文案（"请使用 vps_task 查询后续输出"）
+                    // 会让 agent 陷入 vps_task 轮询死循环（vps_task 无阻塞模式、返回里也没有终止信号）。
                     g.hint = Some(format!(
-                        "命令运行超过 {} 秒尚未结束，已自动转入后台运行。请使用 vps_task(task_id: \"{}\") 查询后续输出或终止。",
-                        wait_seconds, g.id
+                        "命令在 {} 秒内未结束，仍在后台运行（taskId: {}，ok=false 表示未完成、并非失败）。需要结果时调用一次 vps_task(action:\"get\", task_id:\"{}\", wait_seconds:N) 等待其结束即可；不需要结果可直接忽略，不要反复查询。",
+                        wait_seconds, g.id, g.id
                     ));
                 }
                 return Ok(g.snapshot());
@@ -305,31 +307,52 @@ async fn run_local_exec_task(
     cancel_rx: &mut oneshot::Receiver<()>,
 ) {
     use tokio::io::AsyncReadExt;
-    let encoded = windows_ps_encoded_payload(cmd);
-    let mut ps_cmd = tokio::process::Command::new("powershell.exe");
-    ps_cmd
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            encoded.as_str(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
-    ps_cmd.creation_flags(0x08000000);
+    let mut child = {
+        let encoded = windows_ps_encoded_payload(cmd);
+        let mut ps_cmd = tokio::process::Command::new("powershell.exe");
+        ps_cmd
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded.as_str(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        ps_cmd.creation_flags(0x08000000);
+        match ps_cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let mut g = inner.lock().unwrap();
+                g.state = "failed".to_string();
+                g.stderr
+                    .extend_from_slice(format!("启动本机 PowerShell 失败: {e}").as_bytes());
+                g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+                return;
+            }
+        }
+    };
 
-    let mut child = match ps_cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let mut g = inner.lock().unwrap();
-            g.state = "failed".to_string();
-            g.stderr
-                .extend_from_slice(format!("启动本机 PowerShell 失败: {e}").as_bytes());
-            g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
-            return;
+    #[cfg(not(windows))]
+    let mut child = {
+        let mut sh_cmd = tokio::process::Command::new("sh");
+        sh_cmd
+            .args(["-c", cmd])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        match sh_cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let mut g = inner.lock().unwrap();
+                g.state = "failed".to_string();
+                g.stderr
+                    .extend_from_slice(format!("启动本地 Shell 失败: {e}").as_bytes());
+                g.ended_ms = Some(g.started_inst.elapsed().as_millis() as u64);
+                return;
+            }
         }
     };
 
@@ -374,6 +397,8 @@ async fn run_local_exec_task(
 
     let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
     let mut g = inner.lock().unwrap();
+    // 命令已结束：清掉超时期间写下的"仍在后台运行"提示，否则完成态还挂着过期 hint
+    g.hint = None;
     g.exit_code = Some(code);
     g.state = if code == 0 {
         "completed".to_string()
@@ -561,6 +586,8 @@ async fn run_ssh_exec_task(
                 } else {
                     "failed".to_string()
                 };
+                // 终态清掉超时期间写下的"仍在后台运行"提示
+                g.hint = None;
             }
             None => {
                 // 没拿到远端退出码就不能声称成功：连接中断与"服务端未上报退出码"都如实报失败
@@ -641,7 +668,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "vps_exec",
-            "description": "在一台或多台 VPS 上并发执行非交互式命令（直接传主机名如 'vip-hk'）。若在 wait_seconds 内完成则同步返回 stdout/stderr/exitCode；若超时未完则自动转入后台并返回 taskId；若检测到命令卡在 [Y/n] 等交互提问超过 2 秒会自动早退提醒改用 vps_terminal。命令会先过本机命令黑名单，命中不可逆灾难（如 rm -rf /、mkfs、格式化盘）即直接拒绝执行、不产生任何输出——名单文件是 data/deny-list.txt，被拦时不要换写法重试，直接告诉用户哪条被拦。",
+            "description": "在一台或多台 VPS 上并发执行非交互式命令（直接传主机名如 'vip-hk'）。若在 wait_seconds 内完成则同步返回 stdout/stderr/exitCode（ok=true）；若超时未完则返回 state=running、ok=false 与 taskId（表示未完成、不是失败），此时若需要结果，用**一次** vps_task(action:'get', task_id, wait_seconds:N) 等待其结束即可，不要反复查询；若检测到命令卡在 [Y/n] 等交互提问超过 2 秒会自动早退提醒改用 vps_terminal。命令会先过本机命令黑名单，命中不可逆灾难（如 rm -rf /、mkfs、格式化盘）即直接拒绝执行、不产生任何输出——名单文件是 data/deny-list.txt，被拦时不要换写法重试，直接告诉用户哪条被拦。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -789,7 +816,7 @@ pub fn mcp_tool_definitions() -> Value {
                     },
                     "wait_seconds": {
                         "type": "integer",
-                        "description": "同步等待秒数（默认 25）；超大文件若超时未传完则转入后台并返回 transferId"
+                        "description": "同步等待秒数（默认 25）；超大文件若超时未传完则返回 transferId（未完成），需要结果时用一次 vps_task 的 wait_seconds 等待，不要反复查询"
                     }
                 },
                 "required": ["direction"]
@@ -797,7 +824,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "vps_task",
-            "description": "查询或取消正在后台运行的命令任务（exec_...）或大文件传输任务（tr_...）。",
+            "description": "查询或取消正在后台运行的命令任务（exec_...）或大文件传输任务（tr_...）。action='get' 时可传 wait_seconds 阻塞等待任务结束——**一次调用**即拿到最终结果；不要用反复 get 来轮询（既慢又会一直跑下去）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -809,12 +836,75 @@ pub fn mcp_tool_definitions() -> Value {
                     "task_id": {
                         "type": "string",
                         "description": "exec_... 或 tr_... 任务 ID"
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "description": "action='get' 时阻塞等待任务结束的秒数（默认 0 立即返回；建议需要结果时传一个上限，如 120，一次拿到最终结果）"
                     }
                 },
                 "required": ["action"]
             }
         }
     ])
+}
+
+/// 从 MCP 调用参数里取目标主机标签（用于留痕）：优先 host，其次 source_host/target_host，再其次 hosts 列表。
+fn mcp_call_host_label(args: &Value) -> Option<String> {
+    for key in ["host", "source_host", "target_host"] {
+        if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    if let Some(arr) = args.get("hosts").and_then(|v| v.as_array()) {
+        let joined = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+/// 给一条 MCP 调用结果生成简短摘要（exec 类给出 state/exit/输出头，其余给裁剪后的 JSON）。
+fn mcp_result_summary(val: &Value) -> String {
+    fn one(r: &Value) -> String {
+        let state = r.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        let code = r.get("exitCode").and_then(|v| v.as_i64());
+        let out = r
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| r.get("stderr").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let head: String = out.trim().chars().take(200).collect();
+        format!("state={state} exit={code:?} out={head}")
+    }
+    if let Some(r) = val.get("result") {
+        return one(r);
+    }
+    if let Some(arr) = val.get("results").and_then(|v| v.as_array()) {
+        let states: Vec<String> = arr
+            .iter()
+            .map(|r| {
+                r.get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        return format!("{} 台: {}", arr.len(), states.join(","));
+    }
+    if let Some(t) = val.get("task").or_else(|| val.get("transfer")) {
+        return one(t);
+    }
+    let s = serde_json::to_string(val).unwrap_or_default();
+    s.chars().take(300).collect()
 }
 
 pub async fn handle_mcp_request(
@@ -856,41 +946,59 @@ pub async fn handle_mcp_request(
                 .params
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
             let args = req
                 .params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
-            match dispatch_tool_call(state, exec_tasks, tool_name, args).await {
+            // 全程留痕：MCP 是外部 agent 唯一能下达命令的通道，每一次调用都在这里落库
+            // （工具、目标主机、参数、成败、耗时、结果摘要）。内部执行（探针/tar/reg 等）不记。
+            let args_json = serde_json::to_string(&args).unwrap_or_default();
+            let host_label = mcp_call_host_label(&args);
+            let started = Instant::now();
+
+            let outcome = dispatch_tool_call(state, exec_tasks, &tool_name, args).await;
+            let (payload, record_ok, summary) = match outcome {
                 Ok(val) => {
                     let text = serde_json::to_string_pretty(&val).unwrap_or_default();
-                    Some(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": text }],
-                            "isError": false
-                        }
-                    }))
+                    let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let summary = format!("ok={ok} {}", mcp_result_summary(&val));
+                    (
+                        json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+                        ok,
+                        summary,
+                    )
                 }
                 Err(err) => {
-                    let text = json!({
-                        "ok": false,
-                        "error": format!("{err:#}")
-                    })
-                    .to_string();
-                    Some(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": text }],
-                            "isError": true
-                        }
-                    }))
+                    let msg = format!("{err:#}");
+                    let text = json!({ "ok": false, "error": msg }).to_string();
+                    (
+                        json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
+                        false,
+                        format!("error: {msg}"),
+                    )
                 }
+            };
+
+            if let Err(e) = state.db.record_mcp_call(
+                &tool_name,
+                host_label.as_deref(),
+                &args_json,
+                record_ok,
+                started.elapsed().as_millis() as u64,
+                &summary,
+            ) {
+                tracing::warn!("写入 MCP 调用记录失败: {e:#}");
             }
+
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": payload
+            }))
         }
         _ => Some(json!({
             "jsonrpc": "2.0",
@@ -1115,7 +1223,9 @@ async fn tool_vps_exec(
             .exec_with_wait(state, &targets[0], &command, wait_seconds)
             .await?;
         return Ok(json!({
-            "ok": snap.state == "completed" || snap.state == "running",
+            // 未完成（running / interactive_stall）一律 ok=false：旧值把 running 也算成功，
+            // 配合"去轮询"的 hint 让 agent 以为一切正常、继续等下去。
+            "ok": snap.state == "completed",
             "result": snap,
         }));
     }
@@ -1147,8 +1257,10 @@ async fn tool_vps_exec(
         .collect()
         .await;
 
+    // 多机：全部 completed 才算 ok；有仍在跑的（超时转后台）如实报 false。
+    let all_done = results.iter().all(|r| r.state == "completed");
     Ok(json!({
-        "ok": true,
+        "ok": all_done,
         "results": results,
     }))
 }
@@ -1411,10 +1523,10 @@ async fn tool_vps_transfer(state: &Arc<AppState>, args: Value) -> Result<Value> 
             Err(_) => {
                 let latest = state.transfers.list_tasks(Some(&dst_host.id));
                 return Ok(json!({
-                    "ok": true,
+                    "ok": false,
                     "state": "running_in_background",
                     "transfer": latest.first(),
-                    "hint": "大文件仍在高速传输中，可用 vps_task 查询实时进度与速率。"
+                    "hint": "大文件仍在后台传输（未完成，ok=false 并非失败）。需要结果时调用一次 vps_task(action:\"get\", task_id:<transferId>, wait_seconds:N) 等待其结束即可；不需要可直接忽略，不要反复查询。"
                 }));
             }
         }
@@ -1464,11 +1576,11 @@ async fn tool_vps_transfer(state: &Arc<AppState>, args: Value) -> Result<Value> 
         Err(_) => {
             let latest = state.transfers.list_tasks(Some(&host.id));
             Ok(json!({
-                "ok": true,
+                "ok": false,
                 "host": host.name,
                 "state": "running_in_background",
                 "transfer": latest.first(),
-                "hint": "大文件仍在后台满速传输中，请用 vps_task 查询进度（若连续 12 秒无字节推进将由看门狗自动中断报错）。"
+                "hint": "大文件仍在后台传输（未完成，ok=false 并非失败）。需要结果时调用一次 vps_task(action:\"get\", task_id:<transferId>, wait_seconds:N) 等待其结束即可；不需要可直接忽略，不要反复查询（若连续 12 秒无字节推进将由看门狗自动中断报错）。"
             }))
         }
     }
@@ -1481,21 +1593,69 @@ async fn tool_vps_task(
 ) -> Result<Value> {
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    // 阻塞等待秒数：>0 时等到任务结束或超时再返回，**一次调用**即拿到最终结果，
+    // 取代"查询→running→再查询"的轮询（旧设计里 vps_task 无阻塞模式，是死循环的另一半）。
+    let wait_seconds = args
+        .get("wait_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(600);
 
     match action {
         "get" => {
             if task_id.starts_with("exec_") {
-                let t = exec_tasks
+                let mut snap = exec_tasks
                     .get_task(task_id)
                     .ok_or_else(|| anyhow!("未找到命令任务: {task_id}"))?;
-                Ok(json!({ "ok": true, "task": t }))
+                if wait_seconds > 0 && snap.state == "running" {
+                    let deadline = Instant::now() + Duration::from_secs(wait_seconds);
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        match exec_tasks.get_task(task_id) {
+                            Some(s) => {
+                                snap = s;
+                                if snap.state != "running" {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                }
+                Ok(json!({ "ok": true, "task": snap }))
             } else {
-                let t = state
+                let mut t = state
                     .transfers
                     .list_tasks(None)
                     .into_iter()
                     .find(|x| x.id == task_id)
                     .ok_or_else(|| anyhow!("未找到传输任务: {task_id}"))?;
+                if wait_seconds > 0 && t.state == "running" {
+                    let deadline = Instant::now() + Duration::from_secs(wait_seconds);
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        match state
+                            .transfers
+                            .list_tasks(None)
+                            .into_iter()
+                            .find(|x| x.id == task_id)
+                        {
+                            Some(s) => {
+                                t = s;
+                                if t.state != "running" {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                }
                 Ok(json!({ "ok": true, "transfer": t }))
             }
         }

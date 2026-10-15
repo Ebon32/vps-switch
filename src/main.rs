@@ -47,10 +47,13 @@ struct EmbeddedFrontend;
 /// 就用另一套库（机器上真出现过两套互不相干的库 + 不同密钥，API Key 因此对不上、
 /// stdio 桥接 401）。统一到一处，杜绝分叉。
 fn resolve_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     if let Ok(appdata) = std::env::var("APPDATA") {
         return PathBuf::from(appdata).join("vps-switch").join("data");
     }
-    // 没有 APPDATA（非 Windows）时退回当前目录
+    // Linux / 容器环境下默认落在当前目录下的 data
     PathBuf::from("data")
 }
 
@@ -285,6 +288,14 @@ fn main() -> Result<()> {
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         info!("vps-switch headless server listening on http://{addr}");
+        if let Ok(settings) = state.db.get_app_settings() {
+            if settings.auth_enabled {
+                info!(
+                    "Web 登录保护已启用：账号「{}」，初次部署初始密码为「vps-switch」",
+                    settings.admin_username
+                );
+            }
+        }
         axum::serve(listener, app).await?;
         Ok::<(), anyhow::Error>(())
     })

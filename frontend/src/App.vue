@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import BrandLogo from './components/BrandLogo.vue';
 import OsBadge from './components/OsBadge.vue';
 import HostDetailDrawer from './components/HostDetailDrawer.vue';
@@ -104,6 +104,19 @@ const savingMcp = ref(false);
 const guardContent = ref('');
 const guardPath = ref('');
 const savingGuard = ref(false);
+
+// MCP 调用记录（全程留痕）：外部 agent 经 MCP 通道的每一次调用
+type McpCallRecord = {
+  ts: string;
+  tool: string;
+  host: string | null;
+  args: string;
+  ok: boolean;
+  durationMs: number;
+  summary: string;
+};
+const mcpCalls = ref<McpCallRecord[]>([]);
+const loadingMcpCalls = ref(false);
 
 const mcpStatus = ref<{
   exePath: string;
@@ -410,6 +423,38 @@ async function saveGuardList() {
   }
 }
 
+async function loadMcpCalls() {
+  loadingMcpCalls.value = true;
+  try {
+    const res = await fetch('/api/mcp-calls?limit=200');
+    if (res.status === 401) {
+      authenticated.value = false;
+      return;
+    }
+    const data = await res.json();
+    if (data.ok) {
+      mcpCalls.value = Array.isArray(data.calls) ? data.calls : [];
+    }
+  } catch {
+    // ignore
+  } finally {
+    loadingMcpCalls.value = false;
+  }
+}
+
+// 把 RFC3339 时间戳显示成本地「MM-DD HH:MM:SS」
+function formatCallTime(ts: string): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// 切到「MCP Server」分类时自动拉取调用记录
+watch(activeSettingsTab, (tab) => {
+  if (tab === 'mcp') void loadMcpCalls();
+});
+
 async function loadAutostartSettings() {
   try {
     const res = await fetch('/api/system/autostart');
@@ -537,6 +582,9 @@ async function saveMcpSettings(regenerateKey = false) {
 }
 
 async function saveAuthSettings() {
+  if (settingAdminPassword.value.trim().length > 0) {
+    settingAuthEnabled.value = true;
+  }
   savingAuth.value = true;
   try {
     const res = await fetch('/api/settings/auth', {
@@ -2114,6 +2162,82 @@ onBeforeUnmount(() => {
             一行一条，<code class="font-mono">#</code> 起头是注释。<code class="font-mono">*</code> 通配，没有 <code class="font-mono">*</code> 就是精确匹配，按词边界匹配（<code class="font-mono">rm -rf /</code> 不会误伤 <code class="font-mono">rm -rf /var/log</code>）。判定前会剥引号、转小写，并把 <code class="font-mono">-r -f</code> 与 <code class="font-mono">-fr</code> 视作等价。这份名单防手滑，不防蓄意绕过。
           </p>
         </section>
+
+        <!-- 板块 3：MCP 调用记录（全程留痕） -->
+        <section
+          class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
+        >
+          <div class="flex items-start justify-between gap-3 border-b border-zinc-100 pb-3.5 dark:border-zinc-800">
+            <div>
+              <h3 class="text-sm font-semibold">MCP 调用记录</h3>
+              <p class="mt-0.5 text-xs text-zinc-400">
+                外部 agent 经 MCP 通道的每一次调用都在此留痕（工具、目标主机、参数、成败、耗时、结果摘要）。只记 MCP 这条链，内部执行不入库
+              </p>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 rounded-lg bg-zinc-900 px-3 py-1 text-[11px] font-medium text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+              :disabled="loadingMcpCalls"
+              @click="loadMcpCalls"
+            >
+              {{ loadingMcpCalls ? '刷新中…' : '刷新' }}
+            </button>
+          </div>
+
+          <div
+            v-if="mcpCalls.length === 0"
+            class="rounded-xl border border-dashed border-zinc-200 py-8 text-center text-xs text-zinc-400 dark:border-zinc-800"
+          >
+            暂无调用记录
+          </div>
+
+          <div v-else class="overflow-x-auto">
+            <table class="w-full border-collapse text-left text-[11px]">
+              <thead>
+                <tr class="text-zinc-400">
+                  <th class="py-2 pr-3 font-medium whitespace-nowrap">时间</th>
+                  <th class="py-2 pr-3 font-medium">工具</th>
+                  <th class="py-2 pr-3 font-medium">主机</th>
+                  <th class="py-2 pr-3 font-medium">结果</th>
+                  <th class="py-2 pr-3 font-medium whitespace-nowrap">耗时</th>
+                  <th class="py-2 pr-3 font-medium">参数 / 摘要</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(c, i) in mcpCalls"
+                  :key="i"
+                  class="border-t border-zinc-100 align-top dark:border-zinc-800"
+                >
+                  <td class="py-2 pr-3 font-mono whitespace-nowrap text-zinc-500">{{ formatCallTime(c.ts) }}</td>
+                  <td class="py-2 pr-3 font-mono text-zinc-800 dark:text-zinc-200">{{ c.tool }}</td>
+                  <td class="py-2 pr-3 text-zinc-600 dark:text-zinc-300">{{ c.host || '—' }}</td>
+                  <td class="py-2 pr-3">
+                    <span
+                      class="rounded-md px-1.5 py-0.5 font-medium whitespace-nowrap"
+                      :class="
+                        c.ok
+                          ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400'
+                          : 'bg-red-50 text-red-600 dark:bg-red-950/50 dark:text-red-400'
+                      "
+                    >
+                      {{ c.ok ? '成功' : '失败' }}
+                    </span>
+                  </td>
+                  <td class="py-2 pr-3 font-mono whitespace-nowrap text-zinc-500">{{ c.durationMs }}ms</td>
+                  <td class="py-2 pr-3">
+                    <div class="max-w-[440px] truncate font-mono text-zinc-600 dark:text-zinc-300" :title="c.args">
+                      {{ c.args }}
+                    </div>
+                    <div class="mt-0.5 max-w-[440px] truncate text-zinc-400" :title="c.summary">
+                      {{ c.summary }}
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
       </div>
 
       <!-- 分类 2：访问安全 (Security) -->
@@ -2124,14 +2248,14 @@ onBeforeUnmount(() => {
         >
           <div class="flex items-center justify-between border-b border-zinc-100 pb-3.5 dark:border-zinc-800">
             <div>
-              <h3 class="text-sm font-semibold">Web 登录鉴权与账号密码</h3>
+              <h3 class="text-sm font-semibold">Web 登录鉴权</h3>
               <p class="text-xs text-zinc-400">
-                本机运行可保持关闭免登录直进；部署在 VPS 公网环境时请开启登录保护
+                Windows 本机免密直进；VPS 公网部署默认开启密码，防止未授权访问
               </p>
             </div>
             <label class="inline-flex items-center gap-2 cursor-pointer">
               <span class="text-xs font-medium text-zinc-600 dark:text-zinc-300">
-                {{ settingAuthEnabled ? '需要密码登录' : '本机免登录' }}
+                开启密码
               </span>
               <input
                 v-model="settingAuthEnabled"
@@ -2190,7 +2314,7 @@ onBeforeUnmount(() => {
                   </span>
                 </div>
                 <p class="text-xs text-zinc-400">
-                  轻量级 VPS 管理工具与 MCP Server · 概念数少于 1Shell · 零模型调用
+                  轻量级 VPS 管理工具与 MCP Server · 极简原生 · 零模型调用
                 </p>
               </div>
             </div>
@@ -2259,16 +2383,12 @@ onBeforeUnmount(() => {
           </div>
 
           <!-- 系统运行信息条目 -->
-          <div class="grid gap-2.5 sm:grid-cols-2 text-xs">
+          <div class="grid gap-2.5 text-xs">
             <div class="rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
               <div class="text-[11px] font-medium text-zinc-400">本地服务监听</div>
               <div class="mt-1 font-mono font-semibold">127.0.0.1:{{ appAbout?.port || 18800 }}</div>
             </div>
             <div class="rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
-              <div class="text-[11px] font-medium text-zinc-400">技术选型与底座</div>
-              <div class="mt-1 font-mono text-[11px]">Rust + russh + alacritty_terminal + Wry/Tao + Vue 3</div>
-            </div>
-            <div class="sm:col-span-2 rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
               <div class="flex items-center justify-between">
                 <div class="text-[11px] font-medium text-zinc-400">可执行文件绝对路径</div>
                 <button
@@ -2281,10 +2401,10 @@ onBeforeUnmount(() => {
                 </button>
               </div>
               <div class="mt-1 font-mono text-[11px] truncate text-zinc-600 dark:text-zinc-300">
-                {{ appAbout?.exePath || 'E:\\1shell4.7\\vps-switch\\target\\release\\vps-switch.exe' }}
+                {{ appAbout?.exePath || 'vps-switch.exe' }}
               </div>
             </div>
-            <div class="sm:col-span-2 flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
+            <div class="flex items-center justify-between rounded-xl border border-zinc-200/70 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-800/40">
               <div>
                 <div class="text-xs font-semibold">GitHub 官方私有仓库</div>
                 <div class="mt-0.5 font-mono text-[11px] text-zinc-400">https://github.com/weidu12123/vps-switch</div>

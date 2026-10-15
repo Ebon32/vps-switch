@@ -805,17 +805,34 @@ fn spawn_local_conpty_pane(
         })
         .context("创建本机 ConPTY 失败")?;
 
-    let mut cmd = CommandBuilder::new("powershell.exe");
-    let init_hook = r#"$global:__vps_orig_prompt = $function:prompt; function global:prompt { $ec = if ($?) { 0 } else { if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 } }; $p = ($executionContext.SessionState.Path.CurrentLocation.Path -replace '\\','/'); [Console]::Write("$([char]27)]133;D;$ec$([char]7)$([char]27)]7;file://localhost/$p$([char]7)$([char]27)]133;A$([char]7)"); & $global:__vps_orig_prompt }"#;
-    cmd.args(["-NoLogo", "-NoExit", "-Command", init_hook]);
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("TERM_PROGRAM", "vps-switch");
+    #[cfg(windows)]
+    let cmd = {
+        let mut c = CommandBuilder::new("powershell.exe");
+        let init_hook = r#"$global:__vps_orig_prompt = $function:prompt; function global:prompt { $ec = if ($?) { 0 } else { if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 } }; $p = ($executionContext.SessionState.Path.CurrentLocation.Path -replace '\\','/'); [Console]::Write("$([char]27)]133;D;$ec$([char]7)$([char]27)]7;file://localhost/$p$([char]7)$([char]27)]133;A$([char]7)"); & $global:__vps_orig_prompt }"#;
+        c.args(["-NoLogo", "-NoExit", "-Command", init_hook]);
+        c.env("TERM", "xterm-256color");
+        c.env("TERM_PROGRAM", "vps-switch");
+        if let Some(ref cwd) = initial_cwd {
+            c.cwd(cwd);
+        } else if let Ok(home) = std::env::var("USERPROFILE") {
+            c.cwd(home);
+        }
+        c
+    };
 
-    if let Some(ref cwd) = initial_cwd {
-        cmd.cwd(cwd);
-    } else if let Ok(home) = std::env::var("USERPROFILE") {
-        cmd.cwd(home);
-    }
+    #[cfg(not(windows))]
+    let cmd = {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let mut c = CommandBuilder::new(shell);
+        c.env("TERM", "xterm-256color");
+        c.env("TERM_PROGRAM", "vps-switch");
+        if let Some(ref cwd) = initial_cwd {
+            c.cwd(cwd);
+        } else if let Ok(home) = std::env::var("HOME") {
+            c.cwd(home);
+        }
+        c
+    };
 
     let mut child = pair
         .slave

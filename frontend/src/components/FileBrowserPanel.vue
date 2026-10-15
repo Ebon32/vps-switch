@@ -121,7 +121,7 @@ const inlinePrompt = ref<{
 const transfers = ref<TransferTask[]>([]);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-// 可点击的面包屑分段：如 /root/123 -> [/] [root] [123]；本机 Windows -> [此电脑] [E:] [1shell4.7]
+// 可点击的面包屑分段：如 /root/123 -> [/] [root] [123]；本机 Windows -> [此电脑] [C:] [Users]
 const breadcrumbs = computed<BreadcrumbSegment[]>(() => {
   const p = currentPath.value.trim();
   const isLocalWin = props.host.kind === 'local';

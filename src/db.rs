@@ -16,6 +16,16 @@ use std::{
 };
 use uuid::Uuid;
 
+/// 把字符串截断到最多 `max` 个字符（按 char 边界），超出补省略号。
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
     master_key: MasterKey,
@@ -103,7 +113,18 @@ impl Database {
              CREATE TABLE IF NOT EXISTS settings (
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS mcp_calls (
+                 id TEXT PRIMARY KEY,
+                 ts TEXT NOT NULL,
+                 tool TEXT NOT NULL,
+                 host TEXT,
+                 args TEXT NOT NULL DEFAULT '',
+                 ok INTEGER NOT NULL DEFAULT 0,
+                 duration_ms INTEGER NOT NULL DEFAULT 0,
+                 summary TEXT NOT NULL DEFAULT ''
+             );
+             CREATE INDEX IF NOT EXISTS idx_mcp_calls_ts ON mcp_calls(ts);",
         )?;
         // 兼容升级已有数据库：安全添加 favorited 列
         let _ = conn.execute(
@@ -828,19 +849,100 @@ impl Database {
         Ok(())
     }
 
+    /// 记录一次 MCP 工具调用（全程留痕：工具、目标主机、参数、成败、耗时、结果摘要）。
+    /// 只覆盖 MCP 这条链——这是外部 agent 唯一能下达命令的通道，其余内部执行不入库。
+    pub fn record_mcp_call(
+        &self,
+        tool: &str,
+        host: Option<&str>,
+        args: &str,
+        ok: bool,
+        duration_ms: u64,
+        summary: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
+        conn.execute(
+            "INSERT INTO mcp_calls (id, ts, tool, host, args, ok, duration_ms, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                Utc::now().to_rfc3339(),
+                tool,
+                host,
+                clip(args, 4000),
+                if ok { 1 } else { 0 },
+                duration_ms as i64,
+                clip(summary, 2000),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 读取最近的 MCP 调用记录（倒序），供界面/排查查看。
+    pub fn list_mcp_calls(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
+        let mut stmt = conn.prepare(
+            "SELECT ts, tool, host, args, ok, duration_ms, summary
+             FROM mcp_calls ORDER BY ts DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit.clamp(1, 1000)], |r| {
+                Ok(serde_json::json!({
+                    "ts": r.get::<_, String>(0)?,
+                    "tool": r.get::<_, String>(1)?,
+                    "host": r.get::<_, Option<String>>(2)?,
+                    "args": r.get::<_, String>(3)?,
+                    "ok": r.get::<_, i64>(4)? != 0,
+                    "durationMs": r.get::<_, i64>(5)?,
+                    "summary": r.get::<_, String>(6)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn get_app_settings(&self) -> Result<AppSettings> {
-        let auth_enabled = self
-            .get_setting("auth_enabled")?
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let admin_username = self
-            .get_setting("admin_username")?
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "admin".to_string());
-        let has_admin_password = self
-            .get_setting("admin_password_enc")?
-            .filter(|s| !s.is_empty())
-            .is_some();
+        let is_vps_mode = !cfg!(windows)
+            || std::env::var("HOST")
+                .map(|h| h == "0.0.0.0")
+                .unwrap_or(false);
+
+        let auth_enabled = match self.get_setting("auth_enabled")? {
+            Some(v) => v == "true",
+            None => {
+                // Windows 本机默认关闭，VPS/Linux 部署（或绑定 0.0.0.0）默认开启
+                let default_enabled = is_vps_mode;
+                let _ = self.set_setting("auth_enabled", if default_enabled { "true" } else { "false" });
+                default_enabled
+            }
+        };
+
+        let admin_username = match self.get_setting("admin_username")? {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                let u = "admin".to_string();
+                let _ = self.set_setting("admin_username", &u);
+                u
+            }
+        };
+
+        let has_admin_password = match self.get_setting("admin_password_enc")? {
+            Some(s) if !s.is_empty() => true,
+            _ => {
+                // 若是 VPS 部署且从未设置过密码，自动初始化一个初始密码 "vps-switch"
+                if is_vps_mode {
+                    if let Ok(Some(enc)) = self.master_key.encrypt("vps-switch") {
+                        let _ = self.set_setting("admin_password_enc", &enc);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+        };
+
         let mcp_enabled = self
             .get_setting("mcp_enabled")?
             .map(|v| v != "false")
@@ -885,18 +987,24 @@ impl Database {
             }
         }
 
-        if auth_enabled {
+        let mut final_auth_enabled = auth_enabled;
+        if new_password.filter(|s| !s.is_empty()).is_some() {
+            // 输入并设置了新密码，自动开启密码保护
+            final_auth_enabled = true;
+        }
+
+        if final_auth_enabled {
             let has_pwd = self
                 .get_setting("admin_password_enc")?
                 .filter(|s| !s.is_empty())
                 .is_some();
             if !has_pwd {
-                return Err(anyhow!("开启登录保护前请先设置管理员密码"));
+                return Err(anyhow!("开启密码前请先设置管理员密码"));
             }
         }
 
         self.set_setting("admin_username", clean_user)?;
-        self.set_setting("auth_enabled", if auth_enabled { "true" } else { "false" })?;
+        self.set_setting("auth_enabled", if final_auth_enabled { "true" } else { "false" })?;
         self.get_app_settings()
     }
 

@@ -234,7 +234,10 @@ impl InspectorEngine {
         host_id: &str,
     ) -> Result<HostInspection> {
         if host_id == LOCAL_HOST_ID {
+            #[cfg(windows)]
             let ins = self.inspect_local_windows().await?;
+            #[cfg(not(windows))]
+            let ins = self.inspect_local_linux().await?;
             self.latest_snapshots
                 .lock()
                 .unwrap()
@@ -564,6 +567,16 @@ impl InspectorEngine {
         let out = cmd.output().await?;
         let text = String::from_utf8_lossy(&out.stdout);
         let (ins, _) = self.parse_windows_inspection_text(LOCAL_HOST_ID, &text)?;
+        Ok(ins)
+    }
+
+    #[cfg(not(windows))]
+    async fn inspect_local_linux(&self) -> Result<HostInspection> {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", LINUX_INSPECT_SCRIPT]);
+        let out = cmd.output().await?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (ins, _) = self.parse_linux_inspection(LOCAL_HOST_ID, &text)?;
         Ok(ins)
     }
 

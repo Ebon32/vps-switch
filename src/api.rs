@@ -67,6 +67,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/api/settings/auth", put(api_update_auth_settings))
         .route("/api/settings/mcp", put(api_update_mcp_settings))
         .route("/api/guard", get(api_get_guard).put(api_update_guard))
+        .route("/api/mcp-calls", get(api_list_mcp_calls))
         .route("/api/events", get(api_sse_events))
         .route("/api/hosts", get(list_hosts).post(create_host))
         .route("/api/hosts/reorder", put(reorder_hosts))
@@ -1093,10 +1094,8 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
 fn is_request_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     let auth_enabled = state
         .db
-        .get_setting("auth_enabled")
-        .ok()
-        .flatten()
-        .map(|v| v == "true")
+        .get_app_settings()
+        .map(|s| s.auth_enabled)
         .unwrap_or(false);
     if !auth_enabled {
         return true;
@@ -1322,7 +1321,6 @@ async fn api_get_about(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             "exePath": exe_path,
             "port": state.port,
             "githubUrl": "https://github.com/weidu12123/vps-switch",
-            "stack": "Rust (Axum + russh + alacritty_terminal + Wry/Tao) + Vue 3",
         })),
     )
 }
@@ -1566,6 +1564,24 @@ async fn api_mcp_rpc(
     match handle_mcp_request(&state, &state.exec_tasks, req).await {
         Some(val) => (StatusCode::OK, Json(val)).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct McpCallsQuery {
+    limit: Option<i64>,
+}
+
+/// 读取最近的 MCP 调用记录（全程留痕的查看口）。
+async fn api_list_mcp_calls(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<McpCallsQuery>,
+) -> impl IntoResponse {
+    match state.db.list_mcp_calls(q.limit.unwrap_or(200)) {
+        Ok(calls) => (StatusCode::OK, Json(json!({ "ok": true, "calls": calls }))).into_response(),
+        Err(e) => {
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")).into_response()
+        }
     }
 }
 
