@@ -52,9 +52,9 @@ VPS Switch 是一个本地优先的主机管理工具。它集成了终端、文
 前往 [**GitHub Releases**](https://github.com/weidu12123/vps-switch/releases/latest) 获取最新版本：
 
 ### Windows
-- **`vps-switch-0.1.0-windows-x64-setup.exe`（推荐）**：标准向导安装程序，自动配置快捷方式与系统环境变量。
+- **`vps-switch-0.1.0-windows-x64-setup.exe`（推荐）**：标准向导安装程序，自动配置开始菜单与桌面快捷方式。
 - **`vps-switch-0.1.0-windows-x64-portable.zip`**：免安装绿色便携版，解压后双击 `vps-switch.exe` 即可使用。
-- **`vps-switch-0.1.0-x86_64.msi`**：Windows 原生 MSI 包，适合命令行自动化部署。
+- **`vps-switch-0.1.0-x86_64.msi`**：Windows 原生 MSI 包，适合命令行自动化部署（会把安装目录加进系统 PATH）。
 
 > *Windows 首次运行提示：因未购买商业代码签名证书，Windows SmartScreen 可能会提示“未知发布者”，点击「更多信息」→「仍要运行」即可正常使用。*
 
@@ -90,11 +90,15 @@ sudo systemctl enable --now vps-switch
 
 ```bash
 # 本机模式
-claude mcp add vps-switch http://127.0.0.1:18800/mcp
+claude mcp add --transport http --scope user vps-switch http://127.0.0.1:18800/mcp
 
-# 远端模式（附带 API Key）
-claude mcp add vps-switch http://<服务器IP>:18800/mcp -H "x-vps-switch-key: YOUR_API_KEY"
+# 远端模式（附带 API Key，走 Authorization: Bearer）
+claude mcp add --transport http --scope user vps-switch http://<服务器IP>:18800/mcp \
+  -H "Authorization: Bearer YOUR_API_KEY"
 ```
+
+> `--transport http` 不能省：不写时 `claude mcp add` 按 stdio 处理，会把 URL 当成命令。
+> 远端鉴权只认 `Authorization: Bearer <KEY>` 与 `X-API-Key: <KEY>` 两种头，可在设置页复制现成的配置 JSON。
 
 ### Agent 可调用的核心工具
 
@@ -112,8 +116,69 @@ claude mcp add vps-switch http://<服务器IP>:18800/mcp -H "x-vps-switch-key: Y
 
 ## 技术架构
 
-- **后端**：Rust 2021 + Tokio + Axum（单一常驻进程，内存占用 ~30MB）
+- **后端**：Rust 2021 + Tokio + Axum（单一常驻进程）
 - **SSH 底座**：纯异步 `russh` 0.63 + `russh-sftp`（单主机多 channel 复用与跳板机穿透）
 - **终端引擎**：`alacritty_terminal` 权威网格 + 随包 Windows ConPTY + 二进制 WebSocket
 - **前端**：Vue 3 + TypeScript + Tailwind CSS + xterm.js + CodeMirror 6
 - **本地存储**：单文件 SQLite（`rusqlite` bundled）+ 关键凭据 AES-GCM 本地加密
+
+### 内存占用
+
+#### Linux 无头部署（实测，Ubuntu 24.04 / 8 核）
+
+| 状态 | RSS |
+|---|---|
+| 空闲常驻 | **9.7 MB** |
+| 一次本机探针之后 | 10.4 MB |
+| 并发 8 条大输出命令之后 | 39.7 MB |
+| 打开无头终端 pane 之后 | 41.2 MB |
+
+空闲基线就是 10 MB 上下，这也是把 VPS Switch 当常驻服务跑在 128 MB 小机器上仍然宽裕的原因。
+
+第三行的涨幅来自命令输出缓冲：每条任务 stdout/stderr 各留最多 1 MiB，且**结果会刻意留在任务表里**
+（agent 之后要能取回），所以并发大输出之后不会立刻回落——这是取舍，不是泄漏。
+
+> 顺带一提：`top` 的 VIRT 列会显示几百 MB 到 1 GB，那是地址空间不是内存占用（线程栈与
+> 预留缓冲），看 RSS 即可。
+
+#### Windows 桌面（实测）
+
+| 状态 | 提交内存 |
+|---|---|
+| 开机自启 / 启动即最小化，窗口从未打开 | **0 个 WebView2 进程**，后端 5 MB |
+| 窗口打开 | WebView2 约 197 MB |
+| 关闭到托盘 | WebView2 约 180 MB |
+
+窗口一旦创建就会拉起一整套 WebView2（Chromium），这是 WebView 壳的固定开销，不是后端占的。
+所以做了两件事把它压到最小：
+
+- **启动即最小化时不创建 WebView**，点开才建——开机自启后躺在托盘里的常态因此只占几 MB；
+- **关到托盘时把 WebView2 切到低内存档**（`ICoreWebView2_19::SetMemoryUsageTargetLevel`），
+  实测再降 10–20%，且页面不重载，标签页与终端现场都保留。
+
+所以"它占多少内存"取决于窗口开着还是躺在托盘里——后者才是它绝大多数时间的状态。
+如果完全不要这个壳，Linux 无头部署那条路是 10 MB。
+
+
+---
+
+## 从源码构建
+
+仓库里不含构建产物，直接 `cargo build` 会失败（`frontend/dist` 与随包的 ConPTY 二进制都不入库）。
+
+```bash
+# 1. 前端：先产出 frontend/dist（RustEmbed 在编译期读取它，缺了会编译报错）
+cd frontend
+pnpm install
+pnpm build
+cd ..
+
+# 2. 随包的 Windows ConPTY：从 Windows Terminal 发布包取这两个文件放到仓库根目录
+#    （portable-pty 按 DLL 搜索顺序从 exe 同级目录加载 conpty.dll）
+#    conpty.dll  OpenConsole.exe
+
+# 3. 后端
+cargo build --release        # 产物在 target/release/vps-switch.exe
+```
+
+Linux 无头版只需 `cargo build --release`，前端已内嵌进单一二进制。

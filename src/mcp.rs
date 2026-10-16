@@ -139,6 +139,10 @@ pub struct ExecTaskManager {
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// 任务表保留上限，超出后按开始时间淘汰最旧的已完成任务
 const MAX_TASKS: usize = 60;
+/// 任务表里 stdout + stderr 缓冲的合计上限。
+/// 单任务最多 2 MiB，60 个全在跑就是 120 MiB——而"一次 fan-out 到整支机队"正是这个工具的
+/// 主打用法。所以条数之外再压一道字节预算，超了就淘汰最旧的**已结束**任务。
+const MAX_TOTAL_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 fn append_capped(buf: &mut Vec<u8>, chunk: &[u8]) {
     if buf.len() > MAX_OUTPUT_BYTES || chunk.is_empty() {
@@ -158,26 +162,33 @@ impl ExecTaskManager {
         Self::default()
     }
 
-    /// 淘汰最旧的已完成任务，保证长驻进程的任务表不会无界增长
+    /// 淘汰最旧的已完成任务，保证长驻进程的任务表不会无界增长。
+    /// 两个上限任一超标就淘汰，且**只淘汰已结束的任务**——跑着的绝不动，
+    /// 所以极端情况下（几十个任务同时还在跑）字节数仍可能短暂超预算，这是刻意的取舍：
+    /// 宁可短暂占多一点，也不掐掉正在执行的任务。
     fn evict_old_finished(&self, map: &mut HashMap<String, Arc<Mutex<ExecTaskInner>>>) {
-        if map.len() <= MAX_TASKS {
+        let mut total_bytes = 0usize;
+        let mut finished: Vec<(Instant, String, usize)> = Vec::new();
+        for (id, task) in map.iter() {
+            let guard = task.lock().unwrap();
+            let bytes = guard.stdout.len() + guard.stderr.len();
+            total_bytes += bytes;
+            if guard.state != "running" {
+                finished.push((guard.started_inst, id.clone(), bytes));
+            }
+        }
+        if map.len() <= MAX_TASKS && total_bytes <= MAX_TOTAL_BUFFER_BYTES {
             return;
         }
-        let mut finished: Vec<(Instant, String)> = map
-            .iter()
-            .filter_map(|(id, task)| {
-                let guard = task.lock().unwrap();
-                if guard.state == "running" {
-                    None
-                } else {
-                    Some((guard.started_inst, id.clone()))
-                }
-            })
-            .collect();
-        finished.sort();
-        let remove_n = map.len().saturating_sub(MAX_TASKS);
-        for (_, id) in finished.into_iter().take(remove_n) {
+        finished.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut removed = 0usize;
+        for (_, id, bytes) in finished {
+            if map.len() - removed <= MAX_TASKS && total_bytes <= MAX_TOTAL_BUFFER_BYTES {
+                break;
+            }
             map.remove(&id);
+            removed += 1;
+            total_bytes = total_bytes.saturating_sub(bytes);
         }
     }
 

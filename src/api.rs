@@ -32,9 +32,9 @@ use serde_json::json;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
@@ -47,7 +47,9 @@ pub struct AppState {
     pub transfers: Arc<TransferManager>,
     pub inspector: Arc<InspectorEngine>,
     pub exec_tasks: Arc<ExecTaskManager>,
-    pub sessions: Mutex<HashSet<String>>,
+    /// 已签发的 Web 会话令牌 → 签发时刻。用 map 而不是 set 是为了能按 TTL 淘汰：
+    /// 之前只增不删，而且每次保存鉴权设置都会再塞一个，长驻进程里会一直涨。
+    pub sessions: Mutex<HashMap<String, Instant>>,
     pub port: u16,
     /// 服务是否绑在本机回环。绑回环时 MCP 端点免 API Key（本机优先，对齐 1Shell）；
     /// 只有真正对外部署（HOST=0.0.0.0）时才强制校验 Key。
@@ -1056,6 +1058,25 @@ async fn api_clear_transfers(State(state): State<Arc<AppState>>) -> impl IntoRes
 // ==================== 登录鉴权、设置页与 MCP JSON-RPC 2.0 端点 ====================
 
 const SESSION_COOKIE_NAME: &str = "vps_switch_session";
+/// Web 会话有效期，与登录 Cookie 的 Max-Age 对齐（30 天）。
+const SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// 登记新令牌，顺手淘汰过期会话——所有签发入口都走这里，保证会话表不会无界增长。
+fn register_session(state: &AppState, token: String) {
+    let mut sessions = state.sessions.lock().unwrap();
+    sessions.retain(|_, issued| issued.elapsed() < SESSION_TTL);
+    sessions.insert(token, Instant::now());
+}
+
+fn session_is_valid(state: &AppState, token: &str) -> bool {
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .get(token)
+        .map(|issued| issued.elapsed() < SESSION_TTL)
+        .unwrap_or(false)
+}
 
 fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers
@@ -1093,7 +1114,7 @@ fn is_request_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(token) = extract_session_token(headers) else {
         return false;
     };
-    state.sessions.lock().unwrap().contains(&token)
+    session_is_valid(state, &token)
 }
 
 async fn require_web_auth(
@@ -1146,7 +1167,7 @@ async fn api_auth_login(
                 Uuid::new_v4().simple(),
                 Uuid::new_v4().simple()
             );
-            state.sessions.lock().unwrap().insert(token.clone());
+            register_session(&state, token.clone());
             let cookie = format!(
                 "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
             );
@@ -1440,7 +1461,7 @@ async fn api_update_auth_settings(
                 Uuid::new_v4().simple(),
                 Uuid::new_v4().simple()
             );
-            state.sessions.lock().unwrap().insert(token.clone());
+            register_session(&state, token.clone());
             let cookie = format!(
                 "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
             );

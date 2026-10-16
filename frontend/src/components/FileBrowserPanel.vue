@@ -55,7 +55,20 @@ const emit = defineEmits<{
   expandFull: [];
   toggleDetail: [];
   toast: [text: string, kind?: 'ok' | 'err'];
+  /// 会话失效（401）：面板自己没有登录态，交给 App.vue 跳回登录页
+  sessionExpired: [];
 }>();
+
+/// 面板里所有请求都走这里：401 表示会话已失效（服务重启会清空内存里的会话表），
+/// 交给父组件处理，别在这里弹一句看不懂的"读取目录失败"就完事。
+async function apiFetch(input: string, init?: RequestInit): Promise<Response | null> {
+  const res = await fetch(input, init);
+  if (res.status === 401) {
+    emit('sessionExpired');
+    return null;
+  }
+  return res;
+}
 
 const currentPath = ref('');
 const pathInput = ref('');
@@ -120,6 +133,9 @@ const inlinePrompt = ref<{
 // 实时传输队列
 const transfers = ref<TransferTask[]>([]);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+/// 连续多少次拉取传输队列失败就放弃轮询（见 fetchTransfers）
+const MAX_POLL_FAILURES = 5;
+let pollFailures = 0;
 
 // 可点击的面包屑分段：如 /root/123 -> [/] [root] [123]；本机 Windows -> [此电脑] [C:] [Users]
 const breadcrumbs = computed<BreadcrumbSegment[]>(() => {
@@ -219,7 +235,8 @@ async function prefetchDir(targetPath: string | null | undefined) {
   inflightPrefetch.add(key);
   try {
     const url = `/api/files/list?hostId=${encodeURIComponent(hostId)}&path=${encodeURIComponent(targetPath)}`;
-    const res = await fetch(url);
+    const res = await apiFetch(url);
+    if (!res) return;
     const data = await res.json();
     if (data.ok) {
       storeDirCache(hostId, targetPath, {
@@ -323,7 +340,8 @@ async function loadDir(
   try {
     const refreshParam = opts.forceRefresh ? '&refresh=true' : '';
     const url = `/api/files/list?hostId=${encodeURIComponent(hostId)}&path=${encodeURIComponent(reqPath)}${refreshParam}`;
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await apiFetch(url, { signal: controller.signal });
+    if (!res) return;
     const data = await res.json();
     if (seq !== navSeq) return;
 
@@ -364,7 +382,7 @@ async function handleCompress(item: FileEntry) {
   busyActionPath.value = item.path;
   emit('toast', `正在压缩 ${item.name}...`);
   try {
-    const res = await fetch('/api/files/compress', {
+    const res = await apiFetch('/api/files/compress', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -372,6 +390,7 @@ async function handleCompress(item: FileEntry) {
         path: item.path,
       }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       emit('toast', data.error || '压缩失败', 'err');
@@ -394,7 +413,7 @@ async function handleExtract(item: FileEntry) {
   busyActionPath.value = item.path;
   emit('toast', `正在解压 ${item.name}...`);
   try {
-    const res = await fetch('/api/files/extract', {
+    const res = await apiFetch('/api/files/extract', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -402,6 +421,7 @@ async function handleExtract(item: FileEntry) {
         path: item.path,
       }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       emit('toast', data.error || '解压失败', 'err');
@@ -418,24 +438,35 @@ async function handleExtract(item: FileEntry) {
   }
 }
 
+function stopTransferPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
 async function fetchTransfers() {
   try {
-    const res = await fetch(`/api/transfers?hostId=${encodeURIComponent(props.host.id)}`);
+    const res = await apiFetch(`/api/transfers?hostId=${encodeURIComponent(props.host.id)}`);
+    if (!res) return;
     const data = await res.json();
     if (data.ok && Array.isArray(data.tasks)) {
+      pollFailures = 0;
       transfers.value = data.tasks;
       const hasRunning = data.tasks.some((t: TransferTask) => t.state === 'running');
-      if (!hasRunning && pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
+      if (!hasRunning) stopTransferPolling();
+      return;
     }
+    // 拿到非 ok（会话过期 401 / 后端重启 500）不能让 350ms 的定时器一直打下去：
+    // 旧写法只在成功分支里 clear，出错时这个循环会以约 3 req/s 永远轮询下去。
+    if (++pollFailures >= MAX_POLL_FAILURES) stopTransferPolling();
   } catch {
-    // ignore
+    if (++pollFailures >= MAX_POLL_FAILURES) stopTransferPolling();
   }
 }
 
 function ensureTransferPolling() {
+  pollFailures = 0;
   void fetchTransfers();
   if (pollTimer) return;
   pollTimer = setInterval(() => {
@@ -444,7 +475,7 @@ function ensureTransferPolling() {
 }
 
 async function clearCompletedTransfers() {
-  await fetch('/api/transfers', { method: 'DELETE' });
+  await apiFetch('/api/transfers', { method: 'DELETE' });
   await fetchTransfers();
 }
 
@@ -464,7 +495,8 @@ async function openFileEditor(item: FileEntry) {
   editorLoading.value = true;
   try {
     const url = `/api/files/read?hostId=${encodeURIComponent(props.host.id)}&path=${encodeURIComponent(item.path)}`;
-    const res = await fetch(url);
+    const res = await apiFetch(url);
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       emit('toast', data.error || '打开文件失败', 'err');
@@ -484,7 +516,7 @@ async function saveFileEditor() {
   if (!editorPath.value || editorSaving.value) return;
   editorSaving.value = true;
   try {
-    const res = await fetch('/api/files/write', {
+    const res = await apiFetch('/api/files/write', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -493,6 +525,7 @@ async function saveFileEditor() {
         content: editorContent.value,
       }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       emit('toast', data.error || '保存失败', 'err');
@@ -548,10 +581,11 @@ async function uploadFiles(fileList: FileList | File[]) {
       size: String(file.size),
     });
     try {
-      const res = await fetch(`/api/files/upload?${q.toString()}`, {
+      const res = await apiFetch(`/api/files/upload?${q.toString()}`, {
         method: 'POST',
         body: file,
       });
+      if (!res) return;
       const data = await res.json();
       if (!data.ok) {
         emit('toast', `${file.name} 上传失败: ${data.error}`, 'err');
@@ -622,7 +656,7 @@ async function submitInlineAction() {
     if (act.kind === 'mkdir') {
       if (!val) return;
       const target = joinPath(currentPath.value, val);
-      const res = await fetch('/api/files/mkdir', {
+      const res = await apiFetch('/api/files/mkdir', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -630,6 +664,7 @@ async function submitInlineAction() {
           path: target,
         }),
       });
+      if (!res) return;
       const data = await res.json();
       if (!data.ok) throw new Error(data.error);
       highlightTarget = target;
@@ -637,7 +672,7 @@ async function submitInlineAction() {
     } else if (act.kind === 'touch') {
       if (!val) return;
       const newPath = joinPath(currentPath.value, val);
-      const res = await fetch('/api/files/write', {
+      const res = await apiFetch('/api/files/write', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -646,6 +681,7 @@ async function submitInlineAction() {
           content: '',
         }),
       });
+      if (!res) return;
       const data = await res.json();
       if (!data.ok) throw new Error(data.error);
       highlightTarget = newPath;
@@ -656,7 +692,7 @@ async function submitInlineAction() {
         return;
       }
       const newPath = joinPath(currentPath.value, val);
-      const res = await fetch('/api/files/rename', {
+      const res = await apiFetch('/api/files/rename', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -665,12 +701,13 @@ async function submitInlineAction() {
           newPath,
         }),
       });
+      if (!res) return;
       const data = await res.json();
       if (!data.ok) throw new Error(data.error);
       highlightTarget = newPath;
       emit('toast', `已重命名为 ${val}`);
     } else if (act.kind === 'delete' && act.target) {
-      const res = await fetch('/api/files/remove', {
+      const res = await apiFetch('/api/files/remove', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -679,6 +716,7 @@ async function submitInlineAction() {
           isDir: act.target.isDir,
         }),
       });
+      if (!res) return;
       const data = await res.json();
       if (!data.ok) throw new Error(data.error);
       if (editorPath.value === act.target.path) {
@@ -686,7 +724,7 @@ async function submitInlineAction() {
       }
       emit('toast', `已删除 ${act.target.name}`);
     } else if (act.kind === 'download' && act.target) {
-      const res = await fetch('/api/transfers', {
+      const res = await apiFetch('/api/transfers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -696,6 +734,7 @@ async function submitInlineAction() {
           remotePath: act.target.path,
         }),
       });
+      if (!res) return;
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || '发起下载失败');
       inlinePrompt.value = null;

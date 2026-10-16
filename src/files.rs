@@ -536,6 +536,23 @@ pub async fn rename_item(
     Ok(())
 }
 
+/// 是否是"根"这类不该被当作普通目标处理的路径：POSIX 的 `/`，Windows 的盘符根
+/// （`C:` / `C:/` / `C:\`），以及 `.` / `..`。
+///
+/// 判据：统一斜杠、去掉尾部斜杠之后，要么为空（`/`、`//`、空串），要么就是一个盘符。
+/// 此前只挡了字面量 `"/"`，而 Windows 上文件管理器的"此电脑"会把盘符当条目列出来
+/// （`list_local_dir` 返回 `C:/`），删除按钮对每一行都渲染，于是能一路走到
+/// `remove_dir_all("C:/")`。
+fn is_root_like(path: &str) -> bool {
+    let t = path.trim().replace('\\', "/");
+    let t = t.trim_end_matches('/');
+    if t.is_empty() || t == "." || t == ".." {
+        return true;
+    }
+    let b = t.as_bytes();
+    b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
+}
+
 pub async fn remove_item(
     pool: &SshPool,
     db: &Database,
@@ -543,8 +560,8 @@ pub async fn remove_item(
     target_path: &str,
     is_dir: bool,
 ) -> Result<()> {
-    if target_path == "/" || target_path.trim().is_empty() {
-        return Err(anyhow!("禁止删除根目录"));
+    if is_root_like(target_path) {
+        return Err(anyhow!("禁止删除根目录或当前目录（{target_path}）"));
     }
     if host_id == LOCAL_HOST_ID {
         if is_dir {
@@ -651,8 +668,9 @@ pub async fn compress_item(
     target_path: &str,
 ) -> Result<String> {
     let clean = target_path.trim_end_matches(['/', '\\']);
-    if clean.is_empty() || clean == "/" || clean == "drives" {
-        return Err(anyhow!("不能直接压缩根目录"));
+    // "drives" 是 Windows 上"此电脑"那个虚拟层，不是真实目录
+    if is_root_like(clean) || clean == "drives" {
+        return Err(anyhow!("不能直接压缩根目录或当前目录"));
     }
 
     if host_id == LOCAL_HOST_ID {
@@ -1199,6 +1217,63 @@ pub async fn transfer_local_remote_file(
             .into_iter()
             .find(|t| t.id == task_id)
             .ok_or_else(|| anyhow!("读取传输任务状态失败"))
+    } else if host_id == LOCAL_HOST_ID {
+        // 本机主机上的「下载」就是本机内部复制：源和目标都在本机。
+        // 此前这里没有本机分支，直接去开 SFTP——而本机主机的 addr 是 127.0.0.1、port 是 0，
+        // 于是必然失败（实测 "SSH 连接失败: 请求的地址无效 (os error 10049)"），本机文件
+        // 永远下载不下来。这里复用同一套流式引擎（临时文件 + 残片对账续传 + 原子替换 +
+        // SHA-256 闭环），只把「读远端」换成「读本机文件」。
+        let src = PathBuf::from(remote_path);
+        let meta = tokio::fs::metadata(&src)
+            .await
+            .with_context(|| format!("本机源文件不存在: {remote_path}"))?;
+        let total = meta.len();
+        let filename = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download.bin")
+            .to_string();
+
+        let dest = PathBuf::from(local_path);
+        let dest_dir = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let dest_name = dest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("无效的本机落点: {local_path}"))?
+            .to_string();
+
+        let task_id = transfers.create_task(
+            host_id,
+            &host.name,
+            "download",
+            &filename,
+            Some(local_path.to_string()),
+            remote_path,
+            total,
+        );
+        let src_file = tokio::fs::File::open(&src).await?;
+        stream_upload_to_host(
+            pool,
+            db,
+            transfers,
+            &task_id,
+            LOCAL_HOST_ID,
+            &dest_dir,
+            &dest_name,
+            total,
+            src_file,
+        )
+        .await?;
+
+        transfers
+            .list_tasks(None)
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .ok_or_else(|| anyhow!("读取传输任务状态失败"))
     } else {
         use sha2::{Digest, Sha256};
         let sftp = pool.get_or_open_sftp(db, host_id).await?;
@@ -1451,4 +1526,33 @@ pub async fn transfer_remote_to_remote(
         .into_iter()
         .find(|t| t.id == task_id)
         .ok_or_else(|| anyhow!("读取跨主机传输任务状态失败"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 必须拦下：删掉就不可逆的"根"类目标。
+    /// `C:/` 那几条是实测过的漏洞——文件管理器把盘符当条目列出来，删除按钮对每行都渲染，
+    /// 旧判定只挡字面量 `"/"`，于是能一路走到 `remove_dir_all("C:/")`。
+    #[test]
+    fn root_like_targets_are_rejected() {
+        for p in [
+            "/", "//", "///", "", "   ", ".", "..", "./", "../", "C:", "C:/", "C:\\", "c:/",
+            "D:\\", " Z: ",
+        ] {
+            assert!(is_root_like(p), "应判为根但放过了: {p:?}");
+        }
+    }
+
+    /// 必须放行：正常目录与文件。误拦这些，文件管理器就没法用了。
+    #[test]
+    fn ordinary_paths_are_not_root_like() {
+        for p in [
+            "/etc", "/var/log/nginx.old", "/root", "C:/Users", "C:/Users/x/file.txt",
+            "E:/1shell4.7/vps-switch", "./build", "../sibling", "drives", "a:/x", "/dev",
+        ] {
+            assert!(!is_root_like(p), "误判为根: {p:?}");
+        }
+    }
 }

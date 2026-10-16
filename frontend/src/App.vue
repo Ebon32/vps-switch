@@ -25,6 +25,9 @@ interface OpenSessionTab {
   rightWing: RightWingMode;
   splitDirection: 'row' | 'col';
   panes: PaneMeta[];
+  /// 建 pane 失败时的原因。留在标签上，让舞台能渲染成"失败 + 重试"，
+  /// 而不是永远转着"正在连接"（独立窗口模式下没有标签栏，转圈就是死路）。
+  error?: string | null;
 }
 
 // 独立系统终端原生窗口模式判定 (?standalone=1&hostId=...)
@@ -124,6 +127,8 @@ const loadingMcpCalls = ref(false);
 const expandedCallId = ref<string | null>(null);
 const callDetail = ref<{ args: string; result: string } | null>(null);
 const loadingCallDetail = ref(false);
+/// 详情请求的序号：快速点两行时，先发的请求后到会把后一行的正文盖掉（同 loadDir 的 navSeq）
+let callDetailSeq = 0;
 const MCP_CALL_LIMIT = 500;
 const mcpCallFilters = ref({ from: '', to: '', host: '', tool: '', ok: '' });
 const mcpCallFiltered = computed(
@@ -173,7 +178,6 @@ const updateStatus = ref<{
   publishedAt?: string;
   releaseNotes?: string;
   releaseUrl?: string;
-  message?: string;
 }>({
   checking: false,
   checked: false,
@@ -374,13 +378,30 @@ async function handleLogout() {
   activePage.value = 'workspace';
 }
 
+/// 所有受保护的后端请求都走这里：401 表示会话已失效，直接退回登录页。
+/// 之前只有三处处理 401，其余把 401 当普通错误弹个 toast 就算了——而会话表存在内存里，
+/// **服务每次重启都会清空**，所以开了登录保护时这不是边缘情况：用户会停在一个已经死掉的
+/// 工作台里，点什么都没反应。返回 null 表示请求已作废，调用方 `if (!res) return;` 即可。
+async function apiFetch(input: string, init?: RequestInit): Promise<Response | null> {
+  const res = await fetch(input, init);
+  if (res.status === 401) {
+    authenticated.value = false;
+    activePage.value = 'workspace';
+    return null;
+  }
+  return res;
+}
+
+/// 子面板（文件管理器等）发现会话失效时调这里，走同一条回登录页的路
+function handleSessionExpired() {
+  authenticated.value = false;
+  activePage.value = 'workspace';
+}
+
 async function loadSettings() {
   try {
-    const res = await fetch('/api/settings');
-    if (res.status === 401) {
-      authenticated.value = false;
-      return;
-    }
+    const res = await apiFetch('/api/settings');
+    if (!res) return;
     const data = await res.json();
     if (data.ok && data.settings) {
       const s = data.settings;
@@ -411,7 +432,8 @@ async function loadSettings() {
 
 async function loadGuardList() {
   try {
-    const res = await fetch('/api/guard');
+    const res = await apiFetch('/api/guard');
+    if (!res) return;
     const data = await res.json();
     if (data.ok) {
       guardContent.value = data.content || '';
@@ -425,11 +447,12 @@ async function loadGuardList() {
 async function saveGuardList() {
   savingGuard.value = true;
   try {
-    const res = await fetch('/api/guard', {
+    const res = await apiFetch('/api/guard', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: guardContent.value }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       showToast(data.error || '保存命令黑名单失败', 'err');
@@ -460,11 +483,8 @@ async function loadMcpCalls() {
     if (f.tool) q.set('tool', f.tool);
     if (f.ok) q.set('ok', f.ok);
 
-    const res = await fetch(`/api/mcp-calls?${q.toString()}`);
-    if (res.status === 401) {
-      authenticated.value = false;
-      return;
-    }
+    const res = await apiFetch(`/api/mcp-calls?${q.toString()}`);
+    if (!res) return;
     const data = await res.json();
     if (data.ok) {
       mcpCalls.value = Array.isArray(data.calls) ? data.calls : [];
@@ -493,16 +513,20 @@ async function toggleCall(id: string) {
   expandedCallId.value = id;
   callDetail.value = null;
   loadingCallDetail.value = true;
+  const seq = ++callDetailSeq;
   try {
-    const res = await fetch(`/api/mcp-calls/${encodeURIComponent(id)}`);
+    const res = await apiFetch(`/api/mcp-calls/${encodeURIComponent(id)}`);
+    if (!res) return;
     const data = await res.json();
+    // 迟到的响应属于上一行，丢弃——否则展开的是 B，显示的却是 A 的参数与返回
+    if (seq !== callDetailSeq) return;
     if (data.ok && data.call) {
       callDetail.value = { args: data.call.args || '', result: data.call.result || '' };
     }
   } catch {
     // ignore
   } finally {
-    loadingCallDetail.value = false;
+    if (seq === callDetailSeq) loadingCallDetail.value = false;
   }
 }
 
@@ -525,7 +549,8 @@ watch(activeSettingsTab, (tab) => {
 
 async function loadAutostartSettings() {
   try {
-    const res = await fetch('/api/system/autostart');
+    const res = await apiFetch('/api/system/autostart');
+    if (!res) return;
     const data = await res.json();
     if (data.ok) {
       autostartEnabled.value = Boolean(data.autostart);
@@ -542,7 +567,7 @@ async function saveAutostartSettings() {
   const prevCloseAction = closeAction.value;
   savingAutostart.value = true;
   try {
-    const res = await fetch('/api/system/autostart', {
+    const res = await apiFetch('/api/system/autostart', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -550,6 +575,7 @@ async function saveAutostartSettings() {
         closeAction: closeAction.value,
       }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       autostartEnabled.value = prevAutostart;
@@ -571,7 +597,8 @@ async function saveAutostartSettings() {
 
 async function loadAboutInfo() {
   try {
-    const res = await fetch('/api/system/about');
+    const res = await apiFetch('/api/system/about');
+    if (!res) return;
     const data = await res.json();
     if (data.ok) {
       appAbout.value = data;
@@ -585,7 +612,8 @@ async function loadAboutInfo() {
 async function checkAppUpdate() {
   updateStatus.value.checking = true;
   try {
-    const res = await fetch('/api/system/check-update', { method: 'POST' });
+    const res = await apiFetch('/api/system/check-update', { method: 'POST' });
+    if (!res) return;
     const data = await res.json();
     if (data.ok) {
       updateStatus.value = {
@@ -597,7 +625,6 @@ async function checkAppUpdate() {
         publishedAt: data.publishedAt,
         releaseNotes: data.releaseNotes,
         releaseUrl: data.releaseUrl,
-        message: data.message,
       };
       if (data.hasUpdate) {
         showToast(`发现新版本 ${data.latestVersion}！`);
@@ -605,7 +632,17 @@ async function checkAppUpdate() {
         showToast('当前已是最新版本');
       }
     } else {
-      showToast('检查更新失败', 'err');
+      // 后端在失败分支返回的是 error（不是 message），且带着 gh 的原始 stdout/stderr 与退出码——
+      // 只回一句"检查更新失败"等于把唯一有用的排查信息丢了。
+      const detail = data.error || data.stderr || '';
+      updateStatus.value = {
+        checking: false,
+        checked: true,
+        hasUpdate: false,
+        currentVersion: data.currentVersion || updateStatus.value.currentVersion,
+        latestVersion: data.latestVersion || updateStatus.value.currentVersion,
+      };
+      showToast(detail ? `检查更新失败: ${detail}` : '检查更新失败', 'err');
     }
   } catch (e) {
     showToast(`检查更新出错: ${(e as Error).message}`, 'err');
@@ -620,7 +657,7 @@ async function saveMcpSettings(regenerateKey = false) {
   const prevRequireKey = mcpRequireApiKey.value;
   savingMcp.value = true;
   try {
-    const res = await fetch('/api/settings/mcp', {
+    const res = await apiFetch('/api/settings/mcp', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -629,6 +666,7 @@ async function saveMcpSettings(regenerateKey = false) {
         regenerateKey,
       }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       mcpEnabled.value = prevEnabled;
@@ -655,7 +693,7 @@ async function saveAuthSettings() {
   }
   savingAuth.value = true;
   try {
-    const res = await fetch('/api/settings/auth', {
+    const res = await apiFetch('/api/settings/auth', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -664,6 +702,7 @@ async function saveAuthSettings() {
         password: settingAdminPassword.value || undefined,
       }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       showToast(data.error || '保存登录设置失败', 'err');
@@ -684,7 +723,8 @@ async function saveAuthSettings() {
 
 async function triggerCliSync() {
   try {
-    const res = await fetch('/api/mcp/status', { method: 'POST' });
+    const res = await apiFetch('/api/mcp/status', { method: 'POST' });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok || !data.status) {
       showToast(data.error || '写入本机 CLI 配置失败', 'err');
@@ -804,11 +844,8 @@ function subscribeUiEvents() {
 async function fetchHosts() {
   loading.value = true;
   try {
-    const res = await fetch('/api/hosts');
-    if (res.status === 401) {
-      authenticated.value = false;
-      return;
-    }
+    const res = await apiFetch('/api/hosts');
+    if (!res) return;
     const data = await res.json();
     if (data.ok && Array.isArray(data.hosts)) {
       hosts.value = data.hosts;
@@ -823,8 +860,8 @@ async function fetchHosts() {
 
 async function restoreExistingTerminals() {
   try {
-    const res = await fetch('/api/terminals');
-    if (!res.ok) return;
+    const res = await apiFetch('/api/terminals');
+    if (!res || !res.ok) return;
     const data = await res.json();
     if (!data.ok || !Array.isArray(data.panes)) return;
     const byHost = new Map<string, PaneMeta[]>();
@@ -869,9 +906,10 @@ async function checkSingleHost(host: PublicHost) {
   next.add(host.id);
   checkingIds.value = next;
   try {
-    const res = await fetch(`/api/hosts/${encodeURIComponent(host.id)}/check`, {
+    const res = await apiFetch(`/api/hosts/${encodeURIComponent(host.id)}/check`, {
       method: 'POST',
     });
+    if (!res) return;
     const data = await res.json();
     if (data.ok && data.host) {
       replaceHostInList(data.host);
@@ -900,7 +938,8 @@ async function checkAllHosts() {
   checkingAll.value = true;
   showToast('正在并发探索全部主机在线状态与实时硬件快照...');
   try {
-    const res = await fetch('/api/hosts/check-all', { method: 'POST' });
+    const res = await apiFetch('/api/hosts/check-all', { method: 'POST' });
+    if (!res) return;
     const data = await res.json();
     if (data.ok && Array.isArray(data.hosts)) {
       hosts.value = data.hosts;
@@ -946,7 +985,7 @@ async function createPaneForTab(tab: OpenSessionTab, cwd?: string | null) {
   paneCreationInFlight.add(tab.hostId);
   paneCreationCount.value += 1;
   try {
-    const res = await fetch('/api/terminals', {
+    const res = await apiFetch('/api/terminals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -956,22 +995,35 @@ async function createPaneForTab(tab: OpenSessionTab, cwd?: string | null) {
         cwd: cwd || undefined,
       }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok || !data.pane) {
-      showToast(data.error || '启动终端失败', 'err');
+      // 建不出来就把原因留在标签上，交给舞台渲染成"连接失败 + 重试"。
+      // 旧行为只弹一次 toast 就 return，panes 永远是空，舞台就一直转"正在连接"——
+      // 主机离线、密码错、会话过期都会撞上，独立窗口模式下连标签栏都没有，无路可退。
+      tab.error = (data.error as string) || '启动终端失败';
+      showToast(tab.error, 'err');
       return;
     }
+    tab.error = null;
     tab.panes.push(data.pane as PaneMeta);
     const host = hostById(tab.hostId);
     if (host && host.status !== 'online') {
       host.status = 'online';
     }
   } catch (e) {
-    showToast(`启动终端失败: ${(e as Error).message}`, 'err');
+    tab.error = `启动终端失败: ${(e as Error).message}`;
+    showToast(tab.error, 'err');
   } finally {
     paneCreationInFlight.delete(tab.hostId);
     paneCreationCount.value = Math.max(0, paneCreationCount.value - 1);
   }
+}
+
+/// 舞台上的「重试」按钮：清掉失败态后重新建 pane
+async function retryPaneForTab(tab: OpenSessionTab) {
+  tab.error = null;
+  await createPaneForTab(tab);
 }
 
 async function activateSessionTab(tab: OpenSessionTab) {
@@ -1006,11 +1058,12 @@ async function closeSessionTab(hostId: string) {
 
 async function handlePopoutTerminal(hostId: string) {
   try {
-    const res = await fetch('/api/window/open-terminal', {
+    const res = await apiFetch('/api/window/open-terminal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hostId }),
     });
+    if (!res) return;
     const data = await res.json();
     if (data.ok) {
       const h = hostById(hostId);
@@ -1133,11 +1186,12 @@ async function handleReconnectPane(paneId: string) {
   paneCreationInFlight.add(tab.hostId);
   paneCreationCount.value += 1;
   try {
-    const res = await fetch('/api/terminals', {
+    const res = await apiFetch('/api/terminals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hostId: tab.hostId, cols: 100, rows: 30, cwd: cwd || undefined }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok || !data.pane) {
       showToast(data.error || '重连失败', 'err');
@@ -1179,11 +1233,12 @@ async function handleModalSubmit(payload: HostUpsertPayload, editingId: string |
   try {
     const url = editingId ? `/api/hosts/${encodeURIComponent(editingId)}` : '/api/hosts';
     const method = editingId ? 'PUT' : 'POST';
-    const res = await fetch(url, {
+    const res = await apiFetch(url, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       showToast(data.error || '保存失败', 'err');
@@ -1203,11 +1258,12 @@ async function handleModalSubmit(payload: HostUpsertPayload, editingId: string |
 
 async function handlePatchMeta(host: PublicHost, patch: Record<string, unknown>) {
   try {
-    const res = await fetch(`/api/hosts/${encodeURIComponent(host.id)}/meta`, {
+    const res = await apiFetch(`/api/hosts/${encodeURIComponent(host.id)}/meta`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok || !data.host) {
       showToast(data.error || '更新失败', 'err');
@@ -1230,9 +1286,10 @@ async function confirmDeleteHost() {
   if (!host) return;
   deletingHost.value = null;
   try {
-    const res = await fetch(`/api/hosts/${encodeURIComponent(host.id)}`, {
+    const res = await apiFetch(`/api/hosts/${encodeURIComponent(host.id)}`, {
       method: 'DELETE',
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok) {
       // 删不掉就得说，不能静默关掉对话框让人以为删了
@@ -1295,11 +1352,12 @@ async function onDrop(e: DragEvent, target: PublicHost) {
   currentIds.splice(toIdx, 0, fromId);
 
   try {
-    const res = await fetch('/api/hosts/reorder', {
+    const res = await apiFetch('/api/hosts/reorder', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ orderedIds: currentIds }),
     });
+    if (!res) return;
     const data = await res.json();
     if (!data.ok || !Array.isArray(data.hosts)) {
       showToast(data.error || '排序未保存', 'err');
@@ -1442,9 +1500,11 @@ onBeforeUnmount(() => {
         :right-wing="null"
         :creating="creatingPane"
         :standalone="true"
+        :error="tab.error"
         @split="handleSplitTerminal"
         @close-pane="handleClosePane"
         @reconnect-pane="handleReconnectPane"
+        @retry="retryPaneForTab(tab)"
         @toggle-dark="toggleTheme"
         @meta-update="handlePaneMetaUpdate"
       />
@@ -2848,9 +2908,11 @@ onBeforeUnmount(() => {
                 :right-wing="detailHostId === tab.hostId ? rightWing : null"
                 :creating="creatingPane"
                 :standalone="false"
+                :error="tab.error"
                 @split="handleSplitTerminal"
                 @close-pane="handleClosePane"
                 @reconnect-pane="handleReconnectPane"
+                @retry="retryPaneForTab(tab)"
                 @toggle-dark="terminalDark = !terminalDark"
                 @toggle-right-wing="toggleRightWing"
                 @collapse-stage="switchToHomeView"
@@ -2868,6 +2930,7 @@ onBeforeUnmount(() => {
             :right-wing="detailHostId === stageHost.id ? rightWing : null"
             @close="switchToHomeView"
             @toggle-detail="toggleRightWing('detail')"
+            @session-expired="handleSessionExpired"
             @toast="showToast"
           />
         </div>
@@ -2903,6 +2966,7 @@ onBeforeUnmount(() => {
               :terminal-cwd="activeSessionTab?.panes[activeSessionTab.panes.length - 1]?.cwd"
               @close="rightWing = null"
               @expand-full="openFilesStage(rightWingHost)"
+              @session-expired="handleSessionExpired"
               @toast="showToast"
             />
           </div>

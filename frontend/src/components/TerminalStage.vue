@@ -11,12 +11,16 @@ const props = defineProps<{
   rightWing: 'detail' | 'files' | null;
   creating: boolean;
   standalone?: boolean;
+  /// 建 pane 失败的原因（由 App.vue 留在标签上）。有值且还没有 pane 时，
+  /// 渲染成"连接失败 + 重试"，而不是无限转圈。
+  error?: string | null;
 }>();
 
 const emit = defineEmits<{
   split: [direction: 'row' | 'col'];
   closePane: [paneId: string];
   reconnectPane: [paneId: string];
+  retry: [];
   toggleDark: [];
   toggleRightWing: [mode: 'files' | 'detail'];
   collapseStage: [];
@@ -208,6 +212,31 @@ const activePane = computed(() => {
           @meta-update="emit('metaUpdate', $event)"
         />
       </div>
+    </div>
+
+    <!-- 建 pane 失败：给出原因与重试，绝不无限转圈 -->
+    <div
+      v-else-if="error"
+      class="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-xs"
+    >
+      <div class="flex items-center gap-1.5 font-medium text-red-600 dark:text-red-400">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 8v5M12 16h.01" />
+        </svg>
+        <span>连接 {{ host.name }} 终端失败</span>
+      </div>
+      <p class="max-w-[460px] text-center leading-relaxed text-zinc-500 dark:text-zinc-400">
+        {{ error }}
+      </p>
+      <button
+        type="button"
+        class="rounded-xl border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 transition hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+        :disabled="creating"
+        @click="emit('retry')"
+      >
+        {{ creating ? '重试中…' : '重试' }}
+      </button>
     </div>
 
     <!-- 正在握手建立连接时的加载态 -->

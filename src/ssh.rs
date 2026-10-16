@@ -35,6 +35,10 @@ impl client::Handler for SshClientHandler {
 /// 导致 channel open 失败。闸门只约束执行/探针类短通道；终端 pane 与 SFTP 不排队。
 const MAX_CONCURRENT_EXEC_PER_HOST: usize = 6;
 
+/// 目录缓存条数上限。缓存只为让"点进子目录/返回上级"瞬开，长驻进程里长时间乱逛会让它
+/// 无界增长（每条的 DirListing 带着整目录的条目）。超限就按时间淘汰最旧的，不清空。
+const DIR_CACHE_MAX_ENTRIES: usize = 256;
+
 /// 单主机 SSH 与 SFTP 连接池：
 /// - 终端、执行、SFTP 文件浏览、高速上传下载、探针全部共用同一条底层 SSH 连接；
 /// - 通道窗口拉大到 16 MiB + SFTP 64 路并发流水线（255 KiB 大包），彻底跑满跨境高 RTT 带宽。
@@ -119,6 +123,16 @@ impl SshPool {
                 (host_id.to_string(), req_path.to_string()),
                 (now, listing.clone()),
             );
+        }
+        if guard.len() > DIR_CACHE_MAX_ENTRIES {
+            let mut by_age: Vec<(Instant, (String, String))> = guard
+                .iter()
+                .map(|(key, (ts, _))| (*ts, key.clone()))
+                .collect();
+            by_age.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, key) in by_age.into_iter().take(guard.len() - DIR_CACHE_MAX_ENTRIES) {
+                guard.remove(&key);
+            }
         }
     }
 

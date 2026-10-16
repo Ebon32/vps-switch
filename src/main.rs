@@ -203,7 +203,7 @@ fn main() -> Result<()> {
         transfers: Arc::new(TransferManager::new()),
         inspector: Arc::new(InspectorEngine::new()),
         exec_tasks: exec_tasks.clone(),
-        sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+        sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         port,
         bind_is_loopback: bind_ip.is_loopback(),
     });
