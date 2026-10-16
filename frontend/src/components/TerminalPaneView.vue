@@ -147,9 +147,14 @@ function connectWebSocket() {
         // 实时输出帧
         term?.write(view.subarray(1));
       } else if (view.length > 1 && view[0] === 0x02) {
-        // 历史字节环回放帧：写入期间静默屏蔽所有 xterm 自动应答
+        // 历史字节环回放帧：这是后端权威现场的整份快照，不是增量。
+        // 触发点有两个——新建连接、以及客户端落后时被补发——两种情况终端里
+        // 都已经有内容了，直接写进去会和旧内容叠加成重复、错乱的现场
+        // （典型现象：切终端或断线重连后同一段内容出现两遍）。所以先整屏重置
+        // 再写入；重置走写入队列，与实时帧保持先后顺序。
         if (term) {
           replayingDepth += 1;
+          term.write('\x1bc');
           term.write(view.subarray(1), () => {
             replayingDepth = Math.max(0, replayingDepth - 1);
           });
