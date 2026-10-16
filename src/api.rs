@@ -68,6 +68,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/api/settings/mcp", put(api_update_mcp_settings))
         .route("/api/guard", get(api_get_guard).put(api_update_guard))
         .route("/api/mcp-calls", get(api_list_mcp_calls))
+        .route("/api/mcp-calls/:id", get(api_get_mcp_call))
         .route("/api/events", get(api_sse_events))
         .route("/api/hosts", get(list_hosts).post(create_host))
         .route("/api/hosts/reorder", put(reorder_hosts))
@@ -1577,17 +1578,54 @@ async fn api_mcp_rpc(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct McpCallsQuery {
     limit: Option<i64>,
+    tool: Option<String>,
+    host: Option<String>,
+    ok: Option<bool>,
+    /// RFC3339 时间下界（含）/ 上界（不含），由前端按本地时区换算好再发过来
+    from: Option<String>,
+    to: Option<String>,
 }
 
-/// 读取最近的 MCP 调用记录（全程留痕的查看口）。
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 读取 MCP 调用记录（全程留痕的查看口）：支持按时间范围、主机、工具、成败筛选。
 async fn api_list_mcp_calls(
     State(state): State<Arc<AppState>>,
     Query(q): Query<McpCallsQuery>,
 ) -> impl IntoResponse {
-    match state.db.list_mcp_calls(q.limit.unwrap_or(200)) {
-        Ok(calls) => (StatusCode::OK, Json(json!({ "ok": true, "calls": calls }))).into_response(),
+    let filter = crate::db::McpCallFilter {
+        limit: q.limit.unwrap_or(200),
+        tool: non_empty(q.tool),
+        host: non_empty(q.host),
+        ok: q.ok,
+        from: non_empty(q.from),
+        to: non_empty(q.to),
+    };
+    match state.db.list_mcp_calls(&filter) {
+        Ok(calls) => {
+            let (hosts, tools) = state.db.mcp_call_facets().unwrap_or_default();
+            (StatusCode::OK, Json(json!({ "ok": true, "calls": calls, "hosts": hosts, "tools": tools })))
+                .into_response()
+        }
+        Err(e) => {
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")).into_response()
+        }
+    }
+}
+
+/// 单条 MCP 调用记录的完整正文（参数与返回结果原文）。
+async fn api_get_mcp_call(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.db.get_mcp_call(&id) {
+        Ok(Some(call)) => (StatusCode::OK, Json(json!({ "ok": true, "call": call }))).into_response(),
+        Ok(None) => err_response(StatusCode::NOT_FOUND, "调用记录不存在").into_response(),
         Err(e) => {
             err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")).into_response()
         }

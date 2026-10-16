@@ -26,6 +26,36 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// MCP 调用留痕里「参数」与「结果」正文各自的上限（按 char）。超出即截断并在正文里
+/// 写明原始长度——留痕是给人看的，宁可占点磁盘，也不要让人对着半截内容猜。
+const MCP_CALL_TEXT_LIMIT: usize = 256 * 1024;
+
+/// 与 `clip` 相同，但把截断这件事写进正文本身，读取方不必额外记标志位。
+fn clip_with_note(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str(&format!(
+        "\n\n…（已截断：原始 {total} 字符，此处保留前 {max} 字符）"
+    ));
+    out
+}
+
+/// MCP 调用记录的查询条件。所有字段都是可选的，为空即不参与过滤。
+#[derive(Debug, Default, Clone)]
+pub struct McpCallFilter {
+    pub limit: i64,
+    pub tool: Option<String>,
+    pub host: Option<String>,
+    pub ok: Option<bool>,
+    /// RFC3339 时间下界（含）
+    pub from: Option<String>,
+    /// RFC3339 时间上界（不含）
+    pub to: Option<String>,
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
     master_key: MasterKey,
@@ -122,13 +152,19 @@ impl Database {
                  args TEXT NOT NULL DEFAULT '',
                  ok INTEGER NOT NULL DEFAULT 0,
                  duration_ms INTEGER NOT NULL DEFAULT 0,
-                 summary TEXT NOT NULL DEFAULT ''
+                 summary TEXT NOT NULL DEFAULT '',
+                 result TEXT NOT NULL DEFAULT ''
              );
              CREATE INDEX IF NOT EXISTS idx_mcp_calls_ts ON mcp_calls(ts);",
         )?;
         // 兼容升级已有数据库：安全添加 favorited 列
         let _ = conn.execute(
             "ALTER TABLE hosts ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // 兼容升级：MCP 调用留痕补上「返回给 agent 的完整结果」一列
+        let _ = conn.execute(
+            "ALTER TABLE mcp_calls ADD COLUMN result TEXT NOT NULL DEFAULT ''",
             [],
         );
 
@@ -874,56 +910,131 @@ impl Database {
         Ok(())
     }
 
-    /// 记录一次 MCP 工具调用（全程留痕：工具、目标主机、参数、成败、耗时、结果摘要）。
+    /// 记录一次 MCP 工具调用（全程留痕：工具、目标主机、参数、成败、耗时、结果摘要、完整结果）。
     /// 只覆盖 MCP 这条链——这是外部 agent 唯一能下达命令的通道，其余内部执行不入库。
     pub fn record_mcp_call(
         &self,
         tool: &str,
         host: Option<&str>,
         args: &str,
+        result: &str,
         ok: bool,
         duration_ms: u64,
         summary: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
         conn.execute(
-            "INSERT INTO mcp_calls (id, ts, tool, host, args, ok, duration_ms, summary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO mcp_calls (id, ts, tool, host, args, ok, duration_ms, summary, result)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 Uuid::new_v4().to_string(),
                 Utc::now().to_rfc3339(),
                 tool,
                 host,
-                clip(args, 4000),
+                clip_with_note(args, MCP_CALL_TEXT_LIMIT),
                 if ok { 1 } else { 0 },
                 duration_ms as i64,
                 clip(summary, 2000),
+                clip_with_note(result, MCP_CALL_TEXT_LIMIT),
             ],
         )?;
         Ok(())
     }
 
-    /// 读取最近的 MCP 调用记录（倒序），供界面/排查查看。
-    pub fn list_mcp_calls(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+    /// 按条件读取 MCP 调用记录（倒序）。列表只回预览，正文由 `get_mcp_call` 单条取，
+    /// 免得一次拉几百条把上百 KB 的输出全灌进浏览器。
+    pub fn list_mcp_calls(&self, f: &McpCallFilter) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
         let mut stmt = conn.prepare(
-            "SELECT ts, tool, host, args, ok, duration_ms, summary
-             FROM mcp_calls ORDER BY ts DESC LIMIT ?1",
+            "SELECT id, ts, tool, host, ok, duration_ms, summary, args
+             FROM mcp_calls
+             WHERE (?1 IS NULL OR tool = ?1)
+               AND (?2 IS NULL OR host = ?2 OR instr(',' || host || ',', ',' || ?2 || ',') > 0)
+               AND (?3 IS NULL OR ok = ?3)
+               AND (?4 IS NULL OR ts >= ?4)
+               AND (?5 IS NULL OR ts < ?5)
+             ORDER BY ts DESC LIMIT ?6",
         )?;
+        let ok_flag = f.ok.map(|b| if b { 1i64 } else { 0i64 });
         let rows = stmt
-            .query_map(params![limit.clamp(1, 1000)], |r| {
-                Ok(serde_json::json!({
-                    "ts": r.get::<_, String>(0)?,
-                    "tool": r.get::<_, String>(1)?,
-                    "host": r.get::<_, Option<String>>(2)?,
-                    "args": r.get::<_, String>(3)?,
-                    "ok": r.get::<_, i64>(4)? != 0,
-                    "durationMs": r.get::<_, i64>(5)?,
-                    "summary": r.get::<_, String>(6)?,
-                }))
-            })?
+            .query_map(
+                params![
+                    f.tool,
+                    f.host,
+                    ok_flag,
+                    f.from,
+                    f.to,
+                    f.limit.clamp(1, 5000)
+                ],
+                |r| {
+                    let args: String = r.get(7)?;
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, String>(1)?,
+                        "tool": r.get::<_, String>(2)?,
+                        "host": r.get::<_, Option<String>>(3)?,
+                        "ok": r.get::<_, i64>(4)? != 0,
+                        "durationMs": r.get::<_, i64>(5)?,
+                        "summary": r.get::<_, String>(6)?,
+                        "args": clip(&args, 400),
+                    }))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// 一条 MCP 调用记录的完整正文（参数与返回结果原文）。
+    pub fn get_mcp_call(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, ts, tool, host, ok, duration_ms, summary, args, result
+                 FROM mcp_calls WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, String>(1)?,
+                        "tool": r.get::<_, String>(2)?,
+                        "host": r.get::<_, Option<String>>(3)?,
+                        "ok": r.get::<_, i64>(4)? != 0,
+                        "durationMs": r.get::<_, i64>(5)?,
+                        "summary": r.get::<_, String>(6)?,
+                        "args": r.get::<_, String>(7)?,
+                        "result": r.get::<_, String>(8)?,
+                    }))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 记录里出现过的工具与主机名，供筛选下拉框使用（取全表，不随筛选条件收缩）。
+    pub fn mcp_call_facets(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT tool FROM mcp_calls WHERE tool <> '' ORDER BY tool COLLATE NOCASE",
+        )?;
+        let tools = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // host 列可能是 "a,b,c" 这种逗号串（批量调用），这里摊平成单个主机名去重。
+        let mut stmt = conn.prepare("SELECT host FROM mcp_calls WHERE host IS NOT NULL")?;
+        let raw = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut hosts: Vec<String> = raw
+            .iter()
+            .flat_map(|s| s.split(','))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        hosts.sort_by_key(|s| s.to_lowercase());
+        hosts.dedup();
+        Ok((hosts, tools))
     }
 
     pub fn get_app_settings(&self) -> Result<AppSettings> {

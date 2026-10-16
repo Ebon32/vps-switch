@@ -1139,24 +1139,26 @@ pub async fn handle_mcp_request(
             let started = Instant::now();
 
             let outcome = dispatch_tool_call(state, exec_tasks, &tool_name, args).await;
-            let (payload, record_ok, summary) = match outcome {
+            let (payload, record_ok, summary, result_text) = match outcome {
                 Ok(val) => {
                     let text = serde_json::to_string_pretty(&val).unwrap_or_default();
                     let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
                     let summary = format!("ok={ok} {}", mcp_result_summary(&val));
                     (
-                        json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+                        json!({ "content": [{ "type": "text", "text": &text }], "isError": false }),
                         ok,
                         summary,
+                        text,
                     )
                 }
                 Err(err) => {
                     let msg = format!("{err:#}");
                     let text = json!({ "ok": false, "error": msg }).to_string();
                     (
-                        json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
+                        json!({ "content": [{ "type": "text", "text": &text }], "isError": true }),
                         false,
                         format!("error: {msg}"),
+                        text,
                     )
                 }
             };
@@ -1165,6 +1167,7 @@ pub async fn handle_mcp_request(
                 &tool_name,
                 host_label.as_deref(),
                 &args_json,
+                &result_text,
                 record_ok,
                 started.elapsed().as_millis() as u64,
                 &summary,

@@ -107,6 +107,7 @@ const savingGuard = ref(false);
 
 // MCP 调用记录（全程留痕）：外部 agent 经 MCP 通道的每一次调用
 type McpCallRecord = {
+  id: string;
   ts: string;
   tool: string;
   host: string | null;
@@ -116,7 +117,25 @@ type McpCallRecord = {
   summary: string;
 };
 const mcpCalls = ref<McpCallRecord[]>([]);
+const mcpCallHosts = ref<string[]>([]);
+const mcpCallTools = ref<string[]>([]);
 const loadingMcpCalls = ref(false);
+// 列表只回预览，展开某一行时才按 id 取回完整参数与返回结果
+const expandedCallId = ref<string | null>(null);
+const callDetail = ref<{ args: string; result: string } | null>(null);
+const loadingCallDetail = ref(false);
+const MCP_CALL_LIMIT = 500;
+const mcpCallFilters = ref({ from: '', to: '', host: '', tool: '', ok: '' });
+const mcpCallFiltered = computed(
+  () =>
+    Boolean(
+      mcpCallFilters.value.from ||
+        mcpCallFilters.value.to ||
+        mcpCallFilters.value.host ||
+        mcpCallFilters.value.tool ||
+        mcpCallFilters.value.ok
+    )
+);
 
 const mcpStatus = ref<{
   exePath: string;
@@ -129,7 +148,7 @@ const mcpStatus = ref<{
 } | null>(null);
 
 // 设置页分类导航与状态
-type SettingsTabKey = 'general' | 'security' | 'mcp' | 'about';
+type SettingsTabKey = 'general' | 'security' | 'mcp' | 'calls' | 'about';
 const activeSettingsTab = ref<SettingsTabKey>('general');
 
 const autostartEnabled = ref(false);
@@ -427,7 +446,21 @@ async function saveGuardList() {
 async function loadMcpCalls() {
   loadingMcpCalls.value = true;
   try {
-    const res = await fetch('/api/mcp-calls?limit=200');
+    const q = new URLSearchParams();
+    q.set('limit', String(MCP_CALL_LIMIT));
+    const f = mcpCallFilters.value;
+    // 日期按使用者本地时区取整天，换算成 UTC 瞬时再交给后端做闭开区间比较
+    if (f.from) q.set('from', new Date(`${f.from}T00:00:00`).toISOString());
+    if (f.to) {
+      const end = new Date(`${f.to}T00:00:00`);
+      end.setDate(end.getDate() + 1);
+      q.set('to', end.toISOString());
+    }
+    if (f.host) q.set('host', f.host);
+    if (f.tool) q.set('tool', f.tool);
+    if (f.ok) q.set('ok', f.ok);
+
+    const res = await fetch(`/api/mcp-calls?${q.toString()}`);
     if (res.status === 401) {
       authenticated.value = false;
       return;
@@ -435,6 +468,8 @@ async function loadMcpCalls() {
     const data = await res.json();
     if (data.ok) {
       mcpCalls.value = Array.isArray(data.calls) ? data.calls : [];
+      mcpCallHosts.value = Array.isArray(data.hosts) ? data.hosts : [];
+      mcpCallTools.value = Array.isArray(data.tools) ? data.tools : [];
     }
   } catch {
     // ignore
@@ -443,17 +478,49 @@ async function loadMcpCalls() {
   }
 }
 
-// 把 RFC3339 时间戳显示成本地「MM-DD HH:MM:SS」
+function resetMcpCallFilters() {
+  mcpCallFilters.value = { from: '', to: '', host: '', tool: '', ok: '' };
+  void loadMcpCalls();
+}
+
+// 展开/收起一行：展开时才去取这条记录的完整正文
+async function toggleCall(id: string) {
+  if (expandedCallId.value === id) {
+    expandedCallId.value = null;
+    callDetail.value = null;
+    return;
+  }
+  expandedCallId.value = id;
+  callDetail.value = null;
+  loadingCallDetail.value = true;
+  try {
+    const res = await fetch(`/api/mcp-calls/${encodeURIComponent(id)}`);
+    const data = await res.json();
+    if (data.ok && data.call) {
+      callDetail.value = { args: data.call.args || '', result: data.call.result || '' };
+    }
+  } catch {
+    // ignore
+  } finally {
+    loadingCallDetail.value = false;
+  }
+}
+
+// 把 RFC3339 时间戳显示成本地「YYYY-MM-DD HH:MM:SS」
 function formatCallTime(ts: string): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return ts;
   const p = (n: number) => String(n).padStart(2, '0');
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-// 切到「MCP Server」分类时自动拉取调用记录
+// 切到「调用记录」分类时自动拉取
 watch(activeSettingsTab, (tab) => {
-  if (tab === 'mcp') void loadMcpCalls();
+  if (tab === 'calls') {
+    expandedCallId.value = null;
+    callDetail.value = null;
+    void loadMcpCalls();
+  }
 });
 
 async function loadAutostartSettings() {
@@ -1690,7 +1757,7 @@ onBeforeUnmount(() => {
               ? 'border-zinc-900 bg-zinc-900 text-white shadow-sm dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900'
               : 'border-zinc-200/80 bg-white/85 text-zinc-600 hover:bg-white hover:text-zinc-900 dark:border-zinc-700/80 dark:bg-zinc-800/85 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-white'
           "
-          title="进入设置页（MCP Server / API Key / 登录安全）"
+          title="进入设置页（MCP Server / 调用记录 / 登录安全）"
           @click="openSettingsPage()"
         >
           <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1723,7 +1790,7 @@ onBeforeUnmount(() => {
         <div class="flex items-center justify-between">
           <div>
             <h2 class="text-base font-bold">系统设置</h2>
-            <p class="text-xs text-zinc-400">管理 MCP Server 远程/本机接入、API Key 与 Web 访问安全</p>
+            <p class="text-xs text-zinc-400">管理 MCP Server 远程/本机接入、调用记录与 Web 访问安全</p>
           </div>
           <div class="flex items-center gap-2">
             <button
@@ -1794,6 +1861,23 @@ onBeforeUnmount(() => {
               <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
             </svg>
             <span>MCP Server</span>
+          </button>
+
+          <button
+            type="button"
+            class="flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-medium transition cursor-pointer"
+            :class="
+              activeSettingsTab === 'calls'
+                ? 'bg-zinc-900 text-white shadow-sm dark:bg-zinc-100 dark:text-zinc-900'
+                : 'text-zinc-600 hover:bg-zinc-100/80 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            "
+            @click="activeSettingsTab = 'calls'"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 4h16v16H4z" />
+              <path d="M8 9h8M8 13h8M8 17h5" />
+            </svg>
+            <span>调用记录</span>
           </button>
 
           <button
@@ -2164,8 +2248,10 @@ onBeforeUnmount(() => {
             一行一条，<code class="font-mono">#</code> 起头是注释。<code class="font-mono">*</code> 通配，没有 <code class="font-mono">*</code> 就是精确匹配，按词边界匹配（<code class="font-mono">rm -rf /</code> 不会误伤 <code class="font-mono">rm -rf /var/log</code>）。判定前会剥引号、转小写，并把 <code class="font-mono">-r -f</code> 与 <code class="font-mono">-fr</code> 视作等价。这份名单防手滑，不防蓄意绕过。
           </p>
         </section>
+      </div>
 
-        <!-- 板块 3：MCP 调用记录（全程留痕） -->
+      <!-- 分类 3：调用记录 (MCP Call Log) -->
+      <div v-show="activeSettingsTab === 'calls'" class="space-y-4">
         <section
           class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
         >
@@ -2173,7 +2259,7 @@ onBeforeUnmount(() => {
             <div>
               <h3 class="text-sm font-semibold">MCP 调用记录</h3>
               <p class="mt-0.5 text-xs text-zinc-400">
-                外部 agent 经 MCP 通道的每一次调用都在此留痕（工具、目标主机、参数、成败、耗时、结果摘要）。只记 MCP 这条链，内部执行不入库
+                外部 agent 经 MCP 通道的每一次调用都在此留痕。只记 MCP 这条链，内部执行（探针、压缩、注册表等）不入库。点任意一行展开完整参数与返回结果
               </p>
             </div>
             <button
@@ -2186,17 +2272,88 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
+          <!-- 筛选条：时间范围 / 主机 / 工具 / 结果 -->
+          <div class="flex flex-wrap items-end gap-2.5">
+            <label class="flex flex-col gap-1">
+              <span class="text-[11px] font-medium text-zinc-500">起始日期</span>
+              <input
+                v-model="mcpCallFilters.from"
+                type="date"
+                class="rounded-xl border border-zinc-200/80 bg-white px-2.5 py-1.5 text-[11px] text-zinc-700 outline-none focus:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200 dark:[color-scheme:dark]"
+                @change="loadMcpCalls"
+              />
+            </label>
+            <label class="flex flex-col gap-1">
+              <span class="text-[11px] font-medium text-zinc-500">结束日期</span>
+              <input
+                v-model="mcpCallFilters.to"
+                type="date"
+                class="rounded-xl border border-zinc-200/80 bg-white px-2.5 py-1.5 text-[11px] text-zinc-700 outline-none focus:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200 dark:[color-scheme:dark]"
+                @change="loadMcpCalls"
+              />
+            </label>
+            <label class="flex flex-col gap-1">
+              <span class="text-[11px] font-medium text-zinc-500">主机</span>
+              <select
+                v-model="mcpCallFilters.host"
+                class="min-w-[9rem] rounded-xl border border-zinc-200/80 bg-white px-2.5 py-1.5 text-[11px] text-zinc-700 outline-none focus:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                @change="loadMcpCalls"
+              >
+                <option value="">全部主机</option>
+                <option v-for="h in mcpCallHosts" :key="h" :value="h">{{ h }}</option>
+              </select>
+            </label>
+            <label class="flex flex-col gap-1">
+              <span class="text-[11px] font-medium text-zinc-500">工具</span>
+              <select
+                v-model="mcpCallFilters.tool"
+                class="min-w-[9rem] rounded-xl border border-zinc-200/80 bg-white px-2.5 py-1.5 text-[11px] text-zinc-700 outline-none focus:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                @change="loadMcpCalls"
+              >
+                <option value="">全部工具</option>
+                <option v-for="t in mcpCallTools" :key="t" :value="t">{{ t }}</option>
+              </select>
+            </label>
+            <label class="flex flex-col gap-1">
+              <span class="text-[11px] font-medium text-zinc-500">结果</span>
+              <select
+                v-model="mcpCallFilters.ok"
+                class="rounded-xl border border-zinc-200/80 bg-white px-2.5 py-1.5 text-[11px] text-zinc-700 outline-none focus:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                @change="loadMcpCalls"
+              >
+                <option value="">全部</option>
+                <option value="true">成功</option>
+                <option value="false">失败</option>
+              </select>
+            </label>
+            <button
+              v-if="mcpCallFiltered"
+              type="button"
+              class="rounded-xl border border-zinc-200/80 px-3 py-1.5 text-[11px] font-medium text-zinc-500 transition hover:bg-zinc-100/80 cursor-pointer dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+              @click="resetMcpCallFilters"
+            >
+              重置筛选
+            </button>
+          </div>
+
+          <div class="text-[11px] text-zinc-400">
+            {{ mcpCallFiltered ? '符合筛选的调用' : '最近调用' }}
+            <span class="font-medium text-zinc-600 dark:text-zinc-300">{{ mcpCalls.length }}</span>
+            条{{ mcpCalls.length >= MCP_CALL_LIMIT ? `（已达 ${MCP_CALL_LIMIT} 条上限，更早的记录请用筛选查看）` : '' }}
+          </div>
+
           <div
             v-if="mcpCalls.length === 0"
             class="rounded-xl border border-dashed border-zinc-200 py-8 text-center text-xs text-zinc-400 dark:border-zinc-800"
           >
-            暂无调用记录
+            {{ mcpCallFiltered ? '没有符合筛选条件的调用记录' : '暂无调用记录' }}
           </div>
 
           <div v-else class="overflow-x-auto">
             <table class="w-full border-collapse text-left text-[11px]">
               <thead>
                 <tr class="text-zinc-400">
+                  <th class="w-6 py-2"></th>
                   <th class="py-2 pr-3 font-medium whitespace-nowrap">时间</th>
                   <th class="py-2 pr-3 font-medium">工具</th>
                   <th class="py-2 pr-3 font-medium">主机</th>
@@ -2206,36 +2363,81 @@ onBeforeUnmount(() => {
                 </tr>
               </thead>
               <tbody>
-                <tr
-                  v-for="(c, i) in mcpCalls"
-                  :key="i"
-                  class="border-t border-zinc-100 align-top dark:border-zinc-800"
-                >
-                  <td class="py-2 pr-3 font-mono whitespace-nowrap text-zinc-500">{{ formatCallTime(c.ts) }}</td>
-                  <td class="py-2 pr-3 font-mono text-zinc-800 dark:text-zinc-200">{{ c.tool }}</td>
-                  <td class="py-2 pr-3 text-zinc-600 dark:text-zinc-300">{{ c.host || '—' }}</td>
-                  <td class="py-2 pr-3">
-                    <span
-                      class="rounded-md px-1.5 py-0.5 font-medium whitespace-nowrap"
-                      :class="
-                        c.ok
-                          ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400'
-                          : 'bg-red-50 text-red-600 dark:bg-red-950/50 dark:text-red-400'
-                      "
-                    >
-                      {{ c.ok ? '成功' : '失败' }}
-                    </span>
-                  </td>
-                  <td class="py-2 pr-3 font-mono whitespace-nowrap text-zinc-500">{{ c.durationMs }}ms</td>
-                  <td class="py-2 pr-3">
-                    <div class="max-w-[440px] truncate font-mono text-zinc-600 dark:text-zinc-300" :title="c.args">
-                      {{ c.args }}
-                    </div>
-                    <div class="mt-0.5 max-w-[440px] truncate text-zinc-400" :title="c.summary">
-                      {{ c.summary }}
-                    </div>
-                  </td>
-                </tr>
+                <template v-for="c in mcpCalls" :key="c.id">
+                  <tr
+                    class="cursor-pointer border-t border-zinc-100 align-top transition hover:bg-zinc-50/80 dark:border-zinc-800 dark:hover:bg-zinc-800/40"
+                    @click="toggleCall(c.id)"
+                  >
+                    <td class="py-2 pr-1 text-zinc-400 select-none">
+                      {{ expandedCallId === c.id ? '▾' : '▸' }}
+                    </td>
+                    <td class="py-2 pr-3 font-mono whitespace-nowrap text-zinc-500">{{ formatCallTime(c.ts) }}</td>
+                    <td class="py-2 pr-3 font-mono text-zinc-800 dark:text-zinc-200">{{ c.tool }}</td>
+                    <td class="py-2 pr-3 text-zinc-600 dark:text-zinc-300">{{ c.host || '—' }}</td>
+                    <td class="py-2 pr-3">
+                      <span
+                        class="rounded-md px-1.5 py-0.5 font-medium whitespace-nowrap"
+                        :class="
+                          c.ok
+                            ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400'
+                            : 'bg-red-50 text-red-600 dark:bg-red-950/50 dark:text-red-400'
+                        "
+                      >
+                        {{ c.ok ? '成功' : '失败' }}
+                      </span>
+                    </td>
+                    <td class="py-2 pr-3 font-mono whitespace-nowrap text-zinc-500">{{ c.durationMs }}ms</td>
+                    <td class="py-2 pr-3">
+                      <div class="max-w-[440px] truncate font-mono text-zinc-600 dark:text-zinc-300" :title="c.args">
+                        {{ c.args }}
+                      </div>
+                      <div class="mt-0.5 max-w-[440px] truncate text-zinc-400" :title="c.summary">
+                        {{ c.summary }}
+                      </div>
+                    </td>
+                  </tr>
+
+                  <tr
+                    v-if="expandedCallId === c.id"
+                    class="border-t border-zinc-100 bg-zinc-50/70 dark:border-zinc-800 dark:bg-zinc-950/50"
+                  >
+                    <td colspan="7" class="px-4 py-3.5">
+                      <div v-if="loadingCallDetail" class="text-[11px] text-zinc-400">加载完整内容中…</div>
+                      <div v-else class="space-y-3">
+                        <div>
+                          <div class="mb-1.5 flex items-center gap-2">
+                            <span class="text-[11px] font-semibold text-zinc-500">参数（完整）</span>
+                            <button
+                              type="button"
+                              class="rounded-md border border-zinc-200/80 px-2 py-0.5 text-[10px] text-zinc-500 transition hover:bg-zinc-100/80 cursor-pointer dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                              @click.stop="copyText(callDetail?.args || '', '已复制完整参数')"
+                            >
+                              复制
+                            </button>
+                          </div>
+                          <pre
+                            class="max-h-72 overflow-auto rounded-xl border border-zinc-200/80 bg-white p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all text-zinc-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                          >{{ callDetail?.args || '（无参数）' }}</pre>
+                        </div>
+                        <div>
+                          <div class="mb-1.5 flex items-center gap-2">
+                            <span class="text-[11px] font-semibold text-zinc-500">返回结果（完整）</span>
+                            <button
+                              type="button"
+                              class="rounded-md border border-zinc-200/80 px-2 py-0.5 text-[10px] text-zinc-500 transition hover:bg-zinc-100/80 cursor-pointer dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                              @click.stop="copyText(callDetail?.result || '', '已复制完整返回结果')"
+                            >
+                              复制
+                            </button>
+                          </div>
+                          <pre
+                            class="max-h-96 overflow-auto rounded-xl border border-zinc-200/80 bg-white p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all text-zinc-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                          >{{ callDetail?.result || '（本次调用早于留痕升级，未记录完整返回结果）' }}</pre>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
               </tbody>
             </table>
           </div>
