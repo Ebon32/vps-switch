@@ -8,6 +8,16 @@ VPS Switch 是一个本地优先的主机管理工具。它集成了终端、文
 
 ---
 
+## 多系统与异构环境适配
+
+无论是桌面端的人工操作，还是外部 Agent 经由 MCP 下达调度指令，底层均提供透明的系统环境适配：
+
+- **主流 Linux 发行版**：全面支持 Debian、Ubuntu、CentOS 等常见系统，并特别适配了 Alpine 等基于 musl libc / busybox (ash) 的超轻量精简环境；
+- **Windows 远端主机**：针对 Windows OpenSSH 做了深度优化。底层自动转译为 PowerShell Base64 UTF-16LE 载荷并强制注入 UTF-8 输出，自动拦截清洗 PowerShell 5.1 CLIXML 管道噪音，彻底根除 cmd 转义卡死与中文乱码；
+- **POSIX / BSD 体系**：基于标准 OpenSSH 协议栈构建，理论上兼容 macOS 等 BSD 兼容环境。
+
+---
+
 ## 界面展示
 
 ### 1. 主机仓库与连接底座
@@ -92,7 +102,7 @@ claude mcp add vps-switch http://<服务器IP>:18800/mcp -H "x-vps-switch-key: Y
 |---|---|
 | `vps_list` | 查询已配置的主机列表与元数据，支持关键字搜索与状态过滤 |
 | `vps_inspect` | 获取一台或多台主机的实时硬件指标（CPU、内存、磁盘、网速、负载） |
-| `vps_exec` | 在一台或多台主机上并发执行命令，支持直接传主机名；短任务同步返回，长任务支持阻塞等待 |
+| `vps_exec` | 在一台或多台主机上并发执行命令，支持主机名寻址；自动路由适配 Linux（Shell）与 Windows（PowerShell 编码转译），Agent 无需关心系统差异；短任务同步返回，长任务支持阻塞等待 |
 | `vps_task` | 查询或取消后台运行中的长时间任务，支持 `wait_seconds` 阻塞等待完成 |
 | `vps_fs` | 远程文件系统操作（列目录、读写改删、压缩解压），带单文件读写大小保护 |
 | `vps_transfer` | 高速文件流式传输（上传/下载），支持断点续传残片对账与落地 SHA-256 校验 |
