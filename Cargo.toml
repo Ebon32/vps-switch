@@ -38,6 +38,10 @@ async-trait = "0.1"
 wry = "0.57.0"
 tao = "0.37.1"
 tray-icon = "0.26.1"
+# 托盘驻留时把 WebView2 降到低内存档（ICoreWebView2_19::SetMemoryUsageTargetLevel）。
+# 只用 wry 暴露的 controller() 拿原生接口，不碰 wry 内部实现。
+webview2-com = "0.39.1"
+windows-core = "0.62"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

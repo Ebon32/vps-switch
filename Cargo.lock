@@ -4751,6 +4751,8 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "uuid",
+ "webview2-com",
+ "windows-core",
  "winres",
  "wry",
 ]

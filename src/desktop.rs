@@ -147,6 +147,71 @@ fn build_tray_menu(state: &Arc<AppState>) -> Result<Menu> {
     Ok(menu)
 }
 
+/// 把 WebView2 切到低内存档 / 还原。
+///
+/// 低内存档（`COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW`）是 WebView2 官方给"不显示时省内存"
+/// 用的接口：渲染进程会主动收缩缓存与工作集，代价是重绘变慢——所以只该在窗口隐藏时用，
+/// 重新显示前必须还原。比"把 WebView 拆了重建"好得多：页面不重载，标签页与终端现场都还在。
+///
+/// 老版本 WebView2 Runtime 没有这个接口，`cast` 会失败，此时静默跳过（不降级、不报错）。
+#[cfg(windows)]
+fn set_webview_memory_level(webview: &wry::WebView, low: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+    };
+    use windows_core::Interface as _;
+    use wry::WebViewExtWindows;
+
+    let Ok(core) = (unsafe { webview.controller().CoreWebView2() }) else {
+        return;
+    };
+    let Ok(core19) = core.cast::<ICoreWebView2_19>() else {
+        return;
+    };
+    let level = if low {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+    } else {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+    };
+    let _ = unsafe { core19.SetMemoryUsageTargetLevel(level) };
+}
+
+/// 主窗口 WebView 的创建。刻意不在启动时无条件调用：一个隐藏窗口同样会把整套 Chromium
+/// 拉起来（实测约 145 MB），而开机自启的常态就是"躺在托盘里没人点"。
+fn build_main_webview(window: &Window, url: &str) -> Option<wry::WebView> {
+    match WebViewBuilder::new().with_url(url).build(window) {
+        Ok(wv) => Some(wv),
+        Err(e) => {
+            tracing::error!("创建主窗口 WebView 失败: {e}");
+            None
+        }
+    }
+}
+
+/// 显示主窗口：没建过 WebView 就建，建过就还原内存档再显示。
+fn show_main_window(window: &Window, webview: &mut Option<wry::WebView>, url: &str) {
+    if webview.is_none() {
+        *webview = build_main_webview(window, url);
+    }
+    if let Some(wv) = webview.as_ref() {
+        set_webview_memory_level(wv, false);
+        let _ = wv.set_visible(true);
+    }
+    window.set_visible(true);
+    window.set_minimized(false);
+    window.set_focus();
+}
+
+/// 最小化到托盘：WebView 留着（页面不重载，标签页与终端现场都保住），但降到低内存档。
+fn hide_main_window(window: &Window, webview: &Option<wry::WebView>) {
+    if let Some(wv) = webview.as_ref() {
+        let _ = wv.set_visible(false);
+        set_webview_memory_level(wv, true);
+    }
+    window.set_visible(false);
+}
+
 pub fn run_desktop_window(
     state: Arc<AppState>,
     rt_handle: tokio::runtime::Handle,
@@ -191,9 +256,12 @@ pub fn run_desktop_window(
         .build(&event_loop)?;
 
     let url = format!("http://127.0.0.1:{port}");
-    let _webview = WebViewBuilder::new()
-        .with_url(&url)
-        .build(&window)?;
+    // 启动即最小化（开机自启的常态）时先不建 WebView，等第一次真正显示再建。
+    let mut main_webview: Option<wry::WebView> = if start_minimized {
+        None
+    } else {
+        build_main_webview(&window, &url)
+    };
 
     // 系统托盘事件转发到主事件循环
     let proxy_tray = proxy.clone();
@@ -244,7 +312,7 @@ pub fn run_desktop_window(
                         *control_flow = ControlFlow::Exit;
                     } else {
                         // 默认最小化驻留到系统托盘，保持后台不断连
-                        window.set_visible(false);
+                        hide_main_window(&window, &main_webview);
                     }
                 } else if let Some(removed) = standalone_windows.remove(&window_id) {
                     // 独立终端窗口点击 ×：完全关闭并销毁该窗口
@@ -252,9 +320,7 @@ pub fn run_desktop_window(
                 }
             }
             Event::UserEvent(DesktopUserEvent::ShowWindow) => {
-                window.set_visible(true);
-                window.set_minimized(false);
-                window.set_focus();
+                show_main_window(&window, &mut main_webview, &url);
             }
             Event::UserEvent(DesktopUserEvent::OpenStandaloneTerminal { host_id }) => {
                 // 如果该主机已有打开的独立终端窗口，直接唤醒并聚焦
@@ -308,17 +374,13 @@ pub fn run_desktop_window(
                     ..
                 } = tray_ev
                 {
-                    window.set_visible(true);
-                    window.set_minimized(false);
-                    window.set_focus();
+                    show_main_window(&window, &mut main_webview, &url);
                 }
             }
             Event::UserEvent(DesktopUserEvent::TrayMenu(menu_ev)) => {
                 let id_str = menu_ev.id.0.as_str();
                 if id_str == MENU_ID_SHOW {
-                    window.set_visible(true);
-                    window.set_minimized(false);
-                    window.set_focus();
+                    show_main_window(&window, &mut main_webview, &url);
                 } else if id_str == MENU_ID_QUIT {
                     standalone_windows.clear();
                     host_to_window.clear();
