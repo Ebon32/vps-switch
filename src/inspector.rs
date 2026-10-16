@@ -261,7 +261,7 @@ impl InspectorEngine {
             Ok(s) => s,
             Err(err) => {
                 // 连不上要分两种情况：**超时**（不确定，可能只是线路慢）与**拒绝/认证失败**
-                // （确定连不上）。前者若也判离线，慢线路（zouter/lazy-* 这类）会长期误红，
+                // （确定连不上）。前者若也判离线，慢线路（跨境高延迟那类）会长期误红，
                 // 所以记成 unknown 交给界面用灰灯表示"这次没判定出来"，绝不冒充"离线"。
                 let msg = format!("{err:#}");
                 let status = if connect_error_is_timeout(&msg) {
@@ -329,7 +329,7 @@ impl InspectorEngine {
                 // 走到这里说明 SSH **已经连上**了（get_or_connect 成功）——这台机器是可连的。
                 // 探针跑不出来只代表"这次没采到数据"，不该把灯判成离线：慢/抖线路上 channel
                 // 中途掉一次（例如回退的 Windows 探针返回 Disconnected）就会让一台能连的主机
-                // 常年标红（zouter 已实测复现）。所以保持在线，把采集失败原因写进 last_error。
+                // 常年标红（真机实测复现过）。所以保持在线，把采集失败原因写进 last_error。
                 if exec_errored {
                     // exec 层面出过错，池里这条连接不再可信，回收它下次重建
                     pool.invalidate_host(host_id).await;

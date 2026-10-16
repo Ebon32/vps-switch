@@ -1208,21 +1208,16 @@ fn generate_api_key() -> String {
     )
 }
 
+/// 1Shell 的数据库只认它在系统里的正规位置：`%APPDATA%\1Shell\data\1shell.db`。
+/// 这里曾经挂过一条指向某个开发机绝对路径的回退，既把构建机的目录结构带进了发布的 exe，
+/// 又会在 APPDATA 那份不在时静默读到一份陈旧副本——两者都不要。
 fn find_1shell_db_path() -> Option<PathBuf> {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let candidate = PathBuf::from(appdata)
-            .join("1Shell")
-            .join("data")
-            .join("1shell.db");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    let fallback = PathBuf::from(r"E:\1shell4.7\1shell-4.7\data\1shell.db");
-    if fallback.exists() {
-        return Some(fallback);
-    }
-    None
+    let appdata = std::env::var("APPDATA").ok()?;
+    let candidate = PathBuf::from(appdata)
+        .join("1Shell")
+        .join("data")
+        .join("1shell.db");
+    candidate.exists().then_some(candidate)
 }
 
 fn normalize_links(links: Vec<HostLink>) -> Vec<HostLink> {

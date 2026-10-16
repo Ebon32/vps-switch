@@ -3,6 +3,7 @@ name = "vps-switch"
 version = "0.1.0"
 edition = "2021"
 description = "Lightweight VPS manager and MCP server"
+authors = ["weidu12123"]
 
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }

@@ -1,0 +1,20 @@
+[Unit]
+Description=VPS Switch - Lightweight VPS manager and MCP server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vps-switch
+ExecStart=/opt/vps-switch/vps-switch
+Restart=always
+RestartSec=5
+Environment=PORT=18800
+Environment=HOST=0.0.0.0
+Environment=DATA_DIR=/opt/vps-switch/data
+
+# 文件句柄限制（满足高并发 SSH 与终端）
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

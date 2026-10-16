@@ -178,7 +178,7 @@ function handleSubmit() {
               <input
                 v-model="name"
                 type="text"
-                placeholder="如 lazy-jp / 主力机"
+                placeholder="如 hk-web-1 / 主力机"
                 class="mt-1 w-full rounded-xl border border-zinc-200 bg-zinc-50/60 px-3 py-2 text-xs text-zinc-900 outline-none focus:border-zinc-400 focus:bg-white"
               />
             </div>

@@ -19,6 +19,16 @@ node_modules/
 conpty.dll
 OpenConsole.exe
 
+# 测试证据与界面截图（含真实机队 IP/主机名，不入库也不进发布包）
+/artifacts
+/app-*.png
+
 # 系统
 .DS_Store
 Thumbs.db
+
+# 本地构建用的 crates 镜像源（公开仓库不该替所有人改源，各人自备）
+/.cargo/
+
+# cargo wix 每次构建在包根生成的展开式 wxs（中间产物）
+/*.wxs

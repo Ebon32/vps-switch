@@ -1,0 +1,158 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  vps-switch 的 MSI 定义（cargo wix 用 candle/light 编译）。
+
+  为什么是 per-machine 而不是 per-user：per-user MSI 在 Windows Installer 里是个坑。
+  实测两种写法都不成立——不加 ALLUSERS，卸载条目会落到 HKLM 而文件却装进 %LOCALAPPDATA%；
+  加上 ALLUSERS=2 + MSIINSTALLPERUSER=1，安装日志直接回 "MSIINSTALLPERUSER property is not
+  valid for UAC compliant package. Ignoring"，产品注册进了 HKCU，但"设置→应用"里一个条目都没有，
+  用户根本卸不掉。（Chrome / VS Code 的免管理员安装器都不用 MSI，就是这个原因。）
+  所以走标准形状：装进 Program Files、机器级注册、安装时弹一次 UAC。应用自身的运行时模型
+  不受影响——主机库仍在 %APPDATA%\vps-switch\data，开机自启仍由应用自己写 HKCU\...\Run。
+
+  两条刻意的约束：
+  1. conpty.dll 与 OpenConsole.exe 必须和 exe 同目录。portable-pty 走 Windows 的 DLL
+     搜索顺序加载 conpty.dll，放别处等于没带。
+  2. 安装与卸载都不动 %APPDATA% 与 HKCU\...\Run。用户的主机库和凭据在那里，
+     卸载删用户数据是恶习；自启开关归应用自己管，安装器插手就会把用户关掉的自启又打开。
+-->
+
+<!-- 由 cargo wix 在构建时替换：CargoTargetBinDir 指向本次 release 产物目录 -->
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='VPS Switch'
+        UpgradeCode='1357D496-DC42-4DA5-A3E0-76B6F7F778BC'
+        Manufacturer='weidu12123'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Lightweight VPS manager and MCP server'
+            Manufacturer='weidu12123'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='VPS Switch Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='VPS Switch'>
+
+                    <Component Id='Path' Guid='61B93D1C-7246-47E1-A9E8-23DD320F3C90' KeyPath='yes'>
+                        <Environment
+                            Id='PATH'
+                            Name='PATH'
+                            Value='[APPLICATIONFOLDER]'
+                            Permanent='no'
+                            Part='last'
+                            Action='set'
+                            System='yes'/>
+                    </Component>
+
+                    <Component Id='binary0' Guid='4C1D8E72-3A95-4B60-8F27-1E6D9A0C5B34'>
+                        <File
+                            Id='exe0'
+                            Name='vps-switch.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\vps-switch.exe'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <!-- 随包的 Windows Terminal ConPTY：必须与 exe 同目录才会被加载 -->
+                    <Component Id='conpty' Guid='7F3A2D58-6B14-4E93-9C05-2A8D4E1B7F60'>
+                        <File
+                            Id='conptydll'
+                            Name='conpty.dll'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\conpty.dll'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Component Id='openconsole' Guid='9B6E4C03-8D27-4A51-B3F8-5C0A7E2D9164'>
+                        <File
+                            Id='openconsoleexe'
+                            Name='OpenConsole.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\OpenConsole.exe'
+                            KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <!-- 所有用户的开始菜单 -->
+            <Directory Id='CommonProgramsFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='VPS Switch'>
+                    <Component Id='ApplicationShortcut' Guid='8A2F5C41-6D3B-4E77-9B21-5C0E7A9D4F18'>
+                        <Shortcut Id='ApplicationStartMenuShortcut'
+                            Name='VPS Switch'
+                            Description='Lightweight VPS manager and MCP server'
+                            Target='[!exe0]'
+                            WorkingDirectory='APPLICATIONFOLDER'
+                            Icon='ProductICO'/>
+                        <RemoveFolder Id='ApplicationProgramsFolder' On='uninstall'/>
+                        <RegistryValue Root='HKLM' Key='Software\vps-switch' Name='startMenuShortcut' Type='integer' Value='1' KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs VPS Switch.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='conpty'/>
+            <ComponentRef Id='openconsole'/>
+            <ComponentRef Id='ApplicationShortcut'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add the install location of VPS Switch to the system PATH so vps-switch can be run from any terminal.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <!-- 路径相对包根目录（cargo wix 的工作目录），不是相对本文件 -->
+        <Icon Id='ProductICO' SourceFile='assets\app.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/weidu12123/vps-switch'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>

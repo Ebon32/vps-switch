@@ -834,7 +834,7 @@ pub fn mcp_tool_definitions() -> Value {
                 "properties": {
                     "host": {
                         "type": "string",
-                        "description": "目标主机名（如 'vip-hk'、'lazy-gomami'、'本机'）或 IP"
+                        "description": "目标主机名（如 'web-1'、'db-2'、'本机'）或 IP"
                     },
                     "hosts": {
                         "type": "array",
@@ -846,13 +846,13 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "vps_exec",
-            "description": "在一台或多台 VPS 上并发执行非交互式命令（直接传主机名如 'vip-hk'）。若在 wait_seconds 内完成则同步返回 stdout/stderr/exitCode（ok=true）；若超时未完则返回 state=running、ok=false 与 taskId（表示未完成、不是失败），此时若需要结果，用**一次** vps_task(action:'get', task_id, wait_seconds:N) 等待其结束即可，不要反复查询；若检测到命令卡在 [Y/n] 等交互提问超过 2 秒会自动早退提醒改用 vps_terminal。命令会先过本机命令黑名单，命中不可逆灾难（如 rm -rf /、mkfs、格式化盘）即直接拒绝执行、不产生任何输出——名单文件是 data/deny-list.txt，被拦时不要换写法重试，直接告诉用户哪条被拦。",
+            "description": "在一台或多台 VPS 上并发执行非交互式命令（直接传主机名如 'web-1'）。若在 wait_seconds 内完成则同步返回 stdout/stderr/exitCode（ok=true）；若超时未完则返回 state=running、ok=false 与 taskId（表示未完成、不是失败），此时若需要结果，用**一次** vps_task(action:'get', task_id, wait_seconds:N) 等待其结束即可，不要反复查询；若检测到命令卡在 [Y/n] 等交互提问超过 2 秒会自动早退提醒改用 vps_terminal。命令会先过本机命令黑名单，命中不可逆灾难（如 rm -rf /、mkfs、格式化盘）即直接拒绝执行、不产生任何输出——名单文件是 data/deny-list.txt，被拦时不要换写法重试，直接告诉用户哪条被拦。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "host": {
                         "type": "string",
-                        "description": "单台目标主机名（如 'vip-hk'、'lazy-gomami'、'本机'）或 IP"
+                        "description": "单台目标主机名（如 'web-1'、'db-2'、'本机'）或 IP"
                     },
                     "hosts": {
                         "type": "array",
@@ -879,7 +879,7 @@ pub fn mcp_tool_definitions() -> Value {
                 "properties": {
                     "host": {
                         "type": "string",
-                        "description": "目标主机名（如 'vip-hk'、'lazy-gomami'、'本机'）"
+                        "description": "目标主机名（如 'web-1'、'db-2'、'本机'）"
                     },
                     "action": {
                         "type": "string",
@@ -926,7 +926,7 @@ pub fn mcp_tool_definitions() -> Value {
                 "properties": {
                     "host": {
                         "type": "string",
-                        "description": "目标主机名（如 'vip-hk'、'本机'）"
+                        "description": "目标主机名（如 'web-1'、'本机'）"
                     },
                     "action": {
                         "type": "string",
@@ -1297,7 +1297,7 @@ async fn tool_vps_list(state: &Arc<AppState>, args: Value) -> Result<Value> {
 
     Ok(json!({
         "ok": true,
-        "note": "所有工具均支持直接传 name（如 'vip-hk'、'lazy-gomami'、'本机'）定位主机，无需使用内部 ID。",
+        "note": "所有工具均支持直接传 name（如 'web-1'、'db-2'、'本机'）定位主机，无需使用内部 ID。",
         "total": out.len(),
         "hosts": out,
     }))
@@ -1399,7 +1399,7 @@ async fn tool_vps_exec(
     }
     if host_queries.is_empty() {
         return Err(anyhow!(
-            "请提供 host 或 hosts 参数（直接传主机名，如 'vip-hk'）"
+            "请提供 host 或 hosts 参数（直接传主机名，如 'web-1'）"
         ));
     }
 
