@@ -84,16 +84,24 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
             let active = workspace.has_active_filter();
             let this_filter = this.clone();
             let label = filter_summary(workspace);
-            pill_button(active)
-                .id("nav-filter")
-                .on_click(move |_, _, cx| {
-                    let _ = this_filter.update(cx, |workspace, cx| {
-                        workspace.filter_open = !workspace.filter_open;
-                        cx.notify();
-                    });
-                })
-                .child(icon(IconName::Funnel, 14., cx))
-                .child(label)
+            let mut wrapper = div()
+                .relative()
+                .child(
+                    pill_button(active)
+                        .id("nav-filter")
+                        .on_click(move |_, _, cx| {
+                            let _ = this_filter.update(cx, |workspace, cx| {
+                                workspace.filter_open = !workspace.filter_open;
+                                cx.notify();
+                            });
+                        })
+                        .child(icon(IconName::Funnel, 14., cx))
+                        .child(label),
+                );
+            if workspace.filter_open {
+                wrapper = wrapper.child(filter_panel(workspace, this, cx));
+            }
+            wrapper
         });
 
     if workspace.page == Page::Workspace {
@@ -373,6 +381,261 @@ fn filter_summary(workspace: &Workspace) -> String {
 /// 图标：颜色与字号继承外层文本样式。
 pub fn icon(name: IconName, size: f32, _cx: &App) -> impl IntoElement {
     div().text_size(px(size)).child(Icon::new(name))
+}
+
+/// 筛选下拉面板（真值：256px 宽、白 95%、圆角 16、14px 内边距、Tailwind shadow-xl）。
+fn filter_panel(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> AnyElement {
+    use crate::workspace::{RoleFilter, StatusFilter};
+
+    let mut panel = v_flex()
+        .absolute()
+        .top(px(37.))
+        .right(px(0.))
+        .w(px(256.))
+        .rounded_2xl()
+        .border_1()
+        .border_color(Hsla::from(rgb(0xe4e4e7)).opacity(0.9))
+        .bg(Hsla::from(rgb(0xffffff)).opacity(0.95))
+        .p(px(14.))
+        .shadow(vec![
+            BoxShadow {
+                color: Hsla::from(rgb(0x000000)).opacity(0.1),
+                offset: point(px(0.), px(20.)),
+                blur_radius: px(25.),
+                spread_radius: px(-5.),
+                inset: false,
+            },
+            BoxShadow {
+                color: Hsla::from(rgb(0x000000)).opacity(0.1),
+                offset: point(px(0.), px(8.)),
+                blur_radius: px(10.),
+                spread_radius: px(-6.),
+                inset: false,
+            },
+        ]);
+
+    // ---- 在线状态 ----
+    let mut head = h_flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0xa1a1aa))
+                .child("在线状态"),
+        );
+    if workspace.has_active_filter() {
+        let this_reset = this.clone();
+        head = head.child(
+            div()
+                .id("filter-reset")
+                .text_size(px(11.))
+                .text_color(rgb(0x71717a))
+                .cursor_pointer()
+                .hover(|style| style.text_color(rgb(0x18181b)))
+                .on_click(move |_, _, cx| {
+                    let _ = this_reset.update(cx, |workspace, cx| {
+                        workspace.reset_filters();
+                        cx.notify();
+                    });
+                })
+                .child("重置全部"),
+        );
+    }
+    panel = panel.child(head);
+
+    let mut grid = h_flex().mt(px(6.)).gap(px(4.));
+    let statuses: [(&'static str, StatusFilter, Option<Hsla>); 3] = [
+        ("全部", StatusFilter::All, None),
+        ("在线", StatusFilter::Online, Some(Hsla::from(rgb(0x10b981)))),
+        ("离线", StatusFilter::Offline, Some(Hsla::from(rgb(0xef4444)))),
+    ];
+    for (label, filter, dot) in statuses {
+        let active = workspace.status_filter == filter;
+        let count = match filter {
+            StatusFilter::Online => Some(workspace.online_count()),
+            StatusFilter::Offline => Some(workspace.offline_count()),
+            StatusFilter::All => None,
+        };
+        let text = match count {
+            Some(count) => format!("{label} ({count})"),
+            None => label.to_owned(),
+        };
+        let this_status = this.clone();
+        let mut chip = filter_chip(active)
+            .id(SharedString::from(format!("filter-status-{}", label)))
+            .on_click(move |_, _, cx| {
+                let _ = this_status.update(cx, |workspace, cx| {
+                    workspace.status_filter = filter;
+                    cx.notify();
+                });
+            });
+        if let Some(dot_color) = dot {
+            chip = chip.child(div().size(px(8.)).rounded_full().bg(dot_color));
+        }
+        grid = grid.child(chip.child(text));
+    }
+    panel = panel.child(grid);
+
+    // ---- 收藏与分类 ----
+    panel = panel.child(
+        v_flex()
+            .mt(px(12.))
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(rgb(0xf1f2f4))
+            .gap(px(6.))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xa1a1aa))
+                    .child("收藏与分类"),
+            ),
+    );
+
+    let mut chips = h_flex().flex_wrap().gap(px(4.));
+    // 收藏
+    {
+        let active = workspace.favorite_only;
+        let this_fav = this.clone();
+        let base = div()
+            .id("filter-favorite")
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .h(px(24.))
+            .px(px(10.))
+            .rounded_lg()
+            .text_size(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                let _ = this_fav.update(cx, |workspace, cx| {
+                    workspace.favorite_only = !workspace.favorite_only;
+                    cx.notify();
+                });
+            })
+            .child(format!("★ 收藏 ({})", workspace.favorite_count()));
+        chips = chips.child(if active {
+            base.bg(rgb(0xf59e0b)).text_color(rgb(0xffffff))
+        } else {
+            base.bg(rgb(0xf4f4f5)).text_color(rgb(0x52525b))
+        });
+    }
+    // 分类
+    let roles: [(&'static str, RoleFilter); 5] = [
+        ("全部分类", RoleFilter::All),
+        ("主力", RoleFilter::Primary),
+        ("代理", RoleFilter::Proxy),
+        ("测试", RoleFilter::Test),
+        ("归档", RoleFilter::Archived),
+    ];
+    for (label, role) in roles {
+        let active = workspace.role_filter == role;
+        let this_role = this.clone();
+        let base = div()
+            .id(SharedString::from(format!("filter-role-{}", label)))
+            .flex()
+            .items_center()
+            .h(px(24.))
+            .px(px(10.))
+            .rounded_lg()
+            .text_size(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                let _ = this_role.update(cx, |workspace, cx| {
+                    workspace.role_filter = role;
+                    cx.notify();
+                });
+            })
+            .child(label);
+        chips = chips.child(if active {
+            base.bg(rgb(0x18181b)).text_color(rgb(0xffffff))
+        } else {
+            base.bg(rgb(0xf4f4f5)).text_color(rgb(0x52525b))
+        });
+    }
+    panel = panel.child(chips);
+
+    // ---- 标签 ----
+    let tags = workspace.all_tags();
+    if !tags.is_empty() {
+        let mut tag_chips = h_flex().flex_wrap().gap(px(4.));
+        for tag in tags {
+            let active = workspace.tag_filter == tag;
+            let this_tag = this.clone();
+            let value = tag.clone();
+            let base = div()
+                .id(SharedString::from(format!("filter-tag-{}", tag)))
+                .h(px(20.))
+                .px(px(8.))
+                .rounded_lg()
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    let value = value.clone();
+                    let _ = this_tag.update(cx, |workspace, cx| {
+                        workspace.tag_filter = if workspace.tag_filter == value {
+                            String::new()
+                        } else {
+                            value
+                        };
+                        cx.notify();
+                    });
+                })
+                .child(format!("#{tag}"));
+            tag_chips = tag_chips.child(if active {
+                base.bg(rgb(0x18181b)).text_color(rgb(0xffffff))
+            } else {
+                base.bg(rgb(0xf4f4f5)).text_color(rgb(0x52525b))
+            });
+        }
+        panel = panel.child(
+            v_flex()
+                .mt(px(12.))
+                .pt(px(12.))
+                .border_t_1()
+                .border_color(rgb(0xf1f2f4))
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xa1a1aa))
+                        .child("标签"),
+                )
+                .child(tag_chips),
+        );
+    }
+
+    panel.into_any_element()
+}
+
+/// 筛选面板里的状态按钮（真值：圆角 12、12px/500、padding 6/8，激活黑底白字）。
+fn filter_chip(active: bool) -> Div {
+    let base = div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .gap(px(4.))
+        .py(px(6.))
+        .px(px(8.))
+        .rounded_lg()
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer();
+    if active {
+        base.bg(rgb(0x18181b)).text_color(rgb(0xffffff))
+    } else {
+        base.bg(rgb(0xf4f4f5))
+            .text_color(rgb(0x52525b))
+            .hover(|style| style.bg(rgb(0xe4e4e7)))
+    }
 }
 
 /// 品牌图标：纯黑圆角方块 + 白色滑块（旧 `BrandLogo` 的简化等价物）。

@@ -229,6 +229,13 @@ impl Workspace {
             || !self.tag_filter.is_empty()
     }
 
+    pub fn reset_filters(&mut self) {
+        self.status_filter = StatusFilter::All;
+        self.favorite_only = false;
+        self.role_filter = RoleFilter::All;
+        self.tag_filter.clear();
+    }
+
     pub fn filtered_hosts(&self) -> Vec<&Host> {
         let query = self.search_query.trim().to_lowercase();
         self.hosts
