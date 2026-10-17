@@ -20,3 +20,11 @@ async-channel = "2"
 # 不碰 GPUI 自己的 executor。
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
+
+[dev-dependencies]
+# 无头 UI 测试。用 gpui-base / gpui-component 的 test_support（只用公共
+# GPUI API）而不是 gpui-kit 的 test-support：后者的 feature 会拉入
+# gpui-fast 系列，与 gpui-pre 0.3.9 的依赖树版本冲突（cocoa /
+# unicode-properties），解析直接失败。
+gpui-base = { version = "=0.7.3", features = ["test-support"] }
+gpui-component = { version = "=0.7.3", features = ["test-support"] }

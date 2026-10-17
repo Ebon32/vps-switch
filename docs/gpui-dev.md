@@ -78,6 +78,12 @@ fn main() {
 - **彩色 SVG 不能用 `Icon`**：`svg()` 走 `paint_svg`，整图当遮罩单色上色。彩色要 `img()`（光栅化成位图）。
 - **gpui-kit 的 Scrollable 不是就地在原元素加滚动条**：它重建外层 div。滚动区内先放一层 `v_flex().w_full()` 再写内容（否则子块按内容宽度收缩，宽度参差）。
 - **无头 UI 测试**：`gpui-kit` 的 `test-support` feature + `gpui_kit::test::TestWindowExt`（真实 Workspace 在无头窗口里渲染，`click`/`input`/`find` 驱动）。每个里程碑的验收都要有这类测试，别只靠肉眼看窗口。
+  - ⚠️ **但 gpui-kit 0.7.3 的 `test-support` feature 在 Windows 上解析失败**：它会拉入 `gpui-fast` 系列（0.1.7），与 `gpui-pre 0.3.9` 的依赖树冲突（`cocoa` 要 `=0.26.0` vs `0.26.1`，随后 `unicode-properties` 也冲突）。
+  - ✅ **替代方案（已在本仓库验证）**：dev-dependencies 用 `gpui-base = { version = "=0.7.3", features = ["test-support"] }` 与 `gpui-component = { version = "=0.7.3", features = ["test-support"] }`，不用 gpui-kit 的 test-support。TDD 辅助函数在 `gpui-client/tests/ui.rs` 里自实现（`render_frame` = `window.refresh(); window.draw(cx).clear(cx)`；`find` = `gpui_base::test_support::find(window, &[], &ElementId)`；点击 = `window.dispatch_event(MouseDownEvent{..}.to_platform_input(), cx)`）。
+  - 测试元素必须调 `.test_support()`（`gpui_kit::TestSupportExt`）才会出现在查询里。
+  - `TestAppContext::open_window(size, |window, cx| Root::new(view, window, cx))` **返回 `WindowHandle<V>` 而非 Result**，闭包返回 `V` 本身而不是 `Entity<V>`。
+  - `App::subscribe` 的监听器是 **3 个参数** `(Entity<T>, &Event, &mut App)`；`Context::subscribe` 是 4 个参数。
+  - 测试模块**不要 `use gpui_kit::*`**：glob 会把 gpui 的 `test` 宏带进来遮蔽 `#[test]`，宏展开递归直到超限。全部显式导入。
 - 尺寸：`px(..)` 只用于 API 要求 `Pixels` 的地方；其余用 `cx.theme()` token 与 rem 助手。
 
 ### 导入与 API 位置（2026-10-17 首次编译踩过的坑）

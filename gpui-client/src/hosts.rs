@@ -1,11 +1,20 @@
 //! 左侧主机面板：Dock 里的一个面板，列出守护进程返回的主机。
+//! 单击选中；双击（或单击已选中项）让工作区在中央区打开终端标签。
 
 use gpui_kit::StatefulInteractiveElement as _;
+use gpui_kit::TestSupportExt as _;
 use gpui_kit::component::*;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::*;
 
 use crate::api::HostSummary;
+
+/// 面板向工作区发出的事件。
+#[derive(Clone, Debug)]
+pub enum HostListEvent {
+    /// 用户要在这台主机上打开终端。
+    Open(HostSummary),
+}
 
 pub struct HostList {
     focus_handle: FocusHandle,
@@ -13,6 +22,7 @@ pub struct HostList {
     /// 正在显示的错误（例如守护进程没起来）；None 表示还没加载过。
     error: Option<String>,
     loaded: bool,
+    selected: Option<String>,
 }
 
 impl HostList {
@@ -22,6 +32,7 @@ impl HostList {
             hosts: Vec::new(),
             error: None,
             loaded: false,
+            selected: None,
         }
     }
 
@@ -37,7 +48,12 @@ impl HostList {
         cx.notify();
     }
 
-    fn render_host(&self, host: &HostSummary, cx: &App) -> impl IntoElement {
+    fn render_host(
+        &self,
+        host: &HostSummary,
+        this: &Entity<Self>,
+        cx: &App,
+    ) -> impl IntoElement {
         let online = host.last_error.is_none() && host.latency_ms.is_some();
         let dot_color = if online {
             cx.theme().success
@@ -51,7 +67,10 @@ impl HostList {
         } else {
             host.addr.clone()
         };
-        let row = h_flex()
+        let selected = self.selected.as_deref() == Some(host.id.as_str());
+        let host_click = host.clone();
+        let this_click = this.clone();
+        let mut row = h_flex()
             .id(SharedString::from(format!("host-{}", host.id)))
             .px_3()
             .py_2()
@@ -59,6 +78,18 @@ impl HostList {
             .w_full()
             .rounded_md()
             .hover(|style| style.bg(cx.theme().accent))
+            .on_click(move |event, _window, cx| {
+                let host = host_click.clone();
+                let open = event.click_count() >= 2;
+                let _ = this_click.update(cx, |this, cx| {
+                    let already = this.selected.as_deref() == Some(host.id.as_str());
+                    this.selected = Some(host.id.clone());
+                    cx.notify();
+                    if open || already {
+                        cx.emit(HostListEvent::Open(host.clone()));
+                    }
+                });
+            })
             .child(div().size(px(8.)).rounded_full().bg(dot_color).flex_shrink_0())
             .child(
                 v_flex()
@@ -74,16 +105,19 @@ impl HostList {
                             .child(detail),
                     ),
             );
+        if selected {
+            row = row.bg(cx.theme().accent);
+        }
         if host.pinned {
-            row.child(
+            row = row.child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child("置顶"),
-            )
-        } else {
-            row
+            );
         }
+        // 注册给无头测试的元素查询（生产构建里是恒等）。
+        row.test_support()
     }
 }
 
@@ -94,6 +128,7 @@ impl Focusable for HostList {
 }
 
 impl EventEmitter<PanelEvent> for HostList {}
+impl EventEmitter<HostListEvent> for HostList {}
 
 impl BasePanel for HostList {
     fn panel_name(&self) -> &'static str {
@@ -109,6 +144,7 @@ impl Panel for HostList {
 
 impl Render for HostList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity();
         let body = if let Some(error) = &self.error {
             v_flex()
                 .p_3()
@@ -134,7 +170,11 @@ impl Render for HostList {
             v_flex()
                 .p_2()
                 .gap_0p5()
-                .children(self.hosts.iter().map(|host| self.render_host(host, cx)))
+                .children(
+                    self.hosts
+                        .iter()
+                        .map(|host| self.render_host(host, &this, cx)),
+                )
                 .into_any_element()
         };
         v_flex()

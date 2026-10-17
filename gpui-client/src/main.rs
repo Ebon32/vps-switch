@@ -5,12 +5,10 @@
 //! 只做一件事：把守护进程（`vps-switch.exe`，axum + SQLite + SSH + MCP）的
 //! HTTP/WS API 渲染成原生界面。所有业务在守护进程里，这里没有第二份实现。
 
-mod api;
-mod hosts;
-mod workspace;
-
 use gpui_kit::component::Root;
 use gpui_kit::*;
+
+use vps_switch_gpui::{api, workspace};
 
 fn main() {
     gpui_kit::application().run(|cx| {
