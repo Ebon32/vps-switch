@@ -1,23 +1,21 @@
-//! 中央区的终端标签页。M1 是占位：显示主机信息；M2 接入 alacritty_terminal
-//! 渲染与字节 WS。
+//! 中央区的终端标签页：顶栏显示主机，正文是真实的终端视图。
 
 use gpui_kit::component::*;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::*;
 
 use crate::api::HostSummary;
+use crate::terminal::TerminalView;
 
 pub struct TerminalPanel {
-    focus_handle: FocusHandle,
     host: HostSummary,
+    terminal: Entity<TerminalView>,
 }
 
 impl TerminalPanel {
     pub fn new(host: HostSummary, cx: &mut Context<Self>) -> Self {
-        Self {
-            focus_handle: cx.focus_handle(),
-            host,
-        }
+        let terminal = cx.new(|cx| TerminalView::new(host.id.clone(), cx));
+        Self { host, terminal }
     }
 
     pub fn host_id(&self) -> &str {
@@ -26,8 +24,8 @@ impl TerminalPanel {
 }
 
 impl Focusable for TerminalPanel {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.terminal.read(cx).focus_handle(cx)
     }
 }
 
@@ -77,17 +75,10 @@ impl Render for TerminalPanel {
                     ),
             )
             .child(
-                v_flex()
+                div()
                     .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("终端将在 M2 接入"),
-                    ),
+                    .min_h_0()
+                    .child(self.terminal.clone()),
             )
     }
 }

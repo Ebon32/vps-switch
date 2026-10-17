@@ -39,9 +39,12 @@ pub struct Api {
 }
 
 /// 守护进程地址。本机优先定位下固定回环；端口留环境变量覆盖以便隔离测试。
-fn base_url() -> String {
-    let port = std::env::var("VPS_SWITCH_PORT").unwrap_or_else(|_| "18800".into());
-    format!("http://127.0.0.1:{port}")
+pub fn base_url() -> String {
+    format!("http://127.0.0.1:{}", port())
+}
+
+pub fn port() -> String {
+    std::env::var("VPS_SWITCH_PORT").unwrap_or_else(|_| "18800".into())
 }
 
 impl Api {

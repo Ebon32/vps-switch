@@ -4,5 +4,6 @@
 
 pub mod api;
 pub mod hosts;
+pub mod terminal;
 pub mod terminal_panel;
 pub mod workspace;

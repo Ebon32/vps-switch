@@ -18,8 +18,13 @@ serde_json = "1"
 async-channel = "2"
 # 客户端网络层跑在专用线程的 current_thread 运行时上（与 shell-rs 同款），
 # 不碰 GPUI 自己的 executor。
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
+# 终端：与守护进程同版本的 VTE 解析器；客户端拿 WS 字节流自己再解析一遍
+# （与浏览器里 xterm.js 的地位相同）。
+alacritty_terminal = "0.26"
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
 
 [dev-dependencies]
 # 无头 UI 测试。用 gpui-base / gpui-component 的 test_support（只用公共
