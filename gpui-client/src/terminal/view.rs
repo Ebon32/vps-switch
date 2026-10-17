@@ -24,23 +24,33 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
     /// 会话结束的原因；有值时在底部显示提示条。
     status: Option<String>,
+    /// 白底 / 黑底（与旧前端的 LIGHT_THEME / DARK_THEME 对应）。
+    dark: bool,
     cols: u16,
     rows: u16,
 }
 
 impl TerminalView {
-    pub fn new(host_id: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(host_id: String, dark: bool, cx: &mut Context<Self>) -> Self {
         let (cols, rows) = (100, 30);
         let this = Self {
             session: Session::spawn(host_id, cols, rows),
             snapshot: None,
             focus_handle: cx.focus_handle(),
             status: None,
+            dark,
             cols,
             rows,
         };
         Self::poll(cx);
         this
+    }
+
+    pub fn set_dark(&mut self, dark: bool, cx: &mut Context<Self>) {
+        if self.dark != dark {
+            self.dark = dark;
+            cx.notify();
+        }
     }
 
     fn poll(cx: &mut Context<Self>) {
@@ -102,9 +112,10 @@ impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
         let focus = self.focus_handle.clone();
+        let palette = palette(self.dark);
         let mut root = div()
             .size_full()
-            .bg(terminal_background())
+            .bg(Hsla::from(rgb(palette.background)))
             .track_focus(&focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 if let Some(bytes) = encode_key(&event.keystroke) {
@@ -240,9 +251,10 @@ impl Element for TerminalElement {
                 .update(cx, |view, _| view.request_size(clamped_cols, clamped_rows));
         }
 
-        let default_fg: Hsla = terminal_foreground();
-        let default_bg: Hsla = terminal_background();
-        let palette = ansi_palette();
+        let colors = palette(self.view.read(cx).dark);
+        let default_fg: Hsla = Hsla::from(rgb(colors.foreground));
+        let default_bg: Hsla = Hsla::from(rgb(colors.background));
+        let palette: [Hsla; 16] = colors.ansi.map(|hex| Hsla::from(rgb(hex)));
 
         let rows_to_draw = rows.min(snapshot.rows);
         let cols_to_draw = cols.min(snapshot.cols);
@@ -368,9 +380,9 @@ impl Element for TerminalElement {
                     return state;
                 }
                 CursorShape::Block | CursorShape::HollowBlock | CursorShape::Beam => {
-                    Hsla::from(rgb(0xd8dee9)).opacity(0.7)
+                    Hsla::from(rgb(colors.cursor)).opacity(0.7)
                 }
-                CursorShape::Underline => Hsla::from(rgb(0xd8dee9)).opacity(0.5),
+                CursorShape::Underline => Hsla::from(rgb(colors.cursor)).opacity(0.5),
             };
             state.cursor = Some(fill(rect, color));
         }
@@ -410,25 +422,42 @@ impl Element for TerminalElement {
     }
 }
 
-/// 终端底色/前景：固定深色（后续接设置里的独立终端主题）。
-fn terminal_background() -> Hsla {
-    Hsla::from(rgb(0x16181d))
+/// 终端配色，与旧前端 `TerminalPaneView.vue` 的 LIGHT_THEME / DARK_THEME 对齐。
+struct Palette {
+    background: u32,
+    foreground: u32,
+    cursor: u32,
+    ansi: [u32; 16],
 }
 
-fn terminal_foreground() -> Hsla {
-    Hsla::from(rgb(0xd8dee9))
+fn palette(dark: bool) -> Palette {
+    if dark {
+        Palette {
+            background: 0x0c0d10,
+            foreground: 0xe4e4e7,
+            cursor: 0xf4f4f5,
+            ansi: [
+                0x27272a, 0xf87171, 0x4ade80, 0xfacc15, 0x60a5fa, 0xc084fc, 0x22d3ee,
+                0xe4e4e7, 0x71717a, 0xfca5a5, 0x86efac, 0xfde047, 0x93c5fd, 0xd8b4fe,
+                0x67e8f9, 0xffffff,
+            ],
+        }
+    } else {
+        Palette {
+            background: 0xffffff,
+            foreground: 0x18181b,
+            cursor: 0x18181b,
+            ansi: [
+                0x18181b, 0xdc2626, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2,
+                0xe4e4e7, 0x71717a, 0xef4444, 0x22c55e, 0xeab308, 0x3b82f6, 0xa855f7,
+                0x06b6d4, 0xfafafa,
+            ],
+        }
+    }
 }
 
 fn is_default_bg(color: Color) -> bool {
     matches!(color, Color::Named(NamedColor::Background))
-}
-
-fn ansi_palette() -> [Hsla; 16] {
-    [
-        0x1d1f21, 0xc65d5c, 0x8cc46b, 0xd4b96a, 0x7aa2f7, 0xb48ead, 0x62b3b2, 0xc4c9d1,
-        0x585b70, 0xe06866, 0xa3d17a, 0xf0c167, 0x9ab8ff, 0xc79bda, 0x7fc9c8, 0xf2f4f8,
-    ]
-    .map(|hex| Hsla::from(rgb(hex)))
 }
 
 fn resolve_color(color: Color, default_fg: Hsla, default_bg: Hsla, palette: &[Hsla; 16]) -> Hsla {
