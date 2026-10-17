@@ -80,6 +80,15 @@ fn main() {
 - **无头 UI 测试**：`gpui-kit` 的 `test-support` feature + `gpui_kit::test::TestWindowExt`（真实 Workspace 在无头窗口里渲染，`click`/`input`/`find` 驱动）。每个里程碑的验收都要有这类测试，别只靠肉眼看窗口。
 - 尺寸：`px(..)` 只用于 API 要求 `Pixels` 的地方；其余用 `cx.theme()` token 与 rem 助手。
 
+### 导入与 API 位置（2026-10-17 首次编译踩过的坑）
+
+- `h_flex` / `v_flex` 在 **`gpui_kit::component::*`**，不在 `gpui_kit::*`。
+- `.when(...)` 依赖 `gpui::util::FluentBuilder`，**gpui-kit 没有再导出它**（`gpui_kit::util` 也不存在）——别用 `when`，写普通 `if` 分支。
+- `.overflow_y_scroll()` 是 `StatefulInteractiveElement` 的方法：**元素必须先 `.id(...)`**（普通 `div()` 没有它）。style 层面的 overflow 没有独立 helper。
+- 字重：`.font_weight(gpui_kit::FontWeight::SEMIBOLD)`，没有 `font_semibold` 这类 helper。
+- 主题色：`cx.theme().success` / `.danger` / `.muted_foreground` / `.border` / `.accent` / `.background`（`ActiveTheme` 由 `gpui_kit::component::*` 带入）。
+- 若报 "no method found for struct Div"，先怀疑是 trait 不在作用域（`gpui_kit::*` 是 `pub use ::gpui::*`，不包含 prelude 的全部 trait），逐个显式导入。
+
 ---
 
 ## 5. 终端渲染要点（四个参照项目的共识）

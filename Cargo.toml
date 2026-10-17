@@ -1,3 +1,7 @@
+[workspace]
+members = ["gpui-client"]
+resolver = "2"
+
 [package]
 name = "vps-switch"
 version = "0.1.0"

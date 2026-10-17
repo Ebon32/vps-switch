@@ -1,0 +1,22 @@
+[package]
+name = "vps-switch-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "vps-switch-gpui"
+path = "src/main.rs"
+
+[dependencies]
+# 整个 GPUI 栈只有一个依赖入口：gpui-kit = GPUI + 组件 + 图标。
+# 它内部精确锁 `gpui-pre = 0.3.9`（Zed 的周更快照），不要在这里写 gpui 本身。
+gpui-kit = "=0.7.3"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-channel = "2"
+# 客户端网络层跑在专用线程的 current_thread 运行时上（与 shell-rs 同款），
+# 不碰 GPUI 自己的 executor。
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
