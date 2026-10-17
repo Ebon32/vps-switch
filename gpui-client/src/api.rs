@@ -96,6 +96,7 @@ pub enum ApiCommand {
     CheckAll,
     CheckHost(String),
     PatchMeta { host_id: String, patch: serde_json::Value },
+    Reorder { ordered_ids: Vec<String> },
     Post { path: String, body: serde_json::Value },
 }
 
@@ -203,6 +204,18 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                 Err(error) => Some(ApiEvent::Failed(error)),
             }
         }
+        ApiCommand::Reorder { ordered_ids } => {
+            match put_json(
+                client,
+                "/api/hosts/reorder",
+                &serde_json::json!({ "orderedIds": ordered_ids }),
+            )
+            .await
+            {
+                Ok(body) => Some(ApiEvent::Hosts(hosts_from_json(&body))),
+                Err(error) => Some(ApiEvent::Failed(error)),
+            }
+        }
         ApiCommand::Post { path, body } => match post_json(client, &path, Some(&body)).await {
             Ok(body) => Some(ApiEvent::Json(body)),
             Err(error) => Some(ApiEvent::Failed(error)),
@@ -242,6 +255,20 @@ async fn patch_json(
 ) -> Result<serde_json::Value, String> {
     let response = client
         .patch(format!("{}{path}", base_url()))
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| format!("连接守护进程失败：{error}"))?;
+    read_json(response).await
+}
+
+async fn put_json(
+    client: &reqwest::Client,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let response = client
+        .put(format!("{}{path}", base_url()))
         .json(body)
         .send()
         .await

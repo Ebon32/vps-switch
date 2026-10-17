@@ -1,5 +1,6 @@
-//! 顶栏：品牌 + 仓库/侧栏按钮 + 会话标签 + 搜索 + 筛选 + 检测 + 主题/设置/新增。
-//! 规格见 `docs/ui-spec.md` §3。
+//! 顶栏（规格 §3）。尺寸与颜色取自旧前端的 computed style（Playwright 实测）：
+//! 高 50px；`bg white/75` + 底边框 `zinc-200/75`；按钮高 29px；
+//! 「仓库」按钮圆角 12px + 白底 + 细阴影；搜索/筛选/检测为胶囊；圆钮 32px、白 85% 底。
 
 use gpui_kit::component::input::Input;
 use gpui_kit::component::*;
@@ -13,20 +14,16 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
     let has_stage = workspace.has_stage();
     let theme = cx.theme();
 
-    // ---- 左组 ----
-    let mut left = h_flex()
-        .min_w_0()
-        .flex_1()
-        .items_center()
-        .gap(px(6.));
+    let mut left = h_flex().min_w_0().flex_1().items_center().gap(px(6.));
 
+    // 品牌（旧版：logo 24px + 8px 间距 + 14px/700 文字）
     left = left.child(
         h_flex()
             .flex_shrink_0()
             .items_center()
             .gap(px(8.))
             .mr(px(4.))
-            .child(brand_logo(cx))
+            .child(brand_logo())
             .child(
                 div()
                     .text_size(px(14.))
@@ -36,32 +33,29 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
             ),
     );
 
-    // 「仓库」按钮
+    // 「仓库」按钮：圆角 12px、白底、边框 zinc-200/90、阴影、高 29
     let home_active = workspace.page == Page::Workspace && !has_stage;
     let this_home = this.clone();
     left = left.child(
-        pill(home_active, cx)
+        raised_button(home_active)
             .id("nav-home")
             .on_click(move |_, _, cx| {
                 let _ = this_home.update(cx, |workspace, cx| workspace.close_stage(cx));
             })
             .child(icon(IconName::House, 14., cx))
             .child("仓库")
-            .child(count_badge(
-                format!(
-                    "{}/{}",
-                    workspace.online_count(),
-                    workspace.total_active_count()
-                ),
-                cx,
-            )),
+            .child(count_badge(format!(
+                "{}/{}",
+                workspace.online_count(),
+                workspace.total_active_count()
+            ))),
     );
 
     // 「侧栏」切换（仅有舞台时）
     if has_stage {
         let this_side = this.clone();
         left = left.child(
-            pill(workspace.show_sidebar_in_stage, cx)
+            raised_button(workspace.show_sidebar_in_stage)
                 .id("nav-sidebar")
                 .on_click(move |_, _, cx| {
                     let _ = this_side.update(cx, |workspace, cx| workspace.toggle_sidebar(cx));
@@ -85,18 +79,12 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
         .flex_shrink_0()
         .items_center()
         .gap(px(8.))
-        // 搜索
-        .child(
-            div()
-                .w(px(190.))
-                .child(Input::new(&workspace.search)),
-        )
-        // 筛选按钮
+        .child(div().w(px(176.)).child(Input::new(&workspace.search)))
         .child({
             let active = workspace.has_active_filter();
             let this_filter = this.clone();
             let label = filter_summary(workspace);
-            pill(active, cx)
+            pill_button(active)
                 .id("nav-filter")
                 .on_click(move |_, _, cx| {
                     let _ = this_filter.update(cx, |workspace, cx| {
@@ -112,7 +100,7 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
         let checking = workspace.checking_all;
         let this_check = this.clone();
         right = right.child(
-            pill(false, cx)
+            pill_button(false)
                 .id("nav-check")
                 .on_click(move |_, _, cx| {
                     let _ = this_check.update(cx, |workspace, cx| workspace.check_all(cx));
@@ -122,21 +110,17 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
         );
     }
 
-    // 主题切换
+    // 主题切换（32px 圆钮，白 85% 底）
     let this_theme = this.clone();
     let is_dark = workspace.is_dark;
     right = right.child(
-        round_button(cx)
+        round_button(false)
             .id("nav-theme")
             .on_click(move |_, _, cx| {
                 let _ = this_theme.update(cx, |workspace, cx| workspace.toggle_theme(cx));
             })
             .child(icon(
-                if is_dark {
-                    IconName::Sun
-                } else {
-                    IconName::Moon
-                },
+                if is_dark { IconName::Sun } else { IconName::Moon },
                 16.,
                 cx,
             )),
@@ -146,19 +130,15 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
     let this_settings = this.clone();
     let settings_active = workspace.page == Page::Settings;
     right = right.child(
-        if settings_active {
-            round_button_active(cx)
-        } else {
-            round_button(cx)
-        }
-        .id("nav-settings")
-        .on_click(move |_, _, cx| {
-            let _ = this_settings.update(cx, |workspace, cx| workspace.open_settings(cx));
-        })
-        .child(icon(IconName::Settings, 16., cx)),
+        round_button(settings_active)
+            .id("nav-settings")
+            .on_click(move |_, _, cx| {
+                let _ = this_settings.update(cx, |workspace, cx| workspace.open_settings(cx));
+            })
+            .child(icon(IconName::Settings, 16., cx)),
     );
 
-    // 新增 VPS（橙色）
+    // 新增 VPS（橙色 #f97316，白字，32px）
     right = right.child(
         div()
             .id("nav-add")
@@ -169,12 +149,13 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
             .rounded_full()
             .bg(rgb(0xf97316))
             .text_color(rgb(0xffffff))
+            .shadow_sm()
             .hover(|style| style.bg(rgb(0xea580c)))
             .child(icon(IconName::Plus, 16., cx)),
     );
 
     h_flex()
-        .h(px(52.))
+        .h(px(50.))
         .flex_shrink_0()
         .items_center()
         .justify_between()
@@ -182,8 +163,8 @@ pub fn render(workspace: &Workspace, this: &Entity<Workspace>, cx: &App) -> impl
         .px(px(16.))
         .py(px(8.))
         .border_b_1()
-        .border_color(rgb(0xe4e4e7))
-        .bg(rgb(0xfafafa))
+        .border_color(Hsla::from(rgb(0xe4e4e7)).opacity(0.75))
+        .bg(Hsla::from(rgb(0xffffff)).opacity(0.75))
         .child(left)
         .child(right)
 }
@@ -196,8 +177,12 @@ fn session_tab(
 ) -> impl IntoElement {
     let theme = cx.theme();
     let host = workspace.host_by_id(&tab.host_id);
-    let name = host.map(|h| h.name.clone()).unwrap_or_else(|| tab.host_id.clone());
-    let status = host.map(|h| h.status.clone()).unwrap_or_else(|| "unknown".into());
+    let name = host
+        .map(|h| h.name.clone())
+        .unwrap_or_else(|| tab.host_id.clone());
+    let status = host
+        .map(|h| h.status.clone())
+        .unwrap_or_else(|| "unknown".into());
     let active = workspace.page == Page::Workspace
         && workspace.has_stage()
         && workspace.stage_host_id.as_deref() == Some(tab.host_id.as_str());
@@ -213,7 +198,7 @@ fn session_tab(
         .flex_shrink_0()
         .items_center()
         .gap(px(8.))
-        .h(px(30.))
+        .h(px(29.))
         .px(px(12.))
         .rounded_lg()
         .border_1()
@@ -229,26 +214,21 @@ fn session_tab(
                 .rounded_full()
                 .bg(status_dot_color(&status, cx)),
         )
-        .child(
-            div()
-                .max_w(px(128.))
-                .truncate()
-                .child(name),
-        );
+        .child(div().max_w(px(128.)).truncate().child(name));
     let base = if pane_count > 1 {
-        base.child(count_badge(format!("×{pane_count}"), cx))
+        base.child(count_badge(format!("×{pane_count}")))
     } else {
         base
     };
     let styled = if active {
-        base.border_color(theme.border)
+        base.border_color(Hsla::from(rgb(0xe4e4e7)).opacity(0.9))
             .bg(rgb(0xffffff))
             .text_color(theme.foreground)
             .shadow_sm()
     } else {
         base.border_color(Hsla::transparent_black())
-            .bg(rgb(0xf1f2f4))
-            .text_color(theme.muted_foreground)
+            .bg(Hsla::from(rgb(0xf1f2f4)).opacity(0.6))
+            .text_color(rgb(0x52525b))
     };
     styled.child(
         div()
@@ -258,7 +238,7 @@ fn session_tab(
             .justify_center()
             .size(px(16.))
             .rounded_sm()
-            .text_color(theme.muted_foreground)
+            .text_color(rgb(0xa1a1aa))
             .hover(|style| style.bg(rgb(0xe4e4e7)).text_color(theme.foreground))
             .on_click(move |_, _, cx| {
                 let id = close_id.clone();
@@ -277,68 +257,88 @@ pub fn status_dot_color(status: &str, cx: &App) -> Hsla {
     }
 }
 
-/// 胶囊按钮的公共样式。
-pub fn pill(active: bool, cx: &App) -> Div {
-    let theme = cx.theme();
+/// 「仓库 / 侧栏」按钮：高 29、圆角 12px、激活白底+细阴影，否则透明+灰字。
+fn raised_button(active: bool) -> Div {
     let base = div()
         .flex()
         .items_center()
         .gap(px(6.))
-        .h(px(30.))
+        .h(px(29.))
         .px(px(12.))
         .rounded_lg()
         .border_1()
         .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
         .cursor_pointer();
     if active {
-        base.border_color(theme.border)
+        base.border_color(Hsla::from(rgb(0xe4e4e7)).opacity(0.9))
             .bg(rgb(0xffffff))
-            .text_color(theme.foreground)
+            .text_color(rgb(0x18181b))
             .shadow_sm()
     } else {
         base.border_color(Hsla::transparent_black())
-            .text_color(theme.muted_foreground)
+            .text_color(rgb(0x71717a))
+            .hover(|style| style.bg(Hsla::from(rgb(0xffffff)).opacity(0.6)))
+    }
+}
+
+/// 胶囊按钮（筛选 / 检测）：高 29、圆角 full、白 85% 底、边框 zinc-200/80。
+fn pill_button(active: bool) -> Div {
+    let base = div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .h(px(29.))
+        .px(px(12.))
+        .rounded_full()
+        .border_1()
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer();
+    if active {
+        base.border_color(rgb(0x18181b))
+            .bg(rgb(0x18181b))
+            .text_color(rgb(0xffffff))
+            .shadow_sm()
+    } else {
+        base.border_color(Hsla::from(rgb(0xe4e4e7)).opacity(0.8))
+            .bg(Hsla::from(rgb(0xffffff)).opacity(0.85))
+            .text_color(rgb(0x3f3f46))
             .hover(|style| style.bg(rgb(0xffffff)))
     }
 }
 
-fn round_button(cx: &App) -> Div {
-    let theme = cx.theme();
-    div()
+/// 圆钮：32px、白 85% 底、边框 zinc-200/80、图标色 zinc-500。
+fn round_button(active: bool) -> Div {
+    let base = div()
         .flex()
         .items_center()
         .justify_center()
         .size(px(32.))
         .rounded_full()
         .border_1()
-        .border_color(theme.border)
-        .bg(rgb(0xffffff))
-        .text_color(theme.muted_foreground)
-        .cursor_pointer()
-        .hover(|style| style.text_color(theme.foreground))
+        .cursor_pointer();
+    if active {
+        base.border_color(rgb(0x18181b))
+            .bg(rgb(0x18181b))
+            .text_color(rgb(0xffffff))
+            .shadow_sm()
+    } else {
+        base.border_color(Hsla::from(rgb(0xe4e4e7)).opacity(0.8))
+            .bg(Hsla::from(rgb(0xffffff)).opacity(0.85))
+            .text_color(rgb(0x52525b))
+            .hover(|style| style.bg(rgb(0xffffff)).text_color(rgb(0x18181b)))
+    }
 }
 
-fn round_button_active(_cx: &App) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(32.))
-        .rounded_full()
-        .border_1()
-        .border_color(rgb(0x18181b))
-        .bg(rgb(0x18181b))
-        .text_color(rgb(0xffffff))
-        .cursor_pointer()
-}
-
-fn count_badge(text: String, _cx: &App) -> impl IntoElement {
+fn count_badge(text: String) -> impl IntoElement {
     div()
         .rounded_full()
         .bg(rgb(0xf1f2f4))
         .px(px(6.))
         .py(px(1.))
         .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(0x71717a))
         .child(text)
 }
@@ -375,8 +375,8 @@ pub fn icon(name: IconName, size: f32, _cx: &App) -> impl IntoElement {
     div().text_size(px(size)).child(Icon::new(name))
 }
 
-/// 品牌图标：纯黑圆角方块 + 白色滑块符号（旧 `BrandLogo` 的简化等价物）。
-fn brand_logo(_cx: &App) -> impl IntoElement {
+/// 品牌图标：纯黑圆角方块 + 白色滑块（旧 `BrandLogo` 的简化等价物）。
+fn brand_logo() -> impl IntoElement {
     div()
         .flex()
         .items_center()

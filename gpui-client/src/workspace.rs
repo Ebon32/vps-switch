@@ -576,6 +576,29 @@ impl Workspace {
         self.patch_meta(host_id, serde_json::json!({"pinned": pinned}), cx);
     }
 
+    /// 拖拽排序：把 `from_id` 挪到 `to_id` 的位置（本机不参与）。
+    pub fn reorder(&mut self, from_id: &str, to_id: &str, cx: &mut Context<Self>) {
+        if from_id == to_id {
+            return;
+        }
+        let mut ids: Vec<String> = self
+            .hosts
+            .iter()
+            .filter(|host| host.kind != "local")
+            .map(|host| host.id.clone())
+            .collect();
+        let (Some(from), Some(to)) = (
+            ids.iter().position(|id| id == from_id),
+            ids.iter().position(|id| id == to_id),
+        ) else {
+            return;
+        };
+        let moved = ids.remove(from);
+        ids.insert(to, moved);
+        self.api.send(ApiCommand::Reorder { ordered_ids: ids });
+        cx.notify();
+    }
+
     pub fn create_pane(&mut self, tab_index: usize, cx: &mut Context<Self>) {
         let Some(tab) = self.open_tabs.get(tab_index) else {
             return;
@@ -837,7 +860,8 @@ impl Render for Workspace {
     }
 }
 
-/// 页面底色：旧前端的径向渐变用纯色近似。
+/// 页面底色：旧前端是径向渐变 `#f9fafb → #f1f3f6`；GPUI 没有径向渐变，
+/// 用两端的中间值近似。
 fn page_background() -> Hsla {
-    Hsla::from(rgb(0xf4f5f7))
+    Hsla::from(rgb(0xf5f6f8))
 }
