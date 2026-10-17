@@ -8,7 +8,7 @@
 
 ## 边界
 
-**一个轻量级 VPS 管理工具：先把 VPS 仓库、终端、文件浏览器、文件上传下载、探针五大核心板块做到极致，最后将这些现成链路加上护栏工具化为 MCP Server。**
+**一个轻量级 VPS 管理工具：先把 VPS 仓库、终端、文件浏览器、文件上传下载、探针五大核心板块做到极致，最后将这些现成链路加上护栏工具化为 MCP Server。交付两个产物：GPUI 原生的桌面客户端（Windows / macOS / Linux，`vps-switch-gpui`）与无头的守护进程（`vps-switch`，Linux/Windows），两者共用同一后端与同一套 HTTP/WS API。**
 
 设计准则：
 
@@ -109,5 +109,5 @@
 | Web 服务与实时通信 | `axum` | REST API + 终端二进制 WebSocket + 状态/探针/传输进度 SSE |
 | 本地存储 | `rusqlite`（bundled） | 单文件 SQLite + 凭据加密存储 |
 | MCP 协议 | `rmcp`（≥ 1.4.0） | 板块六接入，支持 stdio 与 Streamable HTTP |
-| 桌面壳 | Tauri 2 | 桌面窗口与托盘 + headless 同一二进制双模式 |
+| 桌面壳 | GPUI（`gpui-kit` 0.7.3，内部锁 `gpui-pre` 0.3.9） | GPUI 原生桌面客户端（Windows / macOS / Linux）；Linux 无头服务不带壳。详见 `docs/gpui-client.md` |
 | 前端 | Vue 3 + TypeScript + Tailwind CSS + xterm.js（WebGL）+ CodeMirror 6 | 轻量、响应迅速、围绕五大板块打造精致 UI |
