@@ -44,6 +44,7 @@ pub struct TerminalView {
     dragging_selection: bool,
     last_cell_origin: Point<Pixels>,
     last_cell_size: gpui_kit::Size<Pixels>,
+    last_viewport_size: gpui_kit::Size<Pixels>,
 
     // 中文 IME 预编辑状态
     pub marked_text: String,
@@ -52,6 +53,7 @@ pub struct TerminalView {
 
     // 终端右键菜单坐标（相对于终端视图左上角）
     pub context_menu_pos: Option<Point<Pixels>>,
+    scroll_remainder: f32,
 
     // 刷新/重连计数与无头测试样本
     pub refresh_count: u32,
@@ -133,10 +135,12 @@ impl TerminalView {
             dragging_selection: false,
             last_cell_origin: point(px(0.), px(0.)),
             last_cell_size: size(px(8.), px(18.)),
+            last_viewport_size: size(px(800.), px(480.)),
             marked_text: String::new(),
             marked_selection: 0..0,
             ime_cursor_bounds: None,
             context_menu_pos: None,
+            scroll_remainder: 0.0,
             refresh_count: 0,
             mock_sample_line,
         };
@@ -286,10 +290,12 @@ impl TerminalView {
         rows: u16,
         cell_origin: Point<Pixels>,
         cell_size: gpui_kit::Size<Pixels>,
+        viewport_size: gpui_kit::Size<Pixels>,
         ime_bounds: Option<Bounds<Pixels>>,
     ) {
         self.last_cell_origin = cell_origin;
         self.last_cell_size = cell_size;
+        self.last_viewport_size = viewport_size;
         self.ime_cursor_bounds = ime_bounds;
         if cols >= 2 && rows >= 1 && (cols != self.cols || rows != self.rows) {
             self.cols = cols;
@@ -312,6 +318,21 @@ impl TerminalView {
 
     fn scroll(&mut self, lines: i32) {
         self.session.send(SessionCommand::Scroll(lines));
+    }
+
+    fn scroll_by_delta(&mut self, delta_lines: f32) {
+        if delta_lines == 0.0 {
+            return;
+        }
+        if self.scroll_remainder != 0.0 && self.scroll_remainder.signum() != delta_lines.signum() {
+            self.scroll_remainder = 0.0;
+        }
+        let total = self.scroll_remainder + delta_lines;
+        let lines = total.trunc() as i32;
+        self.scroll_remainder = total - lines as f32;
+        if lines != 0 {
+            self.scroll(lines);
+        }
     }
 
     /// 提取当前鼠标选区内的纯文本。
@@ -393,9 +414,38 @@ impl TerminalView {
             return;
         }
 
+        // 2.5 Shift+PageUp / Shift+PageDown / Shift+Up / Shift+Down 翻看终端历史记录
+        if ks.modifiers.shift && !ctrl_or_cmd && !ks.modifiers.alt {
+            let page = (self.rows.saturating_sub(2)).max(1) as i32;
+            match key.as_str() {
+                "pageup" => {
+                    self.scroll(page);
+                    cx.stop_propagation();
+                    return;
+                }
+                "pagedown" => {
+                    self.scroll(-page);
+                    cx.stop_propagation();
+                    return;
+                }
+                "up" => {
+                    self.scroll(1);
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" => {
+                    self.scroll(-1);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // 3. 特殊控制键与 Ctrl/Alt 组合键由这里直接编码发送并停止冒泡；
         //    普通可打印字符与中文输入法留给 EntityInputHandler 处理，避免重复输入。
-        if let Some(bytes) = encode_special_key(ks) {
+        let app_cursor = self.snapshot.as_ref().is_some_and(|s| s.app_cursor);
+        if let Some(bytes) = encode_special_key(ks, app_cursor) {
             self.selection = None;
             self.context_menu_pos = None;
             self.send_input(bytes);
@@ -537,8 +587,12 @@ impl Render for TerminalView {
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus_handle, cx);
-                    let rel_x = (event.position.x - this.last_cell_origin.x).max(px(12.));
-                    let rel_y = (event.position.y - this.last_cell_origin.y).max(px(12.));
+                    let max_x = (this.last_viewport_size.width - px(164.)).max(px(8.));
+                    let max_y = (this.last_viewport_size.height - px(140.)).max(px(8.));
+                    let rel_x = (event.position.x - this.last_cell_origin.x + px(12.))
+                        .clamp(px(8.), max_x);
+                    let rel_y = (event.position.y - this.last_cell_origin.y + px(8.))
+                        .clamp(px(8.), max_y);
                     this.context_menu_pos = Some(point(rel_x, rel_y));
                     cx.notify();
                     cx.stop_propagation();
@@ -590,14 +644,14 @@ impl Render for TerminalView {
             .bg(Hsla::from(rgb(colors.background)))
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, _cx| {
-                let dy = event.delta.pixel_delta(px(FONT_SIZE)).y;
-                if dy != px(0.) {
-                    let lines = (dy.as_f32() / (FONT_SIZE * LINE_HEIGHT)).round() as i32;
-                    if lines != 0 {
-                        this.scroll(lines);
-                    }
-                }
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                let line_px = (FONT_SIZE * LINE_HEIGHT).max(1.0);
+                let delta_lines = match event.delta {
+                    ScrollDelta::Lines(p) => p.y * 3.0,
+                    ScrollDelta::Pixels(p) => p.y.as_f32() / line_px,
+                };
+                this.scroll_by_delta(delta_lines);
+                cx.stop_propagation();
             }))
             .child(canvas_area);
 
@@ -970,6 +1024,7 @@ struct TerminalPaintState {
     segments: Vec<Segment>,
     backgrounds: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    scrollbar_thumb: Option<PaintQuad>,
     preedit_line: Option<(Point<Pixels>, ShapedLine, PaintQuad)>,
     ime_cursor_bounds: Option<Bounds<Pixels>>,
     cell_width: Pixels,
@@ -1041,6 +1096,7 @@ impl Element for TerminalElement {
             segments: Vec::new(),
             backgrounds: Vec::new(),
             cursor: None,
+            scrollbar_thumb: None,
             preedit_line: None,
             ime_cursor_bounds: None,
             cell_width,
@@ -1219,13 +1275,22 @@ impl Element for TerminalElement {
 
         // 3. 光标与中文 IME 预编辑串
         if let Some((row, col)) = snapshot.cursor.filter(|(r, _)| *r < rows_to_draw) {
+            let is_wide_cursor = col < snapshot.cols
+                && snapshot.cells[row * snapshot.cols + col]
+                    .flags
+                    .contains(Flags::WIDE_CHAR);
+            let cursor_w = if is_wide_cursor {
+                cell_width * 2.0
+            } else {
+                cell_width
+            };
             let cursor_origin = point(
                 bounds.left() + cell_width * col as f32,
                 bounds.top() + line_height * row as f32,
             );
             let cursor_rect = Bounds {
                 origin: cursor_origin,
-                size: size(cell_width, line_height),
+                size: size(cursor_w, line_height),
             };
             state.ime_cursor_bounds = Some(cursor_rect);
 
@@ -1250,7 +1315,7 @@ impl Element for TerminalElement {
                 );
                 let bg_rect = Bounds {
                     origin: cursor_origin,
-                    size: size(shaped.width().max(cell_width), line_height),
+                    size: size(shaped.width().max(cursor_w), line_height),
                 };
                 state.preedit_line = Some((cursor_origin, shaped, fill(bg_rect, default_bg)));
             } else if snapshot.cursor_shape != CursorShape::Hidden {
@@ -1268,12 +1333,35 @@ impl Element for TerminalElement {
                     },
                     CursorShape::Underline => Bounds {
                         origin: point(cursor_origin.x, cursor_origin.y + line_height - px(2.)),
-                        size: size(cell_width, px(2.)),
+                        size: size(cursor_w, px(2.)),
                     },
                     _ => cursor_rect,
                 };
                 state.cursor = Some(fill(shape_rect, cursor_color));
             }
+        }
+
+        // 4. 历史滚动条指示器（有 scrollback 历史时在右侧边缘绘制 4px 滑块）
+        if snapshot.history_size > 0 && bounds.size.height > px(16.) {
+            let total_lines = (snapshot.history_size + snapshot.rows).max(1) as f32;
+            let track_h = bounds.size.height.as_f32();
+            let ratio = (snapshot.rows as f32 / total_lines).clamp(0.05, 1.0);
+            let thumb_h = (track_h * ratio).max(20.0).min(track_h);
+            let top_lines = snapshot
+                .history_size
+                .saturating_sub(snapshot.display_offset) as f32;
+            let progress = (top_lines / (snapshot.history_size as f32)).clamp(0.0, 1.0);
+            let thumb_y = bounds.top().as_f32() + (track_h - thumb_h) * progress;
+            let thumb_rect = Bounds {
+                origin: point(bounds.right() - px(5.), px(thumb_y)),
+                size: size(px(4.), px(thumb_h)),
+            };
+            let thumb_color = if self.dark {
+                Hsla::from(rgb(0xffffff)).opacity(if snapshot.display_offset > 0 { 0.36 } else { 0.16 })
+            } else {
+                Hsla::from(rgb(0x18181b)).opacity(if snapshot.display_offset > 0 { 0.30 } else { 0.14 })
+            };
+            state.scrollbar_thumb = Some(fill(thumb_rect, thumb_color).corner_radii(px(2.)));
         }
 
         state
@@ -1301,9 +1389,17 @@ impl Element for TerminalElement {
         let rows = state.computed_rows;
         let cell_origin = bounds.origin;
         let cell_size = size(state.cell_width, state.line_height);
+        let viewport_size = bounds.size;
         let ime_bounds = state.ime_cursor_bounds;
         self.view.update(cx, |view, _| {
-            view.sync_viewport(cols, rows, cell_origin, cell_size, ime_bounds);
+            view.sync_viewport(
+                cols,
+                rows,
+                cell_origin,
+                cell_size,
+                viewport_size,
+                ime_bounds,
+            );
         });
 
         let mask = ContentMask { bounds };
@@ -1334,6 +1430,9 @@ impl Element for TerminalElement {
             }
             if let Some(cursor) = state.cursor.take() {
                 window.paint_quad(cursor);
+            }
+            if let Some(thumb) = state.scrollbar_thumb.take() {
+                window.paint_quad(thumb);
             }
         });
     }
@@ -1476,27 +1575,72 @@ fn styled_font(font: &Font, flags: Flags) -> Font {
 }
 
 /// 只编码特殊控制键与 Ctrl/Alt 组合键；普通字符与 IME 交给 `EntityInputHandler`。
-fn encode_special_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
+fn encode_special_key(keystroke: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     let key = keystroke.key.as_str();
     let ctrl = keystroke.modifiers.control;
     let alt = keystroke.modifiers.alt;
+    let shift = keystroke.modifiers.shift;
     let sequence: Vec<u8> = match key {
         "enter" => b"\r".to_vec(),
         "backspace" => b"\x7f".to_vec(),
         "tab" => {
-            if keystroke.modifiers.shift {
+            if shift {
                 b"\x1b[Z".to_vec()
             } else {
                 b"\t".to_vec()
             }
         }
         "escape" => b"\x1b".to_vec(),
-        "up" => b"\x1b[A".to_vec(),
-        "down" => b"\x1b[B".to_vec(),
-        "right" => b"\x1b[C".to_vec(),
-        "left" => b"\x1b[D".to_vec(),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
+        "up" => {
+            if ctrl {
+                return Some(b"\x1b[1;5A".to_vec());
+            } else if app_cursor && !alt && !shift {
+                return Some(b"\x1bOA".to_vec());
+            } else {
+                b"\x1b[A".to_vec()
+            }
+        }
+        "down" => {
+            if ctrl {
+                return Some(b"\x1b[1;5B".to_vec());
+            } else if app_cursor && !alt && !shift {
+                return Some(b"\x1bOB".to_vec());
+            } else {
+                b"\x1b[B".to_vec()
+            }
+        }
+        "right" => {
+            if ctrl {
+                return Some(b"\x1b[1;5C".to_vec());
+            } else if app_cursor && !alt && !shift {
+                return Some(b"\x1bOC".to_vec());
+            } else {
+                b"\x1b[C".to_vec()
+            }
+        }
+        "left" => {
+            if ctrl {
+                return Some(b"\x1b[1;5D".to_vec());
+            } else if app_cursor && !alt && !shift {
+                return Some(b"\x1bOD".to_vec());
+            } else {
+                b"\x1b[D".to_vec()
+            }
+        }
+        "home" => {
+            if app_cursor && !ctrl && !alt && !shift {
+                return Some(b"\x1bOH".to_vec());
+            } else {
+                b"\x1b[H".to_vec()
+            }
+        }
+        "end" => {
+            if app_cursor && !ctrl && !alt && !shift {
+                return Some(b"\x1bOF".to_vec());
+            } else {
+                b"\x1b[F".to_vec()
+            }
+        }
         "insert" => b"\x1b[2~".to_vec(),
         "delete" => b"\x1b[3~".to_vec(),
         "pageup" => b"\x1b[5~".to_vec(),

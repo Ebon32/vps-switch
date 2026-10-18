@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const LOCAL_HOST_ID: &str = "local";
+pub const LOCAL_PROXY_JUMP_ID: &str = "local-proxy";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

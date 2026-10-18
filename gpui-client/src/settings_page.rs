@@ -36,9 +36,13 @@ pub enum McpConfigPreviewMode {
 pub struct SettingsState {
     pub active_tab: SettingsTab,
 
-    // 常规与自启
+    // 常规与自启 & 本机代理出口
     pub autostart: bool,
     pub close_action: String, // "tray" | "exit"
+    pub proxy_mode: String,   // "off" | "per_host" | "global"
+    pub proxy_port: u16,
+    pub proxy_port_input: Entity<InputState>,
+    pub pending_proxy_port_sync: Option<String>,
 
     // 访问安全
     pub auth_enabled: bool,
@@ -68,6 +72,9 @@ pub struct SettingsState {
     pub filter_host: String,
     pub filter_tool: String,
     pub filter_ok: String, // "" | "true" | "false"
+    pub host_dropdown_open: bool,
+    pub tool_dropdown_open: bool,
+    pub ok_dropdown_open: bool,
     pub expanded_call_id: Option<String>,
     pub expanded_detail: Option<(String, String)>,
     pub loading_detail: bool,
@@ -87,11 +94,31 @@ impl SettingsState {
                 .placeholder("admin")
                 .default_value("admin")
         });
+        cx.subscribe_in(
+            &admin_username,
+            window,
+            |ws, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    ws.save_auth_settings(window, cx);
+                }
+            },
+        )
+        .detach();
         let admin_password = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("设置或修改登录密码")
                 .masked(true)
         });
+        cx.subscribe_in(
+            &admin_password,
+            window,
+            |ws, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    ws.save_auth_settings(window, cx);
+                }
+            },
+        )
+        .detach();
         let guard_editor = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(16)
@@ -122,10 +149,30 @@ impl SettingsState {
         )
         .detach();
 
+        let proxy_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("7890")
+                .default_value("7890")
+        });
+        cx.subscribe_in(
+            &proxy_port_input,
+            window,
+            |ws, _, event: &InputEvent, _window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    ws.save_proxy_port_from_input(cx);
+                }
+            },
+        )
+        .detach();
+
         Self {
             active_tab: SettingsTab::General,
             autostart: false,
             close_action: "tray".into(),
+            proxy_mode: "per_host".into(),
+            proxy_port: 7890,
+            proxy_port_input,
+            pending_proxy_port_sync: None,
             auth_enabled: false,
             admin_username,
             admin_password,
@@ -149,6 +196,9 @@ impl SettingsState {
             filter_host: String::new(),
             filter_tool: String::new(),
             filter_ok: String::new(),
+            host_dropdown_open: false,
+            tool_dropdown_open: false,
+            ok_dropdown_open: false,
             expanded_call_id: None,
             expanded_detail: None,
             loading_detail: false,
@@ -172,6 +222,13 @@ impl SettingsState {
         } else {
             "tray".into()
         };
+        if matches!(bundle.proxy_mode.as_str(), "off" | "per_host" | "global") {
+            self.proxy_mode = bundle.proxy_mode;
+        }
+        if bundle.proxy_port > 0 {
+            self.proxy_port = bundle.proxy_port;
+            self.pending_proxy_port_sync = Some(bundle.proxy_port.to_string());
+        }
         self.claude_code_synced = bundle.claude_code_synced;
         self.codex_synced = bundle.codex_synced;
         if !bundle.exe_path.is_empty() {
@@ -247,6 +304,9 @@ impl SettingsState {
 impl Workspace {
     pub fn switch_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         self.settings.active_tab = tab;
+        self.settings.host_dropdown_open = false;
+        self.settings.tool_dropdown_open = false;
+        self.settings.ok_dropdown_open = false;
         if tab == SettingsTab::Calls {
             self.settings.expanded_call_id = None;
             self.settings.expanded_detail = None;
@@ -277,6 +337,40 @@ impl Workspace {
             close_action: self.settings.close_action.clone(),
             prev_autostart: prev_auto,
             prev_close_action: prev_close,
+        });
+        cx.notify();
+    }
+
+    pub fn set_proxy_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        let port = self
+            .settings
+            .proxy_port_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p >= 1)
+            .unwrap_or(self.settings.proxy_port.max(1));
+        self.settings.proxy_mode = mode.to_owned();
+        self.settings.proxy_port = port;
+        self.api.send(ApiCommand::SaveProxy {
+            proxy_mode: self.settings.proxy_mode.clone(),
+            proxy_port: port,
+        });
+        cx.notify();
+    }
+
+    pub fn save_proxy_port_from_input(&mut self, cx: &mut Context<Self>) {
+        let raw = self.settings.proxy_port_input.read(cx).value().trim().to_owned();
+        let Some(port) = raw.parse::<u16>().ok().filter(|p| *p >= 1) else {
+            self.show_toast("请输入 1 ~ 65535 之间的有效本地代理端口", ToastKind::Err, cx);
+            return;
+        };
+        self.settings.proxy_port = port;
+        self.api.send(ApiCommand::SaveProxy {
+            proxy_mode: self.settings.proxy_mode.clone(),
+            proxy_port: port,
         });
         cx.notify();
     }
@@ -378,6 +472,9 @@ impl Workspace {
         self.settings.filter_host.clear();
         self.settings.filter_tool.clear();
         self.settings.filter_ok.clear();
+        self.settings.host_dropdown_open = false;
+        self.settings.tool_dropdown_open = false;
+        self.settings.ok_dropdown_open = false;
         self.reload_mcp_calls(cx);
     }
 
@@ -617,12 +714,17 @@ fn render_general_tab(
 ) -> AnyElement {
     let autostart = workspace.settings.autostart;
     let close_is_tray = workspace.settings.close_action != "exit";
+    let proxy_mode = workspace.settings.proxy_mode.as_str();
     let is_dark = workspace.is_dark;
     let term_dark = workspace.terminal_dark;
 
     let this_auto = this.clone();
     let this_tray = this.clone();
     let this_exit = this.clone();
+    let this_proxy_off = this.clone();
+    let this_proxy_host = this.clone();
+    let this_proxy_global = this.clone();
+    let this_proxy_save = this.clone();
     let this_light = this.clone();
     let this_dark = this.clone();
     let this_term_light = this.clone();
@@ -868,11 +970,162 @@ fn render_general_tab(
             ),
     );
 
+    let proxy_card = section_shell(palette).child(
+        v_flex()
+            .gap(px(14.))
+            .child(
+                v_flex()
+                    .pb(px(12.))
+                    .border_b_1()
+                    .border_color(palette.divider)
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text_primary)
+                            .child("本机代理出口路由 (SOCKS5 / HTTP)"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(palette.text_faint)
+                            .child("无需开启全局 TUN，直接连接本机代理软件监听端口（如 Clash 7890 / v2rayN 10808）转发 SSH、SFTP 与探针流量"),
+                    ),
+            )
+            .child(
+                inner_row_shell(palette).child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(palette.text_primary)
+                                        .child("代理出口模式"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(palette.text_faint)
+                                        .child("「按主机选择」可在主机编辑弹窗的跳板机列表里单独指定走本机代理；「全局默认」让所有直连 VPS 默认走该端口"),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap(px(4.))
+                                .p(px(3.))
+                                .rounded_xl()
+                                .bg(palette.subtle_bg)
+                                .child(seg_btn(
+                                    "settings-proxy-off",
+                                    "关闭",
+                                    proxy_mode == "off",
+                                    palette,
+                                    move |_, _, cx| {
+                                        let _ = this_proxy_off
+                                            .update(cx, |w, cx| w.set_proxy_mode("off", cx));
+                                    },
+                                ))
+                                .child(seg_btn(
+                                    "settings-proxy-per-host",
+                                    "按主机选择",
+                                    proxy_mode == "per_host",
+                                    palette,
+                                    move |_, _, cx| {
+                                        let _ = this_proxy_host
+                                            .update(cx, |w, cx| w.set_proxy_mode("per_host", cx));
+                                    },
+                                ))
+                                .child(seg_btn(
+                                    "settings-proxy-global",
+                                    "全局默认走代理",
+                                    proxy_mode == "global",
+                                    palette,
+                                    move |_, _, cx| {
+                                        let _ = this_proxy_global
+                                            .update(cx, |w, cx| w.set_proxy_mode("global", cx));
+                                    },
+                                )),
+                        ),
+                ),
+            )
+            .child(
+                inner_row_shell(palette).child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(palette.text_primary)
+                                        .child("本机代理端口 (127.0.0.1)"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(palette.text_faint)
+                                        .child("自动兼容 SOCKS5、HTTP CONNECT 与 Mixed 混合端口（填写端口号回车或点击保存即可）"),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(palette.text_muted)
+                                        .child("127.0.0.1 :"),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(96.))
+                                        .child(Input::new(&workspace.settings.proxy_port_input)),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-proxy-save")
+                                        .test_support()
+                                        .rounded_lg()
+                                        .bg(palette.primary_bg)
+                                        .text_color(palette.primary_fg)
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .cursor_pointer()
+                                        .on_click(move |_, _, cx| {
+                                            let _ = this_proxy_save.update(cx, |w, cx| {
+                                                w.save_proxy_port_from_input(cx);
+                                            });
+                                        })
+                                        .child("保存端口"),
+                                ),
+                        ),
+                ),
+            ),
+    );
+
     v_flex()
         .id("settings-panel-general")
         .test_support()
         .gap(px(16.))
         .child(card1)
+        .child(proxy_card)
         .child(card2)
         .into_any_element()
 }
@@ -1638,14 +1891,14 @@ fn render_calls_tab(
         )
         .child(
             v_flex()
-                .w(px(140.))
+                .w(px(148.))
                 .gap(px(4.))
                 .child(
                     div()
                         .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(palette.text_muted)
-                        .child("主机（点击切换）"),
+                        .child("主机"),
                 )
                 .child(
                     div()
@@ -1655,7 +1908,11 @@ fn render_calls_tab(
                         .px(px(10.))
                         .rounded_xl()
                         .border_1()
-                        .border_color(palette.border)
+                        .border_color(if s.host_dropdown_open {
+                            palette.text_secondary
+                        } else {
+                            palette.border
+                        })
                         .bg(palette.card_solid_bg)
                         .flex()
                         .items_center()
@@ -1663,21 +1920,24 @@ fn render_calls_tab(
                         .text_size(px(11.))
                         .text_color(palette.text_primary)
                         .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
                         .on_click(move |_, _, cx| {
                             let _ = this_host_cycle.update(cx, |w, cx| {
-                                let mut opts = vec![String::new()];
-                                opts.extend(w.settings.call_hosts.clone());
-                                let pos = opts
-                                    .iter()
-                                    .position(|h| *h == w.settings.filter_host)
-                                    .unwrap_or(0);
-                                w.settings.filter_host = opts[(pos + 1) % opts.len()].clone();
-                                w.reload_mcp_calls(cx);
+                                w.settings.host_dropdown_open = !w.settings.host_dropdown_open;
+                                w.settings.tool_dropdown_open = false;
+                                w.settings.ok_dropdown_open = false;
+                                cx.notify();
                             });
                         })
                         .child(div().truncate().child(host_label))
                         .child(lucide_icon(
-                            CatalogIcon::ChevronsUpDown,
+                            if s.host_dropdown_open {
+                                CatalogIcon::ChevronUp
+                            } else {
+                                CatalogIcon::ChevronDown
+                            },
                             12.,
                             palette.text_faint,
                         )),
@@ -1685,14 +1945,14 @@ fn render_calls_tab(
         )
         .child(
             v_flex()
-                .w(px(140.))
+                .w(px(148.))
                 .gap(px(4.))
                 .child(
                     div()
                         .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(palette.text_muted)
-                        .child("工具（点击切换）"),
+                        .child("工具"),
                 )
                 .child(
                     div()
@@ -1702,7 +1962,11 @@ fn render_calls_tab(
                         .px(px(10.))
                         .rounded_xl()
                         .border_1()
-                        .border_color(palette.border)
+                        .border_color(if s.tool_dropdown_open {
+                            palette.text_secondary
+                        } else {
+                            palette.border
+                        })
                         .bg(palette.card_solid_bg)
                         .flex()
                         .items_center()
@@ -1710,21 +1974,24 @@ fn render_calls_tab(
                         .text_size(px(11.))
                         .text_color(palette.text_primary)
                         .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
                         .on_click(move |_, _, cx| {
                             let _ = this_tool_cycle.update(cx, |w, cx| {
-                                let mut opts = vec![String::new()];
-                                opts.extend(w.settings.call_tools.clone());
-                                let pos = opts
-                                    .iter()
-                                    .position(|t| *t == w.settings.filter_tool)
-                                    .unwrap_or(0);
-                                w.settings.filter_tool = opts[(pos + 1) % opts.len()].clone();
-                                w.reload_mcp_calls(cx);
+                                w.settings.tool_dropdown_open = !w.settings.tool_dropdown_open;
+                                w.settings.host_dropdown_open = false;
+                                w.settings.ok_dropdown_open = false;
+                                cx.notify();
                             });
                         })
                         .child(div().truncate().child(tool_label))
                         .child(lucide_icon(
-                            CatalogIcon::ChevronsUpDown,
+                            if s.tool_dropdown_open {
+                                CatalogIcon::ChevronUp
+                            } else {
+                                CatalogIcon::ChevronDown
+                            },
                             12.,
                             palette.text_faint,
                         )),
@@ -1749,7 +2016,11 @@ fn render_calls_tab(
                         .px(px(10.))
                         .rounded_xl()
                         .border_1()
-                        .border_color(palette.border)
+                        .border_color(if s.ok_dropdown_open {
+                            palette.text_secondary
+                        } else {
+                            palette.border
+                        })
                         .bg(palette.card_solid_bg)
                         .flex()
                         .items_center()
@@ -1757,19 +2028,24 @@ fn render_calls_tab(
                         .text_size(px(11.))
                         .text_color(palette.text_primary)
                         .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
                         .on_click(move |_, _, cx| {
                             let _ = this_ok_cycle.update(cx, |w, cx| {
-                                w.settings.filter_ok = match w.settings.filter_ok.as_str() {
-                                    "" => "true".into(),
-                                    "true" => "false".into(),
-                                    _ => String::new(),
-                                };
-                                w.reload_mcp_calls(cx);
+                                w.settings.ok_dropdown_open = !w.settings.ok_dropdown_open;
+                                w.settings.host_dropdown_open = false;
+                                w.settings.tool_dropdown_open = false;
+                                cx.notify();
                             });
                         })
                         .child(ok_label)
                         .child(lucide_icon(
-                            CatalogIcon::ChevronsUpDown,
+                            if s.ok_dropdown_open {
+                                CatalogIcon::ChevronUp
+                            } else {
+                                CatalogIcon::ChevronDown
+                            },
                             12.,
                             palette.text_faint,
                         )),
@@ -1797,6 +2073,173 @@ fn render_calls_tab(
                     let _ = this_reset.update(cx, |w, cx| w.reset_mcp_call_filters(window, cx));
                 })
                 .child("重置筛选"),
+        );
+    }
+
+    let mut filter_section = v_flex().w_full().gap(px(8.)).child(filter_bar);
+
+    if s.host_dropdown_open {
+        let mut opts = vec![(String::new(), "全部主机".to_owned())];
+        opts.extend(s.call_hosts.iter().map(|h| (h.clone(), h.clone())));
+        let mut list_inner = h_flex().flex_wrap().gap(px(6.));
+        for (idx, (val, label)) in opts.into_iter().enumerate() {
+            let selected = val == s.filter_host;
+            let this_pick = this.clone();
+            let picked = val.clone();
+            let chip = div()
+                .id(SharedString::from(format!("calls-host-opt-{idx}")))
+                .test_support()
+                .rounded_lg()
+                .border_1()
+                .px(px(10.))
+                .py(px(4.))
+                .text_size(px(11.))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    let next = picked.clone();
+                    let _ = this_pick.update(cx, |w, cx| {
+                        w.settings.filter_host = next;
+                        w.settings.host_dropdown_open = false;
+                        w.reload_mcp_calls(cx);
+                    });
+                })
+                .child(label);
+            list_inner = list_inner.child(if selected {
+                chip.border_color(palette.primary_bg)
+                    .bg(palette.primary_bg)
+                    .text_color(palette.primary_fg)
+                    .font_weight(FontWeight::MEDIUM)
+            } else {
+                chip.border_color(palette.border)
+                    .bg(palette.card_solid_bg)
+                    .text_color(palette.text_secondary)
+                    .hover(|s| s.bg(palette.subtle_bg))
+            });
+        }
+        filter_section = filter_section.child(
+            div()
+                .id("calls-host-dropdown")
+                .test_support()
+                .max_h(px(180.))
+                .overflow_y_scroll()
+                .rounded_xl()
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.muted_surface_bg)
+                .p(px(10.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(list_inner),
+        );
+    }
+
+    if s.tool_dropdown_open {
+        let mut opts = vec![(String::new(), "全部工具".to_owned())];
+        opts.extend(s.call_tools.iter().map(|t| (t.clone(), t.clone())));
+        let mut list_inner = h_flex().flex_wrap().gap(px(6.));
+        for (idx, (val, label)) in opts.into_iter().enumerate() {
+            let selected = val == s.filter_tool;
+            let this_pick = this.clone();
+            let picked = val.clone();
+            let chip = div()
+                .id(SharedString::from(format!("calls-tool-opt-{idx}")))
+                .test_support()
+                .rounded_lg()
+                .border_1()
+                .px(px(10.))
+                .py(px(4.))
+                .text_size(px(11.))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    let next = picked.clone();
+                    let _ = this_pick.update(cx, |w, cx| {
+                        w.settings.filter_tool = next;
+                        w.settings.tool_dropdown_open = false;
+                        w.reload_mcp_calls(cx);
+                    });
+                })
+                .child(label);
+            list_inner = list_inner.child(if selected {
+                chip.border_color(palette.primary_bg)
+                    .bg(palette.primary_bg)
+                    .text_color(palette.primary_fg)
+                    .font_weight(FontWeight::MEDIUM)
+            } else {
+                chip.border_color(palette.border)
+                    .bg(palette.card_solid_bg)
+                    .text_color(palette.text_secondary)
+                    .hover(|s| s.bg(palette.subtle_bg))
+            });
+        }
+        filter_section = filter_section.child(
+            div()
+                .id("calls-tool-dropdown")
+                .test_support()
+                .max_h(px(160.))
+                .overflow_y_scroll()
+                .rounded_xl()
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.muted_surface_bg)
+                .p(px(10.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(list_inner),
+        );
+    }
+
+    if s.ok_dropdown_open {
+        let opts: [(&str, &str); 3] = [("", "全部"), ("true", "成功"), ("false", "失败")];
+        let mut list_inner = h_flex().flex_wrap().gap(px(6.));
+        for (idx, (val, label)) in opts.into_iter().enumerate() {
+            let selected = val == s.filter_ok;
+            let this_pick = this.clone();
+            let picked = val.to_owned();
+            let chip = div()
+                .id(SharedString::from(format!("calls-ok-opt-{idx}")))
+                .test_support()
+                .rounded_lg()
+                .border_1()
+                .px(px(10.))
+                .py(px(4.))
+                .text_size(px(11.))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    let next = picked.clone();
+                    let _ = this_pick.update(cx, |w, cx| {
+                        w.settings.filter_ok = next;
+                        w.settings.ok_dropdown_open = false;
+                        w.reload_mcp_calls(cx);
+                    });
+                })
+                .child(label);
+            list_inner = list_inner.child(if selected {
+                chip.border_color(palette.primary_bg)
+                    .bg(palette.primary_bg)
+                    .text_color(palette.primary_fg)
+                    .font_weight(FontWeight::MEDIUM)
+            } else {
+                chip.border_color(palette.border)
+                    .bg(palette.card_solid_bg)
+                    .text_color(palette.text_secondary)
+                    .hover(|s| s.bg(palette.subtle_bg))
+            });
+        }
+        filter_section = filter_section.child(
+            div()
+                .id("calls-ok-dropdown")
+                .test_support()
+                .rounded_xl()
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.muted_surface_bg)
+                .p(px(10.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(list_inner),
         );
     }
 
@@ -1839,13 +2282,15 @@ fn render_calls_tab(
             let call_id = call.id.clone();
             let this_row = this.clone();
             let subtle = palette.subtle_bg;
+            let one_line_args = single_line_preview(&call.args, "{}");
+            let one_line_summary = single_line_preview(&call.summary, "—");
 
             table = table.child(
                 h_flex()
                     .id(SharedString::from(format!("mcp-call-row-{}", call.id)))
                     .test_support()
-                    .items_start()
-                    .py(px(8.))
+                    .h(px(48.))
+                    .items_center()
                     .px(px(8.))
                     .border_t_1()
                     .border_color(palette.divider)
@@ -1859,12 +2304,14 @@ fn render_calls_tab(
                     .child(
                         div()
                             .w(px(20.))
+                            .flex_shrink_0()
                             .text_color(palette.text_faint)
                             .child(if expanded { "▾" } else { "▸" }),
                     )
                     .child(
                         div()
                             .w(px(148.))
+                            .flex_shrink_0()
                             .text_color(palette.text_muted)
                             .truncate()
                             .child(call.ts.replace('T', " ").chars().take(19).collect::<String>()),
@@ -1872,6 +2319,7 @@ fn render_calls_tab(
                     .child(
                         div()
                             .w(px(110.))
+                            .flex_shrink_0()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(palette.text_primary)
                             .truncate()
@@ -1880,6 +2328,7 @@ fn render_calls_tab(
                     .child(
                         div()
                             .w(px(96.))
+                            .flex_shrink_0()
                             .text_color(palette.text_secondary)
                             .truncate()
                             .child(if call.host.is_empty() {
@@ -1889,48 +2338,61 @@ fn render_calls_tab(
                             }),
                     )
                     .child(
-                        div().w(px(56.)).child(
-                            div()
-                                .rounded(px(4.))
-                                .px(px(6.))
-                                .py(px(1.))
-                                .text_size(px(10.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .bg(if call.ok {
-                                    Hsla::from(rgb(0xecfdf5))
-                                } else {
-                                    Hsla::from(rgb(0xfef2f2))
-                                })
-                                .text_color(if call.ok {
-                                    Hsla::from(rgb(0x059669))
-                                } else {
-                                    Hsla::from(rgb(0xdc2626))
-                                })
-                                .child(if call.ok { "成功" } else { "失败" }),
-                        ),
+                        div()
+                            .w(px(56.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .rounded(px(4.))
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .bg(if call.ok {
+                                        Hsla::from(rgb(0xecfdf5))
+                                    } else {
+                                        Hsla::from(rgb(0xfef2f2))
+                                    })
+                                    .text_color(if call.ok {
+                                        Hsla::from(rgb(0x059669))
+                                    } else {
+                                        Hsla::from(rgb(0xdc2626))
+                                    })
+                                    .child(if call.ok { "成功" } else { "失败" }),
+                            ),
                     )
                     .child(
                         div()
                             .w(px(64.))
+                            .flex_shrink_0()
                             .text_color(palette.text_muted)
+                            .truncate()
                             .child(format!("{}ms", call.duration_ms)),
                     )
                     .child(
                         v_flex()
                             .min_w_0()
                             .flex_1()
+                            .justify_center()
                             .gap(px(2.))
+                            .overflow_hidden()
                             .child(
                                 div()
+                                    .h(px(16.))
+                                    .w_full()
                                     .text_color(palette.text_secondary)
                                     .truncate()
-                                    .child(call.args.clone()),
+                                    .child(one_line_args),
                             )
                             .child(
                                 div()
+                                    .h(px(16.))
+                                    .w_full()
                                     .text_color(palette.text_faint)
                                     .truncate()
-                                    .child(call.summary.clone()),
+                                    .child(one_line_summary),
                             ),
                     ),
             );
@@ -1944,6 +2406,8 @@ fn render_calls_tab(
                 let res_copy = full_res.clone();
                 let this_copy_a = this.clone();
                 let this_copy_r = this.clone();
+                let detail_args_id = SharedString::from(format!("call-detail-args-{}", call.id));
+                let detail_res_id = SharedString::from(format!("call-detail-res-{}", call.id));
 
                 let detail_box = if s.loading_detail && s.expanded_detail.is_none() {
                     div()
@@ -2003,6 +2467,9 @@ fn render_calls_tab(
                                 )
                                 .child(
                                     div()
+                                        .id(detail_args_id)
+                                        .max_h(px(260.))
+                                        .overflow_y_scroll()
                                         .rounded_xl()
                                         .border_1()
                                         .border_color(palette.border)
@@ -2062,6 +2529,9 @@ fn render_calls_tab(
                                 )
                                 .child(
                                     div()
+                                        .id(detail_res_id)
+                                        .max_h(px(340.))
+                                        .overflow_y_scroll()
                                         .rounded_xl()
                                         .border_1()
                                         .border_color(palette.border)
@@ -2133,7 +2603,7 @@ fn render_calls_tab(
                                 .child("刷新"),
                         ),
                 )
-                .child(filter_bar)
+                .child(filter_section)
                 .child(
                     div()
                         .text_size(px(11.))
@@ -2455,3 +2925,14 @@ fn render_about_tab(
         .child(stack)
         .into_any_element()
 }
+
+/// 将可能包含 `\r`/`\n`/`\t` 的多行参数或摘要压成单行，防止未展开行被换行符撑高或因空串坍缩。
+pub fn single_line_preview(raw: &str, fallback: &str) -> String {
+    let joined: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.is_empty() {
+        fallback.to_owned()
+    } else {
+        joined
+    }
+}
+

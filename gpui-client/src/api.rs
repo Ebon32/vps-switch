@@ -9,14 +9,56 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn deserialize_null_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+pub(crate) fn deserialize_null_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<bool>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or(false))
+}
+
+pub(crate) fn deserialize_null_u16<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<u16>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or(0))
+}
+
+pub(crate) fn deserialize_null_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or(0))
+}
+
+pub(crate) fn deserialize_null_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<i64>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or(0))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HostLink {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub id: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub description: String,
 }
 
@@ -90,56 +132,73 @@ pub struct DiskUsage {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_bool")]
     pub is_dir: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_u64")]
     pub size: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_i64")]
     pub mtime: i64,
+    #[serde(default)]
     pub permissions: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferTask {
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub id: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub host_id: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub host_name: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub direction: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub filename: String,
+    #[serde(default)]
     pub local_path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub remote_path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_u64")]
     pub total_bytes: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_u64")]
     pub transferred_bytes: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_u64")]
     pub speed_bps: u64,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub state: String,
-    pub error: Option<String>,
     #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_u64")]
     pub resumed_from: u64,
+    #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
     pub verified: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpCallRecord {
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub id: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub ts: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub tool: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub host: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub args: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_bool")]
     pub ok: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_i64")]
     pub duration_ms: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub summary: String,
 }
 
@@ -153,6 +212,8 @@ pub struct SettingsBundle {
     pub has_admin_password: bool,
     pub autostart: bool,
     pub close_action: String,
+    pub proxy_mode: String,
+    pub proxy_port: u16,
     pub claude_code_synced: bool,
     pub codex_synced: bool,
     pub exe_path: String,
@@ -265,6 +326,10 @@ pub enum ApiEvent {
         prev_autostart: bool,
         prev_close_action: String,
         error: String,
+    },
+    ProxySaved {
+        proxy_mode: String,
+        proxy_port: u16,
     },
     McpSaved {
         mcp_enabled: bool,
@@ -403,6 +468,10 @@ pub enum ApiCommand {
         prev_autostart: bool,
         prev_close_action: String,
     },
+    SaveProxy {
+        proxy_mode: String,
+        proxy_port: u16,
+    },
     SaveMcp {
         mcp_enabled: bool,
         mcp_require_api_key: bool,
@@ -516,12 +585,13 @@ impl Api {
                         sse_event_loop(sse_client, sse_tx).await;
                     });
                     while let Ok(command) = command_rx.recv().await {
-                        let event = handle(&client, command).await;
-                        if let Some(event) = event
-                            && event_tx.send(event).is_err()
-                        {
-                            break;
-                        }
+                        let req_client = client.clone();
+                        let req_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Some(event) = handle(&req_client, command).await {
+                                let _ = req_tx.send(event);
+                            }
+                        });
                     }
                 });
             })
@@ -693,7 +763,14 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                             .map(str::to_owned);
                         let items: Vec<FileEntry> = body
                             .get("items")
-                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|item| {
+                                        serde_json::from_value::<FileEntry>(item.clone()).ok()
+                                    })
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         Some(ApiEvent::FilesListed {
                             host_id,
@@ -994,7 +1071,14 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
             {
                 let tasks: Vec<TransferTask> = body
                     .get("tasks")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                serde_json::from_value::<TransferTask>(item.clone()).ok()
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 return Some(ApiEvent::TransfersListed { host_id, tasks });
             }
@@ -1012,7 +1096,14 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
             {
                 let tasks: Vec<TransferTask> = body
                     .get("tasks")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                serde_json::from_value::<TransferTask>(item.clone()).ok()
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 return Some(ApiEvent::TransfersListed { host_id, tasks });
             }
@@ -1022,6 +1113,8 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
             let mut bundle = SettingsBundle {
                 admin_username: "admin".into(),
                 close_action: "tray".into(),
+                proxy_mode: "per_host".into(),
+                proxy_port: 7890,
                 port: port().parse().unwrap_or(18800),
                 version: "v0.1.0".into(),
                 ..SettingsBundle::default()
@@ -1073,6 +1166,16 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                 }
                 if let Some(ca) = body.get("closeAction").and_then(|v| v.as_str()) {
                     bundle.close_action = ca.to_owned();
+                }
+                if let Some(pm) = body.get("proxyMode").and_then(|v| v.as_str()) {
+                    bundle.proxy_mode = pm.to_owned();
+                }
+                if let Some(pp) = body
+                    .get("proxyPort")
+                    .and_then(|v| v.as_u64())
+                    .filter(|p| *p >= 1 && *p <= 65535)
+                {
+                    bundle.proxy_port = pp as u16;
                 }
             }
             if let Ok(about) = get_json(client, "/api/system/about").await {
@@ -1132,6 +1235,35 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                     prev_close_action,
                     error,
                 }),
+            }
+        }
+        ApiCommand::SaveProxy {
+            proxy_mode,
+            proxy_port,
+        } => {
+            let res = post_json(
+                client,
+                "/api/system/autostart",
+                Some(&serde_json::json!({
+                    "proxyMode": proxy_mode,
+                    "proxyPort": proxy_port,
+                })),
+            )
+            .await;
+            match res {
+                Ok(body) => Some(ApiEvent::ProxySaved {
+                    proxy_mode: body
+                        .get("proxyMode")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&proxy_mode)
+                        .to_owned(),
+                    proxy_port: body
+                        .get("proxyPort")
+                        .and_then(|v| v.as_u64())
+                        .map(|p| p as u16)
+                        .unwrap_or(proxy_port),
+                }),
+                Err(error) => Some(ApiEvent::Failed(format!("保存本机代理设置失败: {error}"))),
             }
         }
         ApiCommand::SaveMcp {
@@ -1272,15 +1404,32 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
             {
                 let calls: Vec<McpCallRecord> = body
                     .get("calls")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                serde_json::from_value::<McpCallRecord>(item.clone()).ok()
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let hosts: Vec<String> = body
                     .get("hosts")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let tools: Vec<String> = body
                     .get("tools")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 return Some(ApiEvent::McpCallsLoaded {
                     calls,
@@ -1500,7 +1649,13 @@ pub fn host_from_json(value: &serde_json::Value) -> Option<Host> {
     };
     let links: Vec<HostLink> = value
         .get("links")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| serde_json::from_value::<HostLink>(item.clone()).ok())
+                .filter(|l| !l.name.is_empty() && !l.url.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     Some(Host {
         id: field("id")?.to_owned(),
@@ -1732,6 +1887,39 @@ mod tests {
             }
             _ => panic!("expected RevealTerminal"),
         }
+    }
+
+    #[test]
+    fn parses_mcp_call_records_with_null_host_and_optional_fields() {
+        let raw = serde_json::json!([
+            {
+                "id": "c-1",
+                "ts": "2026-10-18T07:23:38Z",
+                "tool": "vps_exec",
+                "host": "node-a",
+                "args": "{\"command\":\"ls\"}",
+                "ok": true,
+                "durationMs": 611,
+                "summary": "ok=true"
+            },
+            {
+                "id": "c-2",
+                "ts": "2026-10-18T07:20:00Z",
+                "tool": "vps_list",
+                "host": null,
+                "args": "{}",
+                "ok": true,
+                "durationMs": 4,
+                "summary": null
+            }
+        ]);
+        let records: Vec<McpCallRecord> =
+            serde_json::from_value(raw).expect("records with null host must deserialize");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].host, "node-a");
+        assert_eq!(records[1].tool, "vps_list");
+        assert_eq!(records[1].host, "");
+        assert_eq!(records[1].summary, "");
     }
 }
 

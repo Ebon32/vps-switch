@@ -164,6 +164,7 @@ impl SshPool {
         &self,
         host: &HostRecord,
         jump_host: Option<&HostRecord>,
+        local_proxy_port: Option<u16>,
         master_key: &MasterKey,
     ) -> Result<Arc<Handle<SshClientHandler>>> {
         {
@@ -177,7 +178,8 @@ impl SshPool {
         // 旧 SSH 连接已断开或尚未建立，挂在旧连接上的 SFTP 会话必然已死，同步清除避免残留死句柄
         self.sftps.lock().await.remove(&host.id);
 
-        let handle = connect_single_or_jump(host, jump_host, master_key).await?;
+        let handle =
+            connect_single_or_jump(host, jump_host, local_proxy_port, master_key).await?;
         let arc_handle = Arc::new(handle);
         {
             let mut guard = self.sessions.lock().await;
@@ -191,6 +193,7 @@ impl SshPool {
         &self,
         host: &HostRecord,
         jump_host: Option<&HostRecord>,
+        local_proxy_port: Option<u16>,
         master_key: &MasterKey,
     ) -> Result<Arc<Handle<SshClientHandler>>> {
         {
@@ -202,7 +205,8 @@ impl SshPool {
             }
         }
 
-        let handle = connect_single_or_jump(host, jump_host, master_key).await?;
+        let handle =
+            connect_single_or_jump(host, jump_host, local_proxy_port, master_key).await?;
         let arc_handle = Arc::new(handle);
         {
             let mut guard = self.pane_sessions.lock().await;
@@ -225,14 +229,19 @@ impl SshPool {
         &self,
         host: &HostRecord,
         jump_host: Option<&HostRecord>,
+        local_proxy_port: Option<u16>,
         master_key: &MasterKey,
     ) -> Result<Channel<Msg>> {
-        let handle = self.get_or_connect(host, jump_host, master_key).await?;
+        let handle = self
+            .get_or_connect(host, jump_host, local_proxy_port, master_key)
+            .await?;
         match handle.channel_open_session().await {
             Ok(ch) => Ok(ch),
             Err(_) => {
                 self.invalidate_host(&host.id).await;
-                let fresh = self.get_or_connect(host, jump_host, master_key).await?;
+                let fresh = self
+                    .get_or_connect(host, jump_host, local_proxy_port, master_key)
+                    .await?;
                 fresh
                     .channel_open_session()
                     .await
@@ -246,6 +255,13 @@ impl SshPool {
         self.sessions.lock().await.remove(host_id);
         self.pane_sessions.lock().await.remove(host_id);
         self.exec_gates.lock().await.remove(host_id);
+    }
+
+    /// 当全局代理路由或端口变更时，清空已缓存的连接句柄以便新路由立即生效。
+    pub async fn invalidate_all(&self) {
+        self.sftps.lock().await.clear();
+        self.sessions.lock().await.clear();
+        self.pane_sessions.lock().await.clear();
     }
 
     pub async fn invalidate_sftp(&self, host_id: &str) {
@@ -396,9 +412,134 @@ async fn authenticate_session(
     Err(anyhow!("SSH 认证未通过"))
 }
 
+/// 通过本机代理端口 (`127.0.0.1:proxy_port`) 建立到 `(target_host, target_port)` 的 TCP 隧道。
+/// 自动兼容 SOCKS5（如 Clash 7890 / v2rayN 10808）与 HTTP CONNECT（如 v2rayN 10809）代理端口。
+pub async fn connect_via_local_proxy(
+    proxy_port: u16,
+    target_host: &str,
+    target_port: u16,
+) -> Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+
+    // 1. 优先尝试 SOCKS5 握手（兼容 SOCKS5 端口与 Clash/Mihomo Mixed 混合端口）
+    let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
+        .await
+        .with_context(|| format!("无法连接本机代理端口 {proxy_addr}（请确认代理软件已启动）"))?;
+    let _ = stream.set_nodelay(true);
+
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut greet = [0u8; 2];
+    if stream.read_exact(&mut greet).await.is_ok() && greet == [0x05, 0x00] {
+        let mut req = vec![0x05, 0x01, 0x00];
+        if let Ok(ipv4) = target_host.parse::<std::net::Ipv4Addr>() {
+            req.push(0x01);
+            req.extend_from_slice(&ipv4.octets());
+        } else if let Ok(ipv6) = target_host.parse::<std::net::Ipv6Addr>() {
+            req.push(0x04);
+            req.extend_from_slice(&ipv6.octets());
+        } else {
+            let domain = target_host.as_bytes();
+            if domain.len() > 255 {
+                return Err(anyhow!("目标域名过长"));
+            }
+            req.push(0x03);
+            req.push(domain.len() as u8);
+            req.extend_from_slice(domain);
+        }
+        req.extend_from_slice(&target_port.to_be_bytes());
+        stream.write_all(&req).await?;
+
+        let mut head = [0u8; 4];
+        stream
+            .read_exact(&mut head)
+            .await
+            .context("读取本机 SOCKS5 代理响应失败")?;
+        if head[0] != 0x05 || head[1] != 0x00 {
+            return Err(anyhow!(
+                "本机 SOCKS5 代理拒绝连接 {}:{} (code={})",
+                target_host,
+                target_port,
+                head[1]
+            ));
+        }
+        match head[3] {
+            0x01 => {
+                let mut skip = [0u8; 4 + 2];
+                stream.read_exact(&mut skip).await?;
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                let mut skip = vec![0u8; len[0] as usize + 2];
+                stream.read_exact(&mut skip).await?;
+            }
+            0x04 => {
+                let mut skip = [0u8; 16 + 2];
+                stream.read_exact(&mut skip).await?;
+            }
+            other => return Err(anyhow!("未知的 SOCKS5 地址类型: {other}")),
+        }
+        return Ok(stream);
+    }
+
+    // 2. 若代理端口不是 SOCKS5（例如纯 HTTP 代理端口），自动使用 HTTP CONNECT 握手
+    let mut http_stream = tokio::net::TcpStream::connect(&proxy_addr)
+        .await
+        .with_context(|| format!("无法连接本机 HTTP 代理端口 {proxy_addr}"))?;
+    let _ = http_stream.set_nodelay(true);
+    let connect_req = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    http_stream.write_all(connect_req.as_bytes()).await?;
+
+    let mut resp_buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while resp_buf.len() < 4096 {
+        let n = http_stream.read(&mut byte).await?;
+        if n == 0 {
+            break;
+        }
+        resp_buf.push(byte[0]);
+        if resp_buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let header_str = String::from_utf8_lossy(&resp_buf);
+    let first_line = header_str.lines().next().unwrap_or("");
+    if first_line.contains(" 200 ") || first_line.ends_with(" 200") {
+        Ok(http_stream)
+    } else {
+        Err(anyhow!(
+            "本机代理 ({proxy_addr}) 隧道握手失败: {}",
+            first_line.trim()
+        ))
+    }
+}
+
+async fn connect_raw_or_proxy(
+    config: Arc<Config>,
+    target_host: &str,
+    target_port: u16,
+    local_proxy_port: Option<u16>,
+) -> Result<Handle<SshClientHandler>> {
+    if let Some(proxy_port) = local_proxy_port.filter(|p| *p > 0) {
+        let stream = connect_via_local_proxy(proxy_port, target_host, target_port).await?;
+        client::connect_stream(config, stream, SshClientHandler)
+            .await
+            .context("经本机代理进行 SSH 握手失败")
+    } else {
+        let addr = format!("{target_host}:{target_port}");
+        client::connect(config, addr.as_str(), SshClientHandler)
+            .await
+            .context("SSH 连接失败")
+    }
+}
+
 pub async fn connect_single_or_jump(
     host: &HostRecord,
     jump_host: Option<&HostRecord>,
+    local_proxy_port: Option<u16>,
     master_key: &MasterKey,
 ) -> Result<Handle<SshClientHandler>> {
     let mut cfg = Config::default();
@@ -413,14 +554,17 @@ pub async fn connect_single_or_jump(
     let config = Arc::new(cfg);
 
     if let Some(jump) = jump_host {
-        let jump_addr = format!("{}:{}", jump.addr.trim(), jump.port);
         let mut jump_session = tokio::time::timeout(
             Duration::from_secs(10),
-            client::connect(config.clone(), jump_addr.as_str(), SshClientHandler),
+            connect_raw_or_proxy(
+                config.clone(),
+                jump.addr.trim(),
+                jump.port,
+                local_proxy_port,
+            ),
         )
         .await
-        .context("连接跳板机超时")?
-        .context("连接跳板机失败")?;
+        .context("连接跳板机超时")??;
 
         authenticate_session(&mut jump_session, jump, master_key)
             .await
@@ -451,14 +595,12 @@ pub async fn connect_single_or_jump(
         authenticate_session(&mut target_session, host, master_key).await?;
         Ok(target_session)
     } else {
-        let addr = format!("{}:{}", host.addr.trim(), host.port);
         let mut session = tokio::time::timeout(
-            Duration::from_secs(8),
-            client::connect(config, addr.as_str(), SshClientHandler),
+            Duration::from_secs(10),
+            connect_raw_or_proxy(config, host.addr.trim(), host.port, local_proxy_port),
         )
         .await
-        .context("SSH 连接超时")?
-        .context("SSH 连接失败")?;
+        .context("SSH 连接超时")??;
 
         authenticate_session(&mut session, host, master_key).await?;
         Ok(session)
@@ -537,12 +679,9 @@ pub async fn exec_host_capture(
     let record = db
         .get_record(host_id)?
         .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
-    let jump = match record.jump_host_id.as_deref() {
-        Some(jid) => db.get_record(jid)?,
-        None => None,
-    };
+    let (jump, proxy_port) = db.resolve_ssh_route(&record)?;
     let handle = pool
-        .get_or_connect(&record, jump.as_ref(), db.master_key())
+        .get_or_connect(&record, jump.as_ref(), proxy_port, db.master_key())
         .await?;
     exec_capture(&handle, cmd, timeout).await
 }
@@ -621,12 +760,9 @@ pub async fn open_host_channel(
     let record = db
         .get_record(host_id)?
         .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
-    let jump = match record.jump_host_id.as_deref() {
-        Some(jid) => db.get_record(jid)?,
-        None => None,
-    };
+    let (jump, proxy_port) = db.resolve_ssh_route(&record)?;
     let channel = pool
-        .open_session_channel(&record, jump.as_ref(), db.master_key())
+        .open_session_channel(&record, jump.as_ref(), proxy_port, db.master_key())
         .await?;
     let _ = db.update_check_result(&record.id, "online", None, None, None);
     Ok((record, channel))
@@ -641,19 +777,16 @@ pub async fn open_pane_channel(
     let record = db
         .get_record(host_id)?
         .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
-    let jump = match record.jump_host_id.as_deref() {
-        Some(jid) => db.get_record(jid)?,
-        None => None,
-    };
+    let (jump, proxy_port) = db.resolve_ssh_route(&record)?;
     let handle = pool
-        .get_or_connect_pane(&record, jump.as_ref(), db.master_key())
+        .get_or_connect_pane(&record, jump.as_ref(), proxy_port, db.master_key())
         .await?;
     let channel = match handle.channel_open_session().await {
         Ok(ch) => ch,
         Err(_) => {
             pool.drop_pane_session(host_id).await;
             let fresh = pool
-                .get_or_connect_pane(&record, jump.as_ref(), db.master_key())
+                .get_or_connect_pane(&record, jump.as_ref(), proxy_port, db.master_key())
                 .await?;
             fresh
                 .channel_open_session()
@@ -664,3 +797,70 @@ pub async fn open_pane_channel(
     let _ = db.update_check_result(&record.id, "online", None, None, None);
     Ok((record, channel))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::connect_via_local_proxy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn local_proxy_tunnel_supports_both_socks5_and_http_connect() {
+        // 1. 验证 SOCKS5 隧道握手与后续 SSH Banner 字节流无损透传
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = socks_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = socks_listener.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            sock.read_exact(&mut greet).await.unwrap();
+            assert_eq!(greet, [0x05, 0x01, 0x00]);
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut req = [0u8; 10];
+            sock.read_exact(&mut req).await.unwrap();
+            assert_eq!(&req[..4], &[0x05, 0x01, 0x00, 0x01]);
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 22])
+                .await
+                .unwrap();
+            sock.write_all(b"SSH-2.0-OpenSSH_9.6\r\n").await.unwrap();
+        });
+
+        let mut stream = connect_via_local_proxy(socks_port, "198.51.100.8", 22)
+            .await
+            .expect("SOCKS5 隧道应握手成功");
+        let mut banner = [0u8; 21];
+        stream.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-OpenSSH_9.6\r\n");
+
+        // 2. 验证纯 HTTP 代理端口（首个连接非 SOCKS5，自动回退 HTTP CONNECT）且不吞后续字节
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // 第一次连接（SOCKS5 探测）：返回非 0x05 的 HTTP 400
+            let (mut first, _) = http_listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            let _ = first.read_exact(&mut buf).await;
+            let _ = first.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            drop(first);
+
+            // 第二次连接（HTTP CONNECT）：返回 200 Connection Established 并紧跟 SSH banner
+            let (mut second, _) = http_listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 128];
+            let n = second.read(&mut req_buf).await.unwrap();
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(req_str.starts_with("CONNECT example.com:2222 HTTP/1.1\r\n"));
+            second
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nSSH-2.0-Test\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut http_tunnel = connect_via_local_proxy(http_port, "example.com", 2222)
+            .await
+            .expect("HTTP CONNECT 隧道应握手成功");
+        let mut ssh_banner = [0u8; 14];
+        http_tunnel.read_exact(&mut ssh_banner).await.unwrap();
+        assert_eq!(&ssh_banner, b"SSH-2.0-Test\r\n");
+    }
+}
+

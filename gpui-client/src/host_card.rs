@@ -34,7 +34,8 @@ pub fn render_list(
         .size_full()
         .min_h_0()
         .overflow_y_scroll()
-        .pr(px(4.))
+        .px(px(4.))
+        .py(px(2.))
         .child(list)
 }
 
@@ -85,10 +86,11 @@ fn card(
     this: &Entity<Workspace>,
     palette: &Palette,
 ) -> impl IntoElement {
-    let selected = (workspace.has_stage()
-        && workspace.stage_host_id.as_deref() == Some(host.id.as_str()))
-        || (workspace.right_wing == Some(RightWing::Detail)
-            && workspace.detail_host_id.as_deref() == Some(host.id.as_str()));
+    let is_stage_host = workspace.has_stage()
+        && workspace.stage_host_id.as_deref() == Some(host.id.as_str());
+    let is_detail_host = workspace.right_wing == Some(RightWing::Detail)
+        && workspace.detail_host_id.as_deref() == Some(host.id.as_str());
+    let selected = is_stage_host || is_detail_host;
 
     let address = if host.kind == "local" {
         format!("{}@127.0.0.1", host.username)
@@ -122,8 +124,22 @@ fn card(
         && workspace.center_stage == Some(CenterStage::Files);
 
     // ---- 左半部 ----
-    let mut left = h_flex().min_w_0().items_center().gap(px(12.));
-    if show_controls {
+    let mut left = h_flex().min_w_0().items_center().gap(px(10.));
+    if selected {
+        let bar_color = if is_stage_host {
+            palette.accent_orange
+        } else {
+            palette.primary_bg
+        };
+        left = left.child(
+            div()
+                .flex_shrink_0()
+                .w(px(4.))
+                .h(px(30.))
+                .rounded_full()
+                .bg(bar_color),
+        );
+    } else if show_controls {
         let handle_color = if host.kind == "local" {
             palette.text_faint.opacity(0.25)
         } else {
@@ -167,6 +183,20 @@ fn card(
                 .truncate()
                 .child(host.name.clone()),
         );
+    if is_detail_host && !is_stage_host {
+        title_row = title_row.child(
+            div()
+                .flex_shrink_0()
+                .rounded_md()
+                .bg(palette.primary_bg)
+                .px(px(6.))
+                .py(px(1.))
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(palette.primary_fg)
+                .child("详情"),
+        );
+    }
     if show_controls && host.pinned && host.kind != "local" {
         title_row = title_row.child(pin_chip(palette));
     }
@@ -305,7 +335,6 @@ fn card(
         .justify_between()
         .gap(px(12.))
         .rounded_2xl()
-        .border_1()
         .px(px(16.))
         .py(px(14.))
         .cursor_pointer()
@@ -339,14 +368,21 @@ fn card(
         .child(left)
         .child(right);
 
-    if selected {
-        base.border_color(palette.border_selected)
+    if is_stage_host {
+        base.border_2()
+            .border_color(palette.accent_orange)
+            .bg(palette.card_selected_bg)
+            .shadow(palette.card_shadow(true))
+    } else if is_detail_host {
+        base.border_2()
+            .border_color(palette.border_selected)
             .bg(palette.card_selected_bg)
             .shadow(palette.card_shadow(true))
     } else {
         let hover_bg = palette.card_hover_bg;
-        let hover_border = palette.border_selected;
-        base.border_color(palette.border)
+        let hover_border = palette.text_faint.opacity(0.45);
+        base.border_1()
+            .border_color(palette.border)
             .bg(palette.card_bg)
             .shadow(palette.card_shadow(false))
             .hover(move |s| s.bg(hover_bg).border_color(hover_border))

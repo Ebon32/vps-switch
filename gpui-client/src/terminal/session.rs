@@ -15,11 +15,13 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message;
+
+use crate::api::{deserialize_null_bool, deserialize_null_string, deserialize_null_u16};
 
 pub const MAX_RECONNECT_ATTEMPTS: u32 = 6;
 
@@ -44,24 +46,27 @@ impl Dimensions for GridSize {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneMeta {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub host_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_u16")]
     pub cols: u16,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_u16")]
     pub rows: u16,
+    #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_bool")]
     pub running: bool,
+    #[serde(default)]
     pub last_exit_code: Option<i32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_bool")]
     pub bracketed_paste: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_bool")]
     pub headless: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_bool")]
     pub exited: bool,
 }
 
@@ -93,6 +98,7 @@ pub struct Snapshot {
     pub cursor_shape: CursorShape,
     pub display_offset: usize,
     pub history_size: usize,
+    pub app_cursor: bool,
 }
 
 pub enum SessionEvent {
@@ -181,6 +187,7 @@ impl Session {
             cursor_shape: CursorShape::Block,
             display_offset: 0,
             history_size: 0,
+            app_cursor: false,
         };
         let _ = event_tx.send(SessionEvent::Created {
             pane_id: "mock-pane-1".into(),
@@ -336,9 +343,11 @@ async fn worker_loop(
                             message = ws_rx.next() => {
                                 match message {
                                     Some(Ok(Message::Binary(data))) => {
+                                        let mut restore_offset = 0usize;
                                         let payload: &[u8] = match data.first() {
                                             Some(0x02) => {
-                                                // 整份历史字节环回放：先重置终端再写入，杜绝重复内容叠加
+                                                // 整份历史字节环回放：先记录当前历史滚动偏移，重置终端写入后再恢复偏移
+                                                restore_offset = term.grid().display_offset();
                                                 term = Term::new(TermConfig::default(), &size, VoidListener);
                                                 processor = Processor::new();
                                                 &data[1..]
@@ -348,6 +357,9 @@ async fn worker_loop(
                                         };
                                         if !payload.is_empty() {
                                             processor.advance(&mut term, payload);
+                                        }
+                                        if restore_offset > 0 {
+                                            term.scroll_display(Scroll::Delta(restore_offset as i32));
                                         }
                                         store_snapshot(&snapshot, &term, size);
                                         let _ = events.send(SessionEvent::Updated);
@@ -375,12 +387,22 @@ async fn worker_loop(
                                         if is_auto_da_response(&bytes) {
                                             continue;
                                         }
+                                        if term.grid().display_offset() > 0 {
+                                            term.scroll_display(Scroll::Bottom);
+                                            store_snapshot(&snapshot, &term, size);
+                                            let _ = events.send(SessionEvent::Updated);
+                                        }
                                         let mut frame = Vec::with_capacity(1 + bytes.len());
                                         frame.push(0x01);
                                         frame.extend_from_slice(&bytes);
                                         let _ = ws_tx.send(Message::Binary(frame.into())).await;
                                     }
                                     Ok(SessionCommand::Paste(text)) => {
+                                        if term.grid().display_offset() > 0 {
+                                            term.scroll_display(Scroll::Bottom);
+                                            store_snapshot(&snapshot, &term, size);
+                                            let _ = events.send(SessionEvent::Updated);
+                                        }
                                         let _ = ws_tx
                                             .send(Message::Text(
                                                 serde_json::json!({
@@ -608,10 +630,11 @@ fn store_snapshot(
     size: GridSize,
 ) {
     let content = term.renderable_content();
+    let display_offset = content.display_offset as i32;
     let mut cells = vec![CellSnapshot::default(); size.cols * size.lines];
     for indexed in content.display_iter {
         let Point { line, column } = indexed.point;
-        let row = line.0;
+        let row = line.0 + display_offset;
         if row < 0 || row as usize >= size.lines || column.0 >= size.cols {
             continue;
         }
@@ -624,7 +647,7 @@ fn store_snapshot(
         };
     }
     let cursor_point = content.cursor.point;
-    let cursor_row = cursor_point.line.0;
+    let cursor_row = cursor_point.line.0 + display_offset;
     let cursor = if cursor_row >= 0 && (cursor_row as usize) < size.lines {
         Some((cursor_row as usize, cursor_point.column.0))
     } else {
@@ -638,8 +661,74 @@ fn store_snapshot(
         cursor_shape: content.cursor.shape,
         display_offset: content.display_offset,
         history_size: term.grid().history_size(),
+        app_cursor: content.mode.contains(TermMode::APP_CURSOR),
     };
     if let Ok(mut guard) = snapshot.lock() {
         *guard = Some(next);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Scroll;
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    use super::{GridSize, Snapshot, store_snapshot};
+
+    fn row_text(snap: &Snapshot, row: usize) -> String {
+        let start = row * snap.cols;
+        snap.cells[start..start + snap.cols]
+            .iter()
+            .map(|c| c.c)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn scrollback_history_is_visible_when_scrolled_up() {
+        let size = GridSize { cols: 40, lines: 5 };
+        let mut term = Term::new(TermConfig::default(), &size, VoidListener);
+        let mut processor: Processor = Processor::new();
+        let holder = Arc::new(Mutex::new(None));
+
+        // 连续输出 8 行（超出 5 行屏幕高度，前 3 行进入负数行号的 scrollback 历史区）
+        for i in 1..=8 {
+            let line = if i < 8 {
+                format!("LINE-{i:02}-IPV4-RESULT\r\n")
+            } else {
+                format!("LINE-{i:02}-BOTTOM")
+            };
+            processor.advance(&mut term, line.as_bytes());
+        }
+
+        store_snapshot(&holder, &term, size);
+        let bottom_snap = holder.lock().unwrap().clone().unwrap();
+        assert_eq!(bottom_snap.display_offset, 0);
+        assert_eq!(bottom_snap.history_size, 3);
+        assert_eq!(row_text(&bottom_snap, 0), "LINE-04-IPV4-RESULT");
+        assert_eq!(row_text(&bottom_snap, 4), "LINE-08-BOTTOM");
+
+        // 向上滚动 3 行回看历史：第 0 行必须显示滚入历史区的 LINE-01，不能消失为空白
+        term.scroll_display(Scroll::Delta(3));
+        store_snapshot(&holder, &term, size);
+        let top_snap = holder.lock().unwrap().clone().unwrap();
+        assert_eq!(top_snap.display_offset, 3);
+        assert_eq!(row_text(&top_snap, 0), "LINE-01-IPV4-RESULT");
+        assert_eq!(row_text(&top_snap, 1), "LINE-02-IPV4-RESULT");
+        assert_eq!(row_text(&top_snap, 2), "LINE-03-IPV4-RESULT");
+        assert_eq!(row_text(&top_snap, 4), "LINE-05-IPV4-RESULT");
+
+        // 再向下滚回底部
+        term.scroll_display(Scroll::Delta(-3));
+        store_snapshot(&holder, &term, size);
+        let restored = holder.lock().unwrap().clone().unwrap();
+        assert_eq!(restored.display_offset, 0);
+        assert_eq!(row_text(&restored, 4), "LINE-08-BOTTOM");
+    }
+}
+

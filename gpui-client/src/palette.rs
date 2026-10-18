@@ -91,9 +91,9 @@ impl Palette {
             card_selected_bg: Hsla::from(rgb(0xffffff)),
             subtle_bg: Hsla::from(rgb(0xf4f4f5)),
             muted_surface_bg: Hsla::from(rgb(0xfafafa)),
-            border: Hsla::from(rgb(0xe4e4e7)).opacity(0.8),
+            border: Hsla::from(rgb(0xe4e4e7)).opacity(0.85),
             divider: Hsla::from(rgb(0xf1f2f4)),
-            border_selected: Hsla::from(rgb(0x18181b)).opacity(0.25),
+            border_selected: Hsla::from(rgb(0x18181b)).opacity(0.88),
             text_primary: Hsla::from(rgb(0x18181b)),
             text_secondary: Hsla::from(rgb(0x52525b)),
             text_muted: Hsla::from(rgb(0x71717a)),
@@ -128,7 +128,7 @@ impl Palette {
             muted_surface_bg: Hsla::from(rgb(0x141417)),
             border: Hsla::from(rgb(0x27272a)),
             divider: Hsla::from(rgb(0x27272a)).opacity(0.7),
-            border_selected: Hsla::from(rgb(0xf4f4f5)).opacity(0.28),
+            border_selected: Hsla::from(rgb(0xf4f4f5)).opacity(0.90),
             text_primary: Hsla::from(rgb(0xf4f4f5)),
             text_secondary: Hsla::from(rgb(0xd4d4d8)),
             text_muted: Hsla::from(rgb(0xa1a1aa)),
@@ -158,14 +158,14 @@ impl Palette {
 
     /// 卡片阴影（默认细阴影 vs 选中柔和外扩阴影）。
     pub fn card_shadow(&self, selected: bool) -> Vec<BoxShadow> {
-        let alpha = if self.is_dark { 0.28 } else { 0.05 };
+        let alpha = if self.is_dark { 0.42 } else { 0.10 };
         let base_alpha = if self.is_dark { 0.18 } else { 0.02 };
         if selected {
             vec![BoxShadow {
                 color: Hsla::from(rgb(0x000000)).opacity(alpha),
                 offset: point(px(0.), px(4.)),
-                blur_radius: px(20.),
-                spread_radius: px(0.),
+                blur_radius: px(18.),
+                spread_radius: px(1.),
                 inset: false,
             }]
         } else {

@@ -317,6 +317,7 @@ impl Database {
 
     pub fn list_public_hosts(&self) -> Result<Vec<PublicHost>> {
         let records = self.list_records()?;
+        let (_, proxy_port) = self.get_proxy_settings();
         let name_map: HashMap<String, String> = records
             .iter()
             .map(|r| (r.id.clone(), r.name.clone()))
@@ -325,10 +326,13 @@ impl Database {
         Ok(records
             .into_iter()
             .map(|r| {
-                let jump_host_name = r
-                    .jump_host_id
-                    .as_ref()
-                    .and_then(|jid| name_map.get(jid).cloned());
+                let jump_host_name = match r.jump_host_id.as_deref() {
+                    Some(crate::models::LOCAL_PROXY_JUMP_ID) => {
+                        Some(format!("本机代理 :{proxy_port}"))
+                    }
+                    Some(jid) => name_map.get(jid).cloned(),
+                    None => None,
+                };
                 Self::to_public(r, jump_host_name)
             })
             .collect())
@@ -350,10 +354,67 @@ impl Database {
             return Ok(None);
         };
         let jump_name = match rec.jump_host_id.as_deref() {
+            Some(crate::models::LOCAL_PROXY_JUMP_ID) => {
+                let (_, proxy_port) = self.get_proxy_settings();
+                Some(format!("本机代理 :{proxy_port}"))
+            }
             Some(jid) => self.get_record(jid)?.map(|j| j.name),
             None => None,
         };
         Ok(Some(Self::to_public(rec, jump_name)))
+    }
+
+    /// 读取本机代理配置 `(proxy_mode, proxy_port)`：
+    /// - `proxy_mode`: `"off"` | `"per_host"` | `"global"`（默认 `"per_host"`）
+    /// - `proxy_port`: 默认 `7890`
+    pub fn get_proxy_settings(&self) -> (String, u16) {
+        let mode = self
+            .get_setting("proxy_mode")
+            .ok()
+            .flatten()
+            .filter(|m| matches!(m.as_str(), "off" | "per_host" | "global"))
+            .unwrap_or_else(|| "per_host".to_string());
+        let port = self
+            .get_setting("proxy_port")
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|p| *p >= 1)
+            .unwrap_or(7890);
+        (mode, port)
+    }
+
+    /// 解析某台 SSH 主机的连接路由：返回 `(SSH 跳板机记录, 本机代理端口)`。
+    pub fn resolve_ssh_route(
+        &self,
+        record: &HostRecord,
+    ) -> Result<(Option<HostRecord>, Option<u16>)> {
+        let (mode, port) = self.get_proxy_settings();
+        match record.jump_host_id.as_deref() {
+            Some(crate::models::LOCAL_PROXY_JUMP_ID) => {
+                if mode == "off" || port == 0 {
+                    Ok((None, None))
+                } else {
+                    Ok((None, Some(port)))
+                }
+            }
+            Some(jid) if !jid.is_empty() => {
+                let jump = self.get_record(jid)?;
+                let proxy = if mode == "global" && port > 0 {
+                    Some(port)
+                } else {
+                    None
+                };
+                Ok((jump, proxy))
+            }
+            _ => {
+                if mode == "global" && port > 0 {
+                    Ok((None, Some(port)))
+                } else {
+                    Ok((None, None))
+                }
+            }
+        }
     }
 
     fn to_public(r: HostRecord, jump_host_name: Option<String>) -> PublicHost {

@@ -349,6 +349,8 @@ impl Workspace {
         self.files.host_id = Some(host_id.to_owned());
         self.files.editor_open = false;
         self.files.inline_prompt = None;
+        self.files.current_path.clear();
+        self.files.parent_path = None;
         self.files.items.clear();
         let target = initial_path.unwrap_or("").to_owned();
         self.load_files_dir(&target, false);
@@ -909,6 +911,7 @@ pub fn render(
             .h(px(28.))
             .items_center()
             .gap(px(2.))
+            .overflow_hidden()
             .rounded_lg()
             .border_1()
             .border_color(palette.border)
@@ -1199,7 +1202,13 @@ pub fn render(
 
     // ---- 3. 主体区：文件列表 + 在线代码编辑器 ----
     let show_list = !(compact && files.editor_open);
-    let mut main_area = h_flex().flex_1().min_h_0().overflow_hidden();
+    let mut main_area = div()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .flex()
+        .items_stretch()
+        .overflow_hidden();
 
     if show_list {
         main_area = main_area.child(render_file_list(workspace, this, compact, palette));
@@ -1595,6 +1604,7 @@ fn render_file_list(
         .id("files-list-scroll")
         .test_support()
         .flex_1()
+        .h_full()
         .min_w_0()
         .min_h_0()
         .overflow_y_scroll()
@@ -1746,6 +1756,7 @@ fn render_editor_pane(
         .id("files-editor-pane")
         .test_support()
         .flex_1()
+        .h_full()
         .min_w_0()
         .min_h_0()
         .flex()
@@ -1771,7 +1782,7 @@ fn render_transfers_footer(
     let this_clear = this.clone();
 
     let mut list = v_flex().w_full().gap(px(6.));
-    for task in tasks.iter().take(6) {
+    for task in tasks.iter() {
         let arrow = if task.direction == "upload" { "⬆" } else { "⬇" };
         let pct = if task.total_bytes > 0 {
             ((task.transferred_bytes as f64 * 100.0) / task.total_bytes as f64)
@@ -1917,5 +1928,11 @@ fn render_transfers_footer(
                         .child("清理已完成"),
                 ),
         )
-        .child(list)
+        .child(
+            div()
+                .id("files-transfers-scroll")
+                .max_h(px(164.))
+                .overflow_y_scroll()
+                .child(list),
+        )
 }

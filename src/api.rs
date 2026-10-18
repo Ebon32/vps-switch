@@ -172,6 +172,11 @@ async fn create_host(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<HostUpsertPayload>,
 ) -> impl IntoResponse {
+    if payload.jump_host_id.as_deref() == Some(crate::models::LOCAL_PROXY_JUMP_ID)
+        && state.db.get_proxy_settings().0 == "off"
+    {
+        let _ = state.db.set_setting("proxy_mode", "per_host");
+    }
     match state.db.create_host(payload) {
         Ok(host) => (
             StatusCode::OK,
@@ -190,6 +195,11 @@ async fn update_host(
     Path(id): Path<String>,
     Json(payload): Json<HostUpsertPayload>,
 ) -> impl IntoResponse {
+    if payload.jump_host_id.as_deref() == Some(crate::models::LOCAL_PROXY_JUMP_ID)
+        && state.db.get_proxy_settings().0 == "off"
+    {
+        let _ = state.db.set_setting("proxy_mode", "per_host");
+    }
     state.ssh_pool.invalidate_host(&id).await;
     match state.db.update_host(&id, payload) {
         Ok(host) => (
@@ -1279,12 +1289,15 @@ async fn api_get_autostart(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .ok()
         .flatten()
         .unwrap_or_else(|| "tray".to_string());
+    let (proxy_mode, proxy_port) = state.db.get_proxy_settings();
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "autostart": enabled,
             "closeAction": close_action,
+            "proxyMode": proxy_mode,
+            "proxyPort": proxy_port,
         })),
     )
 }
@@ -1294,6 +1307,8 @@ async fn api_get_autostart(State(state): State<Arc<AppState>>) -> impl IntoRespo
 struct SetAutostartPayload {
     autostart: Option<bool>,
     close_action: Option<String>,
+    proxy_mode: Option<String>,
+    proxy_port: Option<u16>,
 }
 
 async fn api_set_autostart(
@@ -1309,6 +1324,23 @@ async fn api_set_autostart(
         let valid_action = if action == "exit" { "exit" } else { "tray" };
         let _ = state.db.set_setting("close_action", valid_action);
     }
+    let mut proxy_changed = false;
+    if let Some(ref mode) = p.proxy_mode {
+        let valid_mode = match mode.as_str() {
+            "off" => "off",
+            "global" => "global",
+            _ => "per_host",
+        };
+        let _ = state.db.set_setting("proxy_mode", valid_mode);
+        proxy_changed = true;
+    }
+    if let Some(port) = p.proxy_port.filter(|port| *port >= 1) {
+        let _ = state.db.set_setting("proxy_port", &port.to_string());
+        proxy_changed = true;
+    }
+    if proxy_changed {
+        state.ssh_pool.invalidate_all().await;
+    }
     let enabled = check_autostart_enabled();
     let close_action = state
         .db
@@ -1316,12 +1348,15 @@ async fn api_set_autostart(
         .ok()
         .flatten()
         .unwrap_or_else(|| "tray".to_string());
+    let (proxy_mode, proxy_port) = state.db.get_proxy_settings();
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "autostart": enabled,
             "closeAction": close_action,
+            "proxyMode": proxy_mode,
+            "proxyPort": proxy_port,
         })),
     )
         .into_response()
@@ -1344,9 +1379,10 @@ async fn api_get_about(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     )
 }
 
-async fn api_check_update() -> impl IntoResponse {
+async fn api_check_update(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let current_version = env!("CARGO_PKG_VERSION");
     let started = Instant::now();
+    let (proxy_mode, proxy_port) = state.db.get_proxy_settings();
     let mut command = tokio::process::Command::new("gh");
     command.args([
         "release",
@@ -1356,6 +1392,11 @@ async fn api_check_update() -> impl IntoResponse {
         "--json",
         "tagName,name,publishedAt,body,url",
     ]);
+    if proxy_mode != "off" && proxy_port > 0 {
+        let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+        command.env("HTTPS_PROXY", &proxy_url);
+        command.env("HTTP_PROXY", &proxy_url);
+    }
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     let mut stdout = String::new();
@@ -1427,6 +1468,7 @@ async fn api_get_settings(State(state): State<Arc<AppState>>) -> impl IntoRespon
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "tray".to_string());
+            let (proxy_mode, proxy_port) = state.db.get_proxy_settings();
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1435,6 +1477,8 @@ async fn api_get_settings(State(state): State<Arc<AppState>>) -> impl IntoRespon
                     "cliSync": cli_sync,
                     "autostart": autostart,
                     "closeAction": close_action,
+                    "proxyMode": proxy_mode,
+                    "proxyPort": proxy_port,
                 })),
             )
                 .into_response()

@@ -80,6 +80,7 @@ pub struct Workspace {
     pub api: Api,
     pub main_window: AnyWindowHandle,
     pub standalone_windows: HashMap<String, AnyWindowHandle>,
+    pub standalone_panes: HashMap<String, Entity<TerminalView>>,
     pub focus_handle: FocusHandle,
     pub hosts: Vec<Host>,
     pub loading: bool,
@@ -156,6 +157,7 @@ impl Workspace {
             api,
             main_window,
             standalone_windows: HashMap::new(),
+            standalone_panes: HashMap::new(),
             focus_handle,
             hosts: Vec::new(),
             loading: true,
@@ -230,16 +232,38 @@ impl Workspace {
                 },
             ],
         );
-        self.settings.calls = vec![McpCallRecord {
-            id: "call-1".into(),
-            ts: "2026-10-17T12:00:00Z".into(),
-            tool: "vps_exec".into(),
-            host: "vip-hk".into(),
-            args: "{\"host\":\"vip-hk\",\"command\":\"uname -a\"}".into(),
-            ok: true,
-            duration_ms: 82,
-            summary: "Linux vip-hk 6.8.0 x86_64".into(),
-        }];
+        self.settings.calls = vec![
+            McpCallRecord {
+                id: "call-1".into(),
+                ts: "2026-10-17T12:00:00Z".into(),
+                tool: "vps_exec".into(),
+                host: "vip-hk".into(),
+                args: "{\n  \"host\": \"vip-hk\",\n  \"command\": \"uname -a &&\\ndf -h &&\\nfree -m\"\n}".into(),
+                ok: true,
+                duration_ms: 82,
+                summary: "Linux vip-hk 6.8.0 x86_64\nFilesystem Size Used Avail\n/dev/vda1 40G 12G 28G".into(),
+            },
+            McpCallRecord {
+                id: "call-2".into(),
+                ts: "2026-10-17T12:01:00Z".into(),
+                tool: "vps_list".into(),
+                host: String::new(),
+                args: "{}".into(),
+                ok: true,
+                duration_ms: 4,
+                summary: String::new(),
+            },
+            McpCallRecord {
+                id: "call-3".into(),
+                ts: "2026-10-17T12:02:00Z".into(),
+                tool: "vps_inspect".into(),
+                host: "us-node".into(),
+                args: "{\"host\":\"us-node\"}".into(),
+                ok: false,
+                duration_ms: 1500,
+                summary: "connection timeout".into(),
+            },
+        ];
         cx.notify();
     }
 
@@ -400,11 +424,19 @@ impl Workspace {
     fn replace_host(&mut self, updated: Host) {
         match self.hosts.iter_mut().find(|host| host.id == updated.id) {
             Some(existing) => *existing = updated,
-            None => self.hosts.push(updated),
+            None => {
+                let insert_pos = self
+                    .hosts
+                    .iter()
+                    .position(|host| host.kind != "local")
+                    .unwrap_or(self.hosts.len());
+                self.hosts.insert(insert_pos, updated);
+            }
         }
     }
 
     pub fn toggle_detail(&mut self, host_id: &str, cx: &mut Context<Self>) {
+        self.filter_open = false;
         if self.right_wing == Some(RightWing::Detail)
             && self.detail_host_id.as_deref() == Some(host_id)
         {
@@ -420,6 +452,7 @@ impl Workspace {
                 && host.status != "offline"
             {
                 self.api.send(ApiCommand::PrewarmFiles(host_id.to_owned()));
+                self.prefetch_files_dir(host_id, "");
             }
         }
         self.sync_current_tab();
@@ -454,11 +487,13 @@ impl Workspace {
 
     pub fn open_terminal(&mut self, host_id: &str, cx: &mut Context<Self>) {
         self.page = Page::Workspace;
+        self.filter_open = false;
         self.sync_current_tab();
         if let Some(host) = self.host_by_id(host_id)
             && host.status != "offline"
         {
             self.api.send(ApiCommand::PrewarmFiles(host_id.to_owned()));
+            self.prefetch_files_dir(host_id, "");
         }
         let index = match self
             .open_tabs
@@ -596,6 +631,9 @@ impl Workspace {
                 pane.update(cx, |view, cx| view.set_dark(dark, cx));
             }
         }
+        for pane in self.standalone_panes.values() {
+            pane.update(cx, |view, cx| view.set_dark(dark, cx));
+        }
         cx.notify();
     }
 
@@ -705,12 +743,16 @@ impl Workspace {
                 return;
             }
             self.standalone_windows.remove(host_id);
+            self.standalone_panes.remove(host_id);
         }
 
         let title = format!("{name} · 终端 · VPS Switch");
         let hid = host_id.to_owned();
+        let hid_for_close = host_id.to_owned();
         let dark = self.terminal_dark;
         let is_mock = self.mock_terminal_for_test;
+        let ws_weak = cx.entity().downgrade();
+        let mut created_view: Option<Entity<TerminalView>> = None;
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
@@ -719,7 +761,7 @@ impl Workspace {
             ))),
             ..WindowOptions::default()
         };
-        if let Ok(handle) = cx.open_window(options, move |window, cx| {
+        if let Ok(handle) = cx.open_window(options, |window, cx| {
             window.set_window_title(&title);
             let view = cx.new(|cx| {
                 if is_mock {
@@ -728,12 +770,32 @@ impl Workspace {
                     TerminalView::new(hid, dark, cx)
                 }
             });
+            created_view = Some(view.clone());
+            let view_weak = view.downgrade();
+            window.on_window_should_close(cx, move |_window, cx| {
+                let pane_id = view_weak
+                    .upgrade()
+                    .and_then(|v| v.read(cx).pane_id.clone());
+                if let Some(ws) = ws_weak.upgrade() {
+                    let _ = ws.update(cx, |w, _| {
+                        w.standalone_windows.remove(&hid_for_close);
+                        w.standalone_panes.remove(&hid_for_close);
+                        if let Some(pid) = pane_id {
+                            w.api.send(ApiCommand::DeletePane(pid));
+                        }
+                    });
+                }
+                true
+            });
             let fh = view.read(cx).focus_handle.clone();
             window.focus(&fh, cx);
             cx.new(|cx| Root::new(view, window, cx))
         }) {
             self.standalone_windows
                 .insert(host_id.to_owned(), handle.into());
+            if let Some(v) = created_view {
+                self.standalone_panes.insert(host_id.to_owned(), v);
+            }
         }
         self.show_toast(
             format!("已在独立原生窗口打开「{name}」终端"),
@@ -744,6 +806,7 @@ impl Workspace {
 
     pub fn open_files(&mut self, host_id: &str, cx: &mut Context<Self>) {
         self.page = Page::Workspace;
+        self.filter_open = false;
         self.sync_current_tab();
         match self
             .open_tabs
@@ -789,6 +852,7 @@ impl Workspace {
 
     pub fn close_stage(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Workspace;
+        self.filter_open = false;
         self.sync_current_tab();
         self.center_stage = None;
         self.stage_host_id = None;
@@ -800,6 +864,7 @@ impl Workspace {
 
     pub fn activate_tab(&mut self, host_id: &str, cx: &mut Context<Self>) {
         self.page = Page::Workspace;
+        self.filter_open = false;
         self.sync_current_tab();
         let Some(tab) = self.open_tabs.iter().find(|tab| tab.host_id == host_id) else {
             return;
@@ -869,15 +934,20 @@ impl Workspace {
                 pane.update(cx, |view, cx| view.set_dark(dark, cx));
             }
         }
+        for pane in self.standalone_panes.values() {
+            pane.update(cx, |view, cx| view.set_dark(dark, cx));
+        }
         cx.notify();
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.filter_open = false;
         if self.page == Page::Settings {
             self.page = Page::Workspace;
         } else {
             self.page = Page::Settings;
             self.api.send(ApiCommand::LoadSettings);
+            self.reload_mcp_calls(cx);
         }
         cx.notify();
     }
@@ -1053,8 +1123,12 @@ impl Workspace {
         let Some(modal) = &mut self.host_modal else {
             return;
         };
+        if modal.saving {
+            return;
+        }
         match modal.build_payload(cx) {
             Ok((payload, editing_id)) => {
+                modal.saving = true;
                 match editing_id {
                     Some(host_id) => self.api.send(ApiCommand::UpdateHost { host_id, payload }),
                     None => self.api.send(ApiCommand::CreateHost(payload)),
@@ -1111,8 +1185,27 @@ impl Workspace {
                 self.filter_open = false;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.settings.host_dropdown_open
+                || self.settings.tool_dropdown_open
+                || self.settings.ok_dropdown_open
+            {
+                self.settings.host_dropdown_open = false;
+                self.settings.tool_dropdown_open = false;
+                self.settings.ok_dropdown_open = false;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.deleting_host.is_some() {
                 self.deleting_host = None;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self
+                .host_modal
+                .as_ref()
+                .is_some_and(|m| m.jump_dropdown_open)
+            {
+                if let Some(m) = &mut self.host_modal {
+                    m.jump_dropdown_open = false;
+                }
                 cx.notify();
                 cx.stop_propagation();
             } else if self.host_modal.is_some() {
@@ -1136,7 +1229,7 @@ impl Workspace {
     fn poll(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(100))
+                .timer(Duration::from_millis(16))
                 .await;
             let alive = this.update(cx, |this, cx| this.tick(cx));
             if alive.is_err() {
@@ -1230,18 +1323,37 @@ impl Workspace {
                 }
                 ApiEvent::HostSaved { host, is_edit } => {
                     let host_id = host.id.clone();
+                    let host_name = host.name.clone();
                     self.replace_host(host);
+                    if !is_edit {
+                        // 新建主机默认置顶到列表第一屏顶部（紧挨 local 本机之后），并同步保存排序
+                        let ordered_ids: Vec<String> = self
+                            .hosts
+                            .iter()
+                            .filter(|h| h.kind != "local")
+                            .map(|h| h.id.clone())
+                            .collect();
+                        self.api.send(ApiCommand::Reorder { ordered_ids });
+                        // 若被当前筛选条件遮挡，自动清除筛选以便立即可见
+                        if !self.filtered_hosts().iter().any(|h| h.id == host_id) {
+                            self.reset_filters();
+                        }
+                        // 自动触发一次在线与 OS 检测
+                        self.checking.insert(host_id.clone());
+                        self.api.send(ApiCommand::CheckHost(host_id.clone()));
+                    } else {
+                        self.api.send(ApiCommand::LoadHosts);
+                    }
                     crate::tray::update_hosts(&self.hosts);
                     self.host_modal = None;
                     self.detail_host_id = Some(host_id);
                     self.right_wing = Some(RightWing::Detail);
                     self.last_inspect = None;
-                    self.api.send(ApiCommand::LoadHosts);
                     self.toast = Some(Toast {
                         text: if is_edit {
-                            "主机已更新".into()
+                            format!("已更新主机「{host_name}」")
                         } else {
-                            "主机已创建".into()
+                            format!("已创建主机「{host_name}」（位于列表顶部，正在检测连接…）")
                         },
                         kind: ToastKind::Ok,
                         at: Instant::now(),
@@ -1249,6 +1361,7 @@ impl Workspace {
                 }
                 ApiEvent::HostSaveFailed(error) => {
                     if let Some(m) = &mut self.host_modal {
+                        m.saving = false;
                         m.error_msg = Some(error.clone());
                     }
                     self.toast = Some(Toast {
@@ -1459,6 +1572,25 @@ impl Workspace {
                     self.toast = Some(Toast {
                         text: format!("保存自启与运行设置失败: {error}"),
                         kind: ToastKind::Err,
+                        at: Instant::now(),
+                    });
+                }
+                ApiEvent::ProxySaved {
+                    proxy_mode,
+                    proxy_port,
+                } => {
+                    self.settings.proxy_mode = proxy_mode.clone();
+                    self.settings.proxy_port = proxy_port;
+                    self.settings.pending_proxy_port_sync = Some(proxy_port.to_string());
+                    self.api.send(ApiCommand::LoadHosts);
+                    let mode_label = match proxy_mode.as_str() {
+                        "off" => "已关闭本机代理路由".to_owned(),
+                        "global" => format!("已开启全局默认走本机代理 (127.0.0.1:{proxy_port})"),
+                        _ => format!("本机代理已就绪 (127.0.0.1:{proxy_port}，按主机选择)"),
+                    };
+                    self.toast = Some(Toast {
+                        text: mode_label,
+                        kind: ToastKind::Ok,
                         at: Instant::now(),
                     });
                 }
@@ -1694,6 +1826,11 @@ impl Render for Workspace {
                 .guard_editor
                 .update(cx, |ta, cx| ta.set_value(guard_txt, window, cx));
         }
+        if let Some(port_txt) = self.settings.pending_proxy_port_sync.take() {
+            self.settings
+                .proxy_port_input
+                .update(cx, |input, cx| input.set_value(port_txt, window, cx));
+        }
 
         let this = cx.entity();
         let palette = Palette::for_mode(self.is_dark);
@@ -1702,7 +1839,10 @@ impl Render for Workspace {
         let main = match self.page {
             Page::Settings => div()
                 .flex_1()
+                .w_full()
+                .h_full()
                 .min_h_0()
+                .overflow_hidden()
                 .child(settings_page::render(self, &this, &palette, cx))
                 .into_any_element(),
             Page::Workspace => {
@@ -1775,6 +1915,7 @@ impl Render for Workspace {
                 let mut row = div()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     .flex()
                     .items_stretch()
                     .justify_center()
@@ -1806,8 +1947,21 @@ impl Render for Workspace {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let _ = this_dismiss_filter.update(cx, |w, cx| {
+                    let mut closed = false;
                     if w.filter_open {
                         w.filter_open = false;
+                        closed = true;
+                    }
+                    if w.settings.host_dropdown_open
+                        || w.settings.tool_dropdown_open
+                        || w.settings.ok_dropdown_open
+                    {
+                        w.settings.host_dropdown_open = false;
+                        w.settings.tool_dropdown_open = false;
+                        w.settings.ok_dropdown_open = false;
+                        closed = true;
+                    }
+                    if closed {
                         cx.notify();
                     }
                 });
@@ -1816,6 +1970,10 @@ impl Render for Workspace {
             .text_color(palette.text_primary)
             .child(top_bar::render(self, &this, &palette, cx))
             .child(main);
+
+        if self.page == Page::Workspace && self.filter_open {
+            root = root.child(top_bar::render_filter_overlay(self, &this, &palette));
+        }
 
         if self.host_modal.is_some() {
             root = root.child(render_host_modal(self, &this, &palette, cx));

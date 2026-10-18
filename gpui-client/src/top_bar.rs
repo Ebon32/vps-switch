@@ -96,9 +96,17 @@ pub fn render(
     }
 
     // 4. 已打开的会话标签页
+    let mut tabs_row = h_flex()
+        .id("nav-tabs-scroll")
+        .min_w_0()
+        .flex_1()
+        .items_center()
+        .gap(px(6.))
+        .overflow_x_scroll();
     for tab in &workspace.open_tabs {
-        left = left.child(session_tab(workspace, tab, this, palette));
+        tabs_row = tabs_row.child(session_tab(workspace, tab, this, palette));
     }
+    left = left.child(tabs_row);
 
     // ---- 右组 ----
     let mut right = h_flex().flex_shrink_0().items_center().gap(px(8.));
@@ -127,6 +135,9 @@ pub fn render(
         let mut filter_btn = pill_button(active_filter, palette)
             .id("nav-filter")
             .test_support()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .on_click(move |_, _, cx| {
                 let _ = this_filter.update(cx, |w, cx| {
                     w.filter_open = !w.filter_open;
@@ -144,6 +155,9 @@ pub fn render(
                     .ml(px(2.))
                     .px(px(4.))
                     .rounded_full()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .on_click(move |_, _, cx| {
                         let _ = this_clear_filter.update(cx, |w, cx| {
                             w.reset_filters();
@@ -155,11 +169,7 @@ pub fn render(
             );
         }
 
-        let mut wrapper = div().relative().child(filter_btn);
-        if workspace.filter_open {
-            wrapper = wrapper.child(filter_panel(workspace, this, palette));
-        }
-        right = right.child(wrapper);
+        right = right.child(filter_btn);
 
         // 检测在线按钮
         let checking = workspace.checking_all;
@@ -455,7 +465,7 @@ fn filter_summary(workspace: &Workspace) -> String {
     }
 }
 
-fn filter_panel(
+pub fn render_filter_overlay(
     workspace: &Workspace,
     this: &Entity<Workspace>,
     palette: &Palette,
@@ -464,9 +474,9 @@ fn filter_panel(
         .id("filter-dropdown-panel")
         .test_support()
         .absolute()
-        .top(px(37.))
-        .right(px(0.))
-        .w(px(256.))
+        .top(px(48.))
+        .right(px(196.))
+        .w(px(268.))
         .rounded_2xl()
         .border_1()
         .border_color(palette.border)
@@ -682,7 +692,13 @@ fn filter_panel(
                         .text_color(palette.text_faint)
                         .child("标签"),
                 )
-                .child(tag_chips),
+                .child(
+                    div()
+                        .id("filter-tags-scroll")
+                        .max_h(px(128.))
+                        .overflow_y_scroll()
+                        .child(tag_chips),
+                ),
         );
     }
 

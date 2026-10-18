@@ -103,12 +103,15 @@ fn has_element(window: &Window, id: &str) -> bool {
     gpui_base::test_support::find(window, &[], &element_id).is_some()
 }
 
-fn element_center(window: &Window, id: &str) -> Point<Pixels> {
+fn element_bounds(window: &Window, id: &str) -> gpui_kit::Bounds<Pixels> {
     let element_id = ElementId::Name(SharedString::from(id));
     gpui_base::test_support::find(window, &[], &element_id)
         .unwrap_or_else(|| panic!("element {id} not found in the last frame"))
         .bounds()
-        .center()
+}
+
+fn element_center(window: &Window, id: &str) -> Point<Pixels> {
+    element_bounds(window, id).center()
 }
 
 fn click_element(window: &mut Window, id: &str, count: usize, cx: &mut App) {
@@ -209,6 +212,15 @@ fn filter_dropdown_and_modals_work_end_to_end(cx: &mut TestAppContext) {
         click_element(window, "nav-filter", 1, cx);
         assert!(has_element(window, "filter-dropdown-panel"));
 
+        // 再次点击筛选按钮：必须直接关闭（不能先被 workspace-root 关掉又被 on_click 重新打开）
+        click_element(window, "nav-filter", 1, cx);
+        assert!(!has_element(window, "filter-dropdown-panel"));
+        assert!(!ws.read(cx).filter_open);
+
+        // 重新展开筛选面板测试过滤与重置
+        click_element(window, "nav-filter", 1, cx);
+        assert!(has_element(window, "filter-dropdown-panel"));
+
         click_element(window, "filter-status-online", 1, cx);
         assert_eq!(ws.read(cx).status_filter, StatusFilter::Online);
         assert!(has_element(window, "host-card-vip-hk"));
@@ -233,6 +245,32 @@ fn filter_dropdown_and_modals_work_end_to_end(cx: &mut TestAppContext) {
                 .as_ref()
                 .and_then(|m| m.editing_id.as_deref()),
             Some("vip-hk")
+        );
+
+        // 点击跳板机选择框：展开下拉列表（含「本机代理」与各 SSH 候选），点选后立即选中并收起
+        assert!(!has_element(window, "modal-jump-dropdown"));
+        click_element(window, "modal-jump-cycle", 1, cx);
+        assert!(has_element(window, "modal-jump-dropdown"));
+        assert!(has_element(window, "modal-jump-opt-1"));
+        assert!(has_element(window, "modal-jump-opt-2"));
+        click_element(window, "modal-jump-opt-1", 1, cx);
+        assert!(!has_element(window, "modal-jump-dropdown"));
+        assert_eq!(
+            ws.read(cx)
+                .host_modal
+                .as_ref()
+                .map(|m| m.jump_host_id.as_str()),
+            Some("local-proxy")
+        );
+
+        click_element(window, "modal-jump-cycle", 1, cx);
+        click_element(window, "modal-jump-opt-2", 1, cx);
+        assert_eq!(
+            ws.read(cx)
+                .host_modal
+                .as_ref()
+                .map(|m| m.jump_host_id.as_str()),
+            Some("us-node")
         );
     })
     .unwrap();
@@ -324,6 +362,12 @@ fn settings_page_switches_all_five_tabs_and_expands_call_log(cx: &mut TestAppCon
         click_element(window, "nav-settings", 1, cx);
         assert!(has_element(window, "settings-panel-general"));
         assert!(has_element(window, "settings-toggle-autostart"));
+        assert!(has_element(window, "settings-proxy-off"));
+        assert!(has_element(window, "settings-proxy-per-host"));
+        assert!(has_element(window, "settings-proxy-global"));
+        assert!(has_element(window, "settings-proxy-save"));
+        click_element(window, "settings-proxy-global", 1, cx);
+        assert_eq!(ws.read(cx).settings.proxy_mode, "global");
 
         // 切换到「访问安全」
         click_element(window, "settings-tab-security", 1, cx);
@@ -336,10 +380,20 @@ fn settings_page_switches_all_five_tabs_and_expands_call_log(cx: &mut TestAppCon
         assert!(has_element(window, "settings-toggle-mcp"));
         assert!(has_element(window, "settings-save-guard"));
 
-        // 切换到「调用记录」并点击展开第一条记录
+        // 切换到「调用记录」：未展开时多行参数、空摘要与单行记录的行高必须完全一致
         click_element(window, "settings-tab-calls", 1, cx);
         assert!(has_element(window, "settings-panel-calls"));
         assert!(has_element(window, "mcp-call-row-call-1"));
+        assert!(has_element(window, "mcp-call-row-call-2"));
+        assert!(has_element(window, "mcp-call-row-call-3"));
+        let h1 = element_bounds(window, "mcp-call-row-call-1").size.height;
+        let h2 = element_bounds(window, "mcp-call-row-call-2").size.height;
+        let h3 = element_bounds(window, "mcp-call-row-call-3").size.height;
+        assert_eq!(h1, px(48.));
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
+
+        // 点击展开第一条记录
         click_element(window, "mcp-call-row-call-1", 1, cx);
         assert_eq!(
             ws.read(cx).settings.expanded_call_id.as_deref(),

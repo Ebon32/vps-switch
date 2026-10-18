@@ -248,14 +248,11 @@ impl InspectorEngine {
         let record = db
             .get_record(host_id)?
             .ok_or_else(|| anyhow!("主机不存在: {host_id}"))?;
-        let jump = match record.jump_host_id.as_deref() {
-            Some(jid) => db.get_record(jid)?,
-            None => None,
-        };
+        let (jump, proxy_port) = db.resolve_ssh_route(&record)?;
 
         let connect_started = Instant::now();
         let session = match pool
-            .get_or_connect(&record, jump.as_ref(), db.master_key())
+            .get_or_connect(&record, jump.as_ref(), proxy_port, db.master_key())
             .await
         {
             Ok(s) => s,

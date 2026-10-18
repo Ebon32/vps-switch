@@ -1,7 +1,7 @@
 //! 新建 / 编辑主机弹窗（`HostModal.vue`）与删除确认弹窗（`App.vue` 2987-3018 行）。
 
 use gpui_kit::StatefulInteractiveElement as _;
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::*;
 
@@ -35,16 +35,18 @@ pub struct HostModalState {
     pub private_key: Entity<TextareaState>,
     pub passphrase: Entity<InputState>,
     pub jump_host_id: String,
+    pub jump_dropdown_open: bool,
     pub role: String, // "" | "primary" | "proxy" | "test" | "archive"
     pub tags: Entity<InputState>,
     pub pinned: bool,
     pub archived: bool,
     pub links: Vec<LinkRowInput>,
+    pub saving: bool,
     pub error_msg: Option<String>,
 }
 
 impl HostModalState {
-    pub fn new(editing: Option<&Host>, window: &mut Window, cx: &mut App) -> Self {
+    pub fn new(editing: Option<&Host>, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let is_local = editing.is_some_and(|h| h.kind == "local");
         let name_val = editing.map(|h| h.name.clone()).unwrap_or_default();
         let addr_val = editing.map(|h| h.addr.clone()).unwrap_or_default();
@@ -112,6 +114,15 @@ impl HostModalState {
                 .default_value(tags_val)
         });
 
+        for field in [&name, &addr, &port, &username, &password, &passphrase, &tags] {
+            cx.subscribe_in(field, window, |ws, _, event: &InputEvent, _window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    ws.submit_host_modal(cx);
+                }
+            })
+            .detach();
+        }
+
         let source_links = editing
             .map(|h| h.links.clone())
             .filter(|l| !l.is_empty())
@@ -136,11 +147,13 @@ impl HostModalState {
             private_key,
             passphrase,
             jump_host_id,
+            jump_dropdown_open: false,
             role,
             tags,
             pinned,
             archived,
             links,
+            saving: false,
             error_msg: None,
         }
     }
@@ -514,11 +527,16 @@ pub fn render_host_modal(
                 }
             });
 
-        // 跳板机循环切换（直连 -> 各候选 SSH 主机）
-        let candidates: Vec<(String, String)> = std::iter::once((
-            String::new(),
-            "直连（不使用跳板）".to_owned(),
-        ))
+        // 跳板机下拉展开选择（直连 + 本机代理端口 + 各候选 SSH 主机，可滚动点选）
+        let proxy_port = workspace.settings.proxy_port.max(1);
+        let candidates: Vec<(String, String)> = vec![
+            (String::new(), "直连（不使用跳板）".to_owned()),
+            (
+                "local-proxy".to_owned(),
+                format!("本机代理 (127.0.0.1:{proxy_port})"),
+            ),
+        ]
+        .into_iter()
         .chain(
             workspace
                 .hosts
@@ -532,8 +550,9 @@ pub fn render_host_modal(
             .find(|(id, _)| *id == modal.jump_host_id)
             .map(|(_, label)| label.clone())
             .unwrap_or_else(|| "直连（不使用跳板）".to_owned());
-        let this_jump = this.clone();
-        let jump_selector = div()
+        let dropdown_open = modal.jump_dropdown_open;
+        let this_jump_toggle = this.clone();
+        let jump_trigger = div()
             .id("modal-jump-cycle")
             .test_support()
             .mt(px(4.))
@@ -541,30 +560,115 @@ pub fn render_host_modal(
             .px(px(12.))
             .rounded_xl()
             .border_1()
-            .border_color(palette.border)
-            .bg(palette.muted_surface_bg)
+            .border_color(if dropdown_open {
+                palette.text_secondary
+            } else {
+                palette.border
+            })
+            .bg(if dropdown_open {
+                palette.card_solid_bg
+            } else {
+                palette.muted_surface_bg
+            })
             .flex()
             .items_center()
             .justify_between()
             .text_size(px(12.))
             .text_color(palette.text_primary)
             .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .on_click(move |_, _, cx| {
-                let list = candidates.clone();
-                let _ = this_jump.update(cx, |w, cx| {
+                let _ = this_jump_toggle.update(cx, |w, cx| {
                     if let Some(m) = &mut w.host_modal {
-                        let pos = list
-                            .iter()
-                            .position(|(id, _)| *id == m.jump_host_id)
-                            .unwrap_or(0);
-                        let next = (pos + 1) % list.len();
-                        m.jump_host_id = list[next].0.clone();
+                        m.jump_dropdown_open = !m.jump_dropdown_open;
                         cx.notify();
                     }
                 });
             })
             .child(div().truncate().child(current_jump_label))
-            .child(lucide_icon(CatalogIcon::ChevronsUpDown, 13., palette.text_faint));
+            .child(lucide_icon(
+                if dropdown_open {
+                    CatalogIcon::ChevronUp
+                } else {
+                    CatalogIcon::ChevronDown
+                },
+                13.,
+                palette.text_faint,
+            ));
+
+        let mut jump_col = v_flex()
+            .flex_1()
+            .gap(px(4.))
+            .child(field_label("跳板机（可选）", palette))
+            .child(jump_trigger);
+
+        if dropdown_open {
+            let mut list_inner = v_flex().w_full().gap(px(2.));
+            for (idx, (cand_id, cand_label)) in candidates.into_iter().enumerate() {
+                let selected = cand_id == modal.jump_host_id;
+                let this_pick = this.clone();
+                let picked_id = cand_id.clone();
+                let item = h_flex()
+                    .id(SharedString::from(format!("modal-jump-opt-{idx}")))
+                    .test_support()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded_lg()
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(palette.subtle_bg))
+                    .on_click(move |_, _, cx| {
+                        let next_id = picked_id.clone();
+                        let _ = this_pick.update(cx, |w, cx| {
+                            if let Some(m) = &mut w.host_modal {
+                                m.jump_host_id = next_id;
+                                m.jump_dropdown_open = false;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .child(div().truncate().child(cand_label))
+                    .child(if selected {
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text_primary)
+                            .child("✓")
+                    } else {
+                        div()
+                    });
+                list_inner = list_inner.child(if selected {
+                    item.bg(palette.subtle_bg)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(palette.text_primary)
+                } else {
+                    item.text_color(palette.text_secondary)
+                });
+            }
+
+            let dropdown_panel = div()
+                .id("modal-jump-dropdown")
+                .test_support()
+                .mt(px(2.))
+                .max_h(px(208.))
+                .overflow_y_scroll()
+                .rounded_xl()
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.card_solid_bg)
+                .p(px(4.))
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(list_inner);
+            jump_col = jump_col.child(dropdown_panel);
+        }
 
         form = form.child(
             h_flex()
@@ -577,13 +681,7 @@ pub fn render_host_modal(
                         .child(field_label("认证方式", palette))
                         .child(auth_switch),
                 )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .gap(px(4.))
-                        .child(field_label("跳板机（点击切换）", palette))
-                        .child(jump_selector),
-                ),
+                .child(jump_col),
         );
 
         // 第四行：密码 或 私钥 + 口令
@@ -749,7 +847,7 @@ pub fn render_host_modal(
 
     let body = div()
         .id("modal-body-scroll")
-        .flex_1()
+        .max_h(px(468.))
         .min_h_0()
         .overflow_y_scroll()
         .px(px(20.))
@@ -785,23 +883,27 @@ pub fn render_host_modal(
                 })
                 .child("取消"),
         )
-        .child(
+        .child({
+            let saving = modal.saving;
             div()
                 .id("modal-save")
                 .test_support()
                 .rounded_xl()
                 .bg(palette.primary_bg)
                 .text_color(palette.primary_fg)
+                .opacity(if saving { 0.65 } else { 1.0 })
                 .px(px(16.))
                 .py(px(6.))
                 .text_size(px(12.))
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
-                    let _ = this_save.update(cx, |w, cx| w.submit_host_modal(cx));
+                    if !saving {
+                        let _ = this_save.update(cx, |w, cx| w.submit_host_modal(cx));
+                    }
                 })
-                .child("保存"),
-        );
+                .child(if saving { "保存中..." } else { "保存" })
+        });
 
     div()
         .id("host-modal-backdrop")
@@ -816,7 +918,8 @@ pub fn render_host_modal(
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             let _ = this_backdrop.update(cx, |w, cx| w.close_host_modal(cx));
         })
-        .child(
+        .child({
+            let this_card = this.clone();
             div()
                 .id("host-modal-card")
                 .test_support()
@@ -830,13 +933,21 @@ pub fn render_host_modal(
                 .border_color(palette.border)
                 .bg(palette.card_solid_bg)
                 .shadow_xl()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let _ = this_card.update(cx, |w, cx| {
+                        if let Some(m) = &mut w.host_modal
+                            && m.jump_dropdown_open
+                        {
+                            m.jump_dropdown_open = false;
+                            cx.notify();
+                        }
+                    });
                     cx.stop_propagation();
                 })
                 .child(header)
                 .child(body)
-                .child(footer),
-        )
+                .child(footer)
+        })
         .into_any_element()
 }
 
