@@ -52,11 +52,13 @@ VPS Switch 是一个本地优先的主机管理工具。它集成了终端、文
 前往 [**GitHub Releases**](https://github.com/weidu12123/vps-switch/releases/latest) 获取最新版本：
 
 ### Windows
-- **`vps-switch-0.1.0-windows-x64-setup.exe`（推荐）**：标准向导安装程序，自动配置开始菜单与桌面快捷方式。
-- **`vps-switch-0.1.0-windows-x64-portable.zip`**：免安装绿色便携版，解压后双击 `vps-switch.exe` 即可使用。
+- **`vps-switch-0.1.0-windows-x64-setup.exe`（推荐）**：标准向导安装程序，内置 GPUI 原生桌面客户端（`vps-switch-gpui.exe`）、后端守护进程（`vps-switch.exe`）与随包 Windows ConPTY，自动配置开始菜单与桌面快捷方式。
+- **`vps-switch-0.1.0-windows-x64-portable.zip`**：免安装绿色便携版，解压后双击 `vps-switch-gpui.exe`（或 `vps-switch.exe`）即可启动 GPUI 原生桌面客户端。
 - **`vps-switch-0.1.0-x86_64.msi`**：Windows 原生 MSI 包，适合命令行自动化部署（会把安装目录加进系统 PATH）。
 
-> *Windows 首次运行提示：因未购买商业代码签名证书，Windows SmartScreen 可能会提示“未知发布者”，点击「更多信息」→「仍要运行」即可正常使用。*
+> *Windows 运行提示：*
+> 1. *GPUI 原生客户端使用 DirectX 11 硬件加速渲染（虚拟机模拟显示适配器同样可用并自动降级动画）。*
+> 2. *因未购买商业代码签名证书，首次运行若遇 Windows SmartScreen 提示“未知发布者”，点击「更多信息」→「仍要运行」即可。*
 
 ### Linux (x86_64)
 适用于将 VPS Switch 作为无头服务直接部署在云服务器或中转机上，Web 前端已完整内嵌在单一二进制中：
@@ -116,10 +118,11 @@ claude mcp add --transport http --scope user vps-switch http://<服务器IP>:188
 
 ## 技术架构
 
-- **后端**：Rust 2021 + Tokio + Axum（单一常驻进程）
-- **SSH 底座**：纯异步 `russh` 0.63 + `russh-sftp`（单主机多 channel 复用与跳板机穿透）
-- **终端引擎**：`alacritty_terminal` 权威网格 + 随包 Windows ConPTY + 二进制 WebSocket
-- **前端**：Vue 3 + TypeScript + Tailwind CSS + xterm.js + CodeMirror 6
+- **桌面客户端（GPUI 原生）**：`gpui-kit 0.7.3`（`gpui-pre 0.3.9`）+ `alacritty_terminal 0.26` 自绘终端网格 + Tree-Sitter 在线代码编辑器 + 原生系统托盘（零 WebView2 / Chromium 依赖）
+- **后端守护进程**：Rust + Tokio + Axum（单一常驻进程，提供 HTTP REST、二进制终端 WebSocket、SSE 事件流与 MCP Server）
+- **SSH 底座**：纯异步 `russh` 0.63 + `russh-sftp`（单主机多 channel 复用、跳板机穿透与 SFTP 会话自愈）
+- **终端引擎**：`alacritty_terminal` 权威网格 + 2 MiB 历史字节环 + 随包 Windows ConPTY + OSC 133/7 命令边界与工作目录追踪
+- **Web 控制台（Linux 无头内嵌）**：Vue 3 + TypeScript + Tailwind CSS + xterm.js + CodeMirror 6
 - **本地存储**：单文件 SQLite（`rusqlite` bundled）+ 关键凭据 AES-GCM 本地加密
 
 ### 内存占用
@@ -141,34 +144,21 @@ claude mcp add --transport http --scope user vps-switch http://<服务器IP>:188
 > 顺带一提：`top` 的 VIRT 列会显示几百 MB 到 1 GB，那是地址空间不是内存占用（线程栈与
 > 预留缓冲），看 RSS 即可。
 
-#### Windows 桌面（实测）
+#### Windows GPUI 原生桌面版（实测，Windows 11 / 29 台 VPS 机队）
 
-| 状态 | 提交内存 |
-|---|---|
-| 开机自启后**一次都没点开过窗口** | **0 个 WebView2 进程**，后端 5 MB |
-| 窗口打开中 | WebView2 约 197 MB |
-| 点 X 隐藏到托盘（WebView 已经创建过） | WebView2 约 180 MB |
+| 进程 | 工作集 (Working Set) | 私有内存 (Private) | 说明 |
+|---|---:|---:|---|
+| `vps-switch.exe --headless` | **28.8 MB** | **7.0 MB** | 后端守护进程（连接池 + SQLite + MCP Server） |
+| `vps-switch-gpui.exe` | **72.7 MB** | 116.4 MB | GPUI 原生客户端（DirectX 渲染 + 终端 + 编辑器 + 托盘） |
+| **合计（客户端 + 守护进程）** | **101.5 MB (~0.1 GB)** | **123.4 MB** | **共 2 个进程，零 Chromium / WebView2 子进程** |
 
-窗口一旦创建就会拉起一整套 WebView2（Chromium），这是 WebView 壳的固定开销，不是后端占的。
-
-**关键区别是"WebView 有没有被创建过"，而不是"窗口现在可不可见"**：这两行看起来都是"没有窗口"，
-但第一行是 WebView 从未创建（启动即最小化时不建，点开才建），第三行是创建过之后只被降到低内存档
-（`ICoreWebView2_19::SetMemoryUsageTargetLevel`）——降档实测省 10–20%，且页面不重载、标签页与
-终端现场都保留，代价是它不会归零。
-
-所以要说实话：**只有"自启了但一直没点开"才是 5 MB。一旦打开过窗口，之后隐藏到托盘就是约 180 MB
-一直挂着**，直到进程重启。想连这一份也省掉，就得在隐藏时销毁 WebView，代价是重开要重新加载页面、
-且当前会丢掉已打开的标签页（前端尚未做布局持久化）。
-
-完全不要这个壳的部署方式是 Linux 无头，那条路是 10 MB。
-
-
+相比旧 WebView2 桌面壳（7 个进程、常驻工作集约 340 MB），GPUI 原生版常驻工作集直降约 **70%**（省下 ~240 MB）；且弹出多个独立终端窗口均在同一个客户端进程内共享渲染上下文，不再随窗口数量按百 MB 累加。
 
 ---
 
 ## 从源码构建
 
-仓库里不含构建产物，直接 `cargo build` 会失败（`frontend/dist` 与随包的 ConPTY 二进制都不入库）。
+仓库里不含构建产物，直接 `cargo build` 会失败（`frontend/dist` 与随包的 ConPTY 二进制都不入库）。仓库根目录的 `rust-toolchain.toml` 已锁定 Rust `1.99.1`。
 
 ```bash
 # 1. 前端：先产出 frontend/dist（RustEmbed 在编译期读取它，缺了会编译报错）
@@ -181,8 +171,9 @@ cd ..
 #    （portable-pty 按 DLL 搜索顺序从 exe 同级目录加载 conpty.dll）
 #    conpty.dll  OpenConsole.exe
 
-# 3. 后端
-cargo build --release        # 产物在 target/release/vps-switch.exe
+# 3. 编译后端守护进程与 GPUI 原生桌面客户端
+cargo build --release -p vps-switch -p vps-switch-gpui
+# 产物：target/release/vps-switch-gpui.exe 与 target/release/vps-switch.exe
 ```
 
-Linux 无头版只需 `cargo build --release`，前端已内嵌进单一二进制。
+Linux 无头服务只需编译 `vps-switch` 包（`cargo build --release -p vps-switch`），Web 控制台已内嵌进单一二进制。

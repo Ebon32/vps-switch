@@ -1175,17 +1175,18 @@ async function handleClosePane(paneId: string) {
   }
 }
 
-// 终端会话结束后原地重连：为该主机新建一个 pane 顶替退出那个的位置。
-// 先建后删——后端 create_pane 会顺手回收同主机已退出的旧 pane，且该主机没有活终端时
-// 会释放旧的终端连接、重新登录（横幅照常出现）。
+// 终端刷新 / 会话结束后原地重连：先 DELETE 旧 pane（若该主机仅此一个 pane，后端 close_pane
+// 会立即调用 drop_pane_session 释放可能半死不活的旧 SSH 连接），再新建全新 pane 顶替原位置。
 async function handleReconnectPane(paneId: string) {
   const tab = openTabs.value.find((t) => t.panes.some((p) => p.id === paneId));
   if (!tab || paneCreationInFlight.has(tab.hostId)) return;
   const idx = tab.panes.findIndex((p) => p.id === paneId);
   const cwd = tab.panes[idx]?.cwd || undefined;
+  tab.error = null;
   paneCreationInFlight.add(tab.hostId);
   paneCreationCount.value += 1;
   try {
+    await fetch(`/api/terminals/${encodeURIComponent(paneId)}`, { method: 'DELETE' }).catch(() => {});
     const res = await apiFetch('/api/terminals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1194,15 +1195,28 @@ async function handleReconnectPane(paneId: string) {
     if (!res) return;
     const data = await res.json();
     if (!data.ok || !data.pane) {
-      showToast(data.error || '重连失败', 'err');
+      const errMsg = data.error || '刷新终端失败';
+      if (tab.panes.length <= 1) {
+        tab.panes = [];
+        tab.error = errMsg;
+      }
+      showToast(errMsg, 'err');
       return;
     }
-    void fetch(`/api/terminals/${encodeURIComponent(paneId)}`, { method: 'DELETE' });
     const at = tab.panes.findIndex((p) => p.id === paneId);
-    tab.panes.splice(at >= 0 ? at : idx, 1, data.pane as PaneMeta);
-    showToast('终端已重新连接');
+    if (at >= 0) {
+      tab.panes.splice(at, 1, data.pane as PaneMeta);
+    } else {
+      tab.panes.push(data.pane as PaneMeta);
+    }
+    showToast('终端已刷新重连');
   } catch (e) {
-    showToast(`重连失败: ${(e as Error).message}`, 'err');
+    const errMsg = `刷新终端失败: ${(e as Error).message}`;
+    if (tab.panes.length <= 1) {
+      tab.panes = [];
+      tab.error = errMsg;
+    }
+    showToast(errMsg, 'err');
   } finally {
     paneCreationInFlight.delete(tab.hostId);
     paneCreationCount.value = Math.max(0, paneCreationCount.value - 1);

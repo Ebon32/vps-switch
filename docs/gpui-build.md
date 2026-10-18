@@ -63,7 +63,7 @@
 | 拖拽排序 | HTML5 drag | `on_drag` / `drag_over` / `on_drop` | 已做 |
 | 文件拖放上传（拖进文件面板） | `@drop` | gpui `FileDropEvent`（窗口级） | 未做（板块三） |
 | 快捷键 | Esc、Ctrl+K | `on_key_down` / keymap | 未接 |
-| 右键菜单（**旧网页版没有**） | — | 卡片可加 `ContextMenuExt` 作为增强；**托盘右键菜单**（旧桌面壳 tray-icon 提供：主机列表、秒开终端、显示主窗口、退出）在 M5 用 `gpui-tray` 重建 | 托盘 M5；卡片右键属增强，待用户确认 |
+| 右键菜单（**旧网页版没有**） | WebView2 默认菜单 | **终端右键菜单（复制/粘贴/清屏）**：已记录，待六大板块前端主干完成后统一用 `PopupMenu` 补上；**托盘右键菜单**在 M5 重建 | 待前端主干完成后补 |
 | 复制（API Key / 路径 / 链接） | `navigator.clipboard` | gpui 剪贴板 | 未接 |
 | 打开外部链接（GitHub release） | `<a target=_blank>` | `open` crate（系统浏览器） | **依赖未补** |
 | 文件保存 / 选择对话框（下载、上传本机路径） | 浏览器下载 | `rfd` 原生对话框 | **依赖未补** |
@@ -161,9 +161,17 @@
 **实现中**：数值来自真值；SVG 原样移植；不做近似。
 **完成后**：逐元素核对表（尺寸/颜色/间距/图标/hover/选中态）→ 无头 UI 测试 → 用户目视验收 → 通过才标 ✅。
 
-## 六、当前进度
+## 六、当前进度（2026-10-18 更新）
 
 - ✅ 方案与规格：`docs/gpui-client.md`、`docs/ui-spec.md`
-- ✅ 依赖补齐之外的基础设施：workspace 拆分（api/theme/util/top_bar/host_card/terminal_stage/detail_drawer/settings_page）
-- ⬜ 本文档的第三节（依赖补齐）**尚未执行**——下一步就是它
-- 板块一：卡片列表与顶栏已有实现，OS 图标/品牌 Logo 仍是字符近似，待替换为原样 SVG；弹窗、删除确认、快捷键未做
+- ✅ 视觉底座补齐：`AppAssets`（全套 Lucide + `BrandLogo.svg` + Simple Icons 官方 OS 图标）、`Palette` 亮暗双色板与线性渐变、52px 原生矢量 `cpu_ring`（同心居中）、渲染热路径 `opt-level = 3`、守护进程自动探活拉起
+- ✅ 板块一（VPS 仓库）：顶栏、筛选下拉、主机卡片列表、新建/编辑主机弹窗、删除确认弹窗、`Ctrl+K` / `Escape`
+- ✅ 板块二（终端）：终端舞台、分屏画布、256 色与反显渲染修复、中文 IME `EntityInputHandler`、鼠标拖拽选区与 `Ctrl+C`/`Ctrl+V`、指数退避重连、原生独立终端窗口
+- ✅ 板块三 & 四（文件浏览器与上传下载）：双形态面板、分段面包屑与手输路径、目录缓存、新建/改名/删除/压缩/解压、内置代码编辑器 `Editor`（`Ctrl+S` 保存）、原生文件选择与拖拽上传、实时传输队列
+- ✅ 板块五（探针详情抽屉）：6 大卡片 + 2.8s 实时采样 + 角色/标签/快捷链接 + 底部操作栏
+- ✅ 板块六（系统设置与 MCP Server）：五大分类全量实现（常规与自启 / 访问安全 / MCP Server 与黑名单 / 调用记录展开 / 关于与更新）
+- ✅ 细节与原生能力补全：
+  1. 终端右键菜单（复制 / 粘贴 / 清屏 / 重新连接）
+  2. SSE 实时事件流（`/api/events`，响应外部 Agent `revealTerminal` 唤起终端并附着指定 pane）
+  3. 系统托盘常驻、关闭窗口行为（按 `close_action` 最小化到托盘 / 直接退出）、托盘右键主机列表秒开独立终端窗口、`build.rs` 图标内嵌
+

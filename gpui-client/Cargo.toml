@@ -25,6 +25,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 alacritty_terminal = "0.26"
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26.1"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [dev-dependencies]
 # 无头 UI 测试。用 gpui-base / gpui-component 的 test_support（只用公共

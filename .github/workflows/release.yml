@@ -1,0 +1,154 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            kind: macos
+            arch_suffix: aarch64
+          - name: macOS x86_64
+            os: macos-14
+            target: x86_64-apple-darwin
+            kind: macos
+            arch_suffix: x86_64
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            kind: linux
+            arch_suffix: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build daemon
+        run: cargo build --release --locked -p vps-switch --target ${{ matrix.target }}
+
+      - name: Build GPUI client (macOS)
+        if: matrix.kind == 'macos'
+        run: cargo build --release --locked -p vps-switch-gpui --target ${{ matrix.target }}
+
+      - name: Package macOS .app
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${{ matrix.target }}/release"
+          APP_DIR="dist/VPS Switch.app/Contents"
+          mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources"
+
+          cp "$BIN_DIR/vps-switch-gpui" "$APP_DIR/MacOS/"
+          cp "$BIN_DIR/vps-switch" "$APP_DIR/MacOS/"
+          chmod +x "$APP_DIR/MacOS/"*
+
+          cat > "$APP_DIR/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>VPS Switch</string>
+            <key>CFBundleDisplayName</key><string>VPS Switch</string>
+            <key>CFBundleIdentifier</key><string>com.weidu12123.vps-switch</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleExecutable</key><string>vps-switch-gpui</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          ZIP_NAME="vps-switch-0.1.0-macos-${{ matrix.arch_suffix }}.zip"
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "VPS Switch.app" "$ZIP_NAME"
+          shasum -a 256 "$ZIP_NAME" > "$ZIP_NAME.sha256"
+
+      - name: Package Linux tar.gz
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${{ matrix.target }}/release"
+          PKG_DIR="dist/vps-switch-0.1.0-linux-x86_64"
+          mkdir -p "$PKG_DIR"
+          cp "$BIN_DIR/vps-switch" "$PKG_DIR/"
+          chmod 755 "$PKG_DIR/vps-switch"
+          cp vps-switch.service "$PKG_DIR/"
+          printf 'VPS Switch Linux x86_64 headless server.\nRun ./vps-switch (default port 18800).\n' > "$PKG_DIR/README.txt"
+          cd dist
+          tar -czf vps-switch-0.1.0-linux-x86_64.tar.gz vps-switch-0.1.0-linux-x86_64
+          sha256sum vps-switch-0.1.0-linux-x86_64.tar.gz > vps-switch-0.1.0-linux-x86_64.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          fail_on_unmatched_files: true

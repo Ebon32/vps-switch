@@ -447,6 +447,22 @@ pub async fn read_text_file(
         });
     }
 
+    match read_remote_text_file_once(pool, db, host_id, file_path).await {
+        Ok(res) => Ok(res),
+        Err(err) if crate::ssh::is_anyhow_sftp_session_dead(&err) => {
+            pool.invalidate_sftp(host_id).await;
+            read_remote_text_file_once(pool, db, host_id, file_path).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn read_remote_text_file_once(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    file_path: &str,
+) -> Result<FileReadResult> {
     let sftp = pool.get_or_open_sftp(db, host_id).await?;
     let meta = sftp
         .metadata(file_path)
@@ -484,6 +500,25 @@ pub async fn write_text_file(
         return Ok(bytes.len() as u64);
     }
 
+    let res = match write_remote_text_file_once(pool, db, host_id, file_path, bytes).await {
+        Ok(n) => n,
+        Err(err) if crate::ssh::is_anyhow_sftp_session_dead(&err) => {
+            pool.invalidate_sftp(host_id).await;
+            write_remote_text_file_once(pool, db, host_id, file_path, bytes).await?
+        }
+        Err(err) => return Err(err),
+    };
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(res)
+}
+
+async fn write_remote_text_file_once(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    file_path: &str,
+    bytes: &[u8],
+) -> Result<u64> {
     let sftp = pool.get_or_open_sftp(db, host_id).await?;
     let mut file = sftp
         .create(file_path)
@@ -491,7 +526,6 @@ pub async fn write_text_file(
         .with_context(|| format!("打开远端文件写入失败: {file_path}"))?;
     file.write_all(bytes).await?;
     file.close().await?;
-    pool.invalidate_dir_cache(host_id).await;
     Ok(bytes.len() as u64)
 }
 
@@ -506,9 +540,18 @@ pub async fn create_dir(
         return Ok(());
     }
     let sftp = pool.get_or_open_sftp(db, host_id).await?;
-    sftp.create_dir(dir_path)
-        .await
-        .with_context(|| format!("创建远端目录失败: {dir_path}"))?;
+    if let Err(err) = sftp.create_dir(dir_path).await {
+        if crate::ssh::is_sftp_session_dead(&err) {
+            pool.invalidate_sftp(host_id).await;
+            let fresh = pool.get_or_open_sftp(db, host_id).await?;
+            fresh
+                .create_dir(dir_path)
+                .await
+                .with_context(|| format!("创建远端目录失败: {dir_path}"))?;
+        } else {
+            return Err(err).with_context(|| format!("创建远端目录失败: {dir_path}"));
+        }
+    }
     pool.invalidate_dir_cache(host_id).await;
     Ok(())
 }
@@ -524,15 +567,40 @@ pub async fn rename_item(
         tokio::fs::rename(old_path, new_path).await?;
         return Ok(());
     }
+    match rename_remote_item_once(pool, db, host_id, old_path, new_path).await {
+        Ok(()) => {}
+        Err(err) if crate::ssh::is_anyhow_sftp_session_dead(&err) => {
+            pool.invalidate_sftp(host_id).await;
+            rename_remote_item_once(pool, db, host_id, old_path, new_path).await?;
+        }
+        Err(err) => return Err(err),
+    }
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(())
+}
+
+async fn rename_remote_item_once(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Result<()> {
     let sftp = pool.get_or_open_sftp(db, host_id).await?;
-    // 若目标已存在，先删除旧目标再 rename
-    if sftp.try_exists(new_path).await.unwrap_or(false) {
-        let _ = sftp.remove_file(new_path).await;
+    // 若目标已存在，先删除旧目标再 rename；但若 try_exists 因死会话报错则直接向上冒泡触发重连
+    match sftp.try_exists(new_path).await {
+        Ok(true) => {
+            let _ = sftp.remove_file(new_path).await;
+        }
+        Ok(false) => {}
+        Err(err) if crate::ssh::is_sftp_session_dead(&err) => {
+            return Err(err).with_context(|| format!("重命名前探测目标失败: {new_path}"));
+        }
+        Err(_) => {}
     }
     sftp.rename(old_path, new_path)
         .await
         .with_context(|| format!("重命名失败: {old_path} -> {new_path}"))?;
-    pool.invalidate_dir_cache(host_id).await;
     Ok(())
 }
 
@@ -572,6 +640,25 @@ pub async fn remove_item(
         return Ok(());
     }
 
+    match remove_remote_item_once(pool, db, host_id, target_path, is_dir).await {
+        Ok(()) => {}
+        Err(err) if crate::ssh::is_anyhow_sftp_session_dead(&err) => {
+            pool.invalidate_sftp(host_id).await;
+            remove_remote_item_once(pool, db, host_id, target_path, is_dir).await?;
+        }
+        Err(err) => return Err(err),
+    }
+    pool.invalidate_dir_cache(host_id).await;
+    Ok(())
+}
+
+async fn remove_remote_item_once(
+    pool: &SshPool,
+    db: &Database,
+    host_id: &str,
+    target_path: &str,
+    is_dir: bool,
+) -> Result<()> {
     let sftp = pool.get_or_open_sftp(db, host_id).await?;
     if is_dir {
         remove_remote_dir_recursive(&sftp, target_path).await?;
@@ -580,7 +667,6 @@ pub async fn remove_item(
             .await
             .with_context(|| format!("删除远端文件失败: {target_path}"))?;
     }
-    pool.invalidate_dir_cache(host_id).await;
     Ok(())
 }
 
@@ -997,13 +1083,23 @@ where
         return Ok(local_final.to_string_lossy().replace('\\', "/"));
     }
 
-    let sftp = pool.get_or_open_sftp(db, host_id).await?;
+    let mut sftp = pool.get_or_open_sftp(db, host_id).await?;
 
     // 续传对账：远端残片的整文件哈希必须等于源文件前 N 字节的哈希。
     // 取不到残片哈希（例如远端没有 sha256sum）就不敢续，清掉残片从头传。
     let mut resume_from = 0u64;
     if expected_size > 0 {
-        if let Ok(meta) = sftp.metadata(&temp_path).await {
+        let meta_res = match sftp.metadata(&temp_path).await {
+            Ok(meta) => Ok(meta),
+            Err(err) if crate::ssh::is_sftp_session_dead(&err) => {
+                // 缓存 SFTP 通道已关闭（如 session closed），当场清理重连再查残片，避免误吞错误并拖到 open_with_flags 才炸
+                pool.invalidate_sftp(host_id).await;
+                sftp = pool.get_or_open_sftp(db, host_id).await?;
+                sftp.metadata(&temp_path).await
+            }
+            Err(err) => Err(err),
+        };
+        if let Ok(meta) = meta_res {
             let partial = meta.size.unwrap_or(0);
             if partial > 0 && partial < expected_size {
                 match crate::ssh::remote_sha256(
@@ -1046,15 +1142,26 @@ where
         }
     }
 
+    // 续传分支固定使用 CREATE | WRITE（绝不加 APPEND）：russh-sftp 的 File::write_all 按本地 seek 游标传 offset，
+    // 若带 APPEND 会被 SFTP 服务端强制忽略偏移导致静默写坏文件。
     let open_flags = if resume_from > 0 {
         OpenFlags::CREATE | OpenFlags::WRITE
     } else {
         OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
     };
-    let mut remote_file = sftp
-        .open_with_flags(&temp_path, open_flags)
-        .await
-        .with_context(|| format!("创建远端临时文件失败: {temp_path}"))?;
+    let mut remote_file = match sftp.open_with_flags(&temp_path, open_flags).await {
+        Ok(f) => f,
+        Err(err) if crate::ssh::is_sftp_session_dead(&err) => {
+            pool.invalidate_sftp(host_id).await;
+            sftp = pool.get_or_open_sftp(db, host_id).await?;
+            sftp.open_with_flags(&temp_path, open_flags)
+                .await
+                .with_context(|| format!("创建远端临时文件失败: {temp_path}"))?
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("创建远端临时文件失败: {temp_path}"));
+        }
+    };
     if resume_from > 0 {
         use tokio::io::AsyncSeekExt;
         remote_file
@@ -1109,14 +1216,19 @@ where
         return Err(anyhow!(msg));
     }
 
-    // 原子替换目标文件
-    if sftp.try_exists(&final_path).await.unwrap_or(false) {
-        let _ = sftp.remove_file(&final_path).await;
-    }
-    if let Err(err) = sftp.rename(&temp_path, &final_path).await {
-        let _ = sftp.remove_file(&temp_path).await;
-        transfers.fail_task(task_id, &err);
-        return Err(err.into());
+    // 原子替换目标文件（若因 SFTP 通道闪断失败则自愈重连一次；失败保留 .vps-part 残片不删）
+    if let Err(err) = atomic_replace_remote_file(&sftp, &temp_path, &final_path).await {
+        let retry_res = if crate::ssh::is_sftp_session_dead(&err) {
+            pool.invalidate_sftp(host_id).await;
+            sftp = pool.get_or_open_sftp(db, host_id).await?;
+            atomic_replace_remote_file(&sftp, &temp_path, &final_path).await
+        } else {
+            Err(err)
+        };
+        if let Err(err) = retry_res {
+            transfers.fail_task(task_id, &err);
+            return Err(err.into());
+        }
     }
 
     let digest = hex::encode(hasher.finalize());
@@ -1144,6 +1256,22 @@ where
     }
     pool.invalidate_dir_cache(host_id).await;
     Ok(final_path)
+}
+
+async fn atomic_replace_remote_file(
+    sftp: &SftpSession,
+    temp_path: &str,
+    final_path: &str,
+) -> std::result::Result<(), russh_sftp::client::error::Error> {
+    match sftp.try_exists(final_path).await {
+        Ok(true) => {
+            let _ = sftp.remove_file(final_path).await;
+        }
+        Ok(false) => {}
+        Err(err) if crate::ssh::is_sftp_session_dead(&err) => return Err(err),
+        Err(_) => {}
+    }
+    sftp.rename(temp_path, final_path).await
 }
 
 /// 本机路径 ↔ 远端路径 直接高速传输（桌面端直传 & 未来板块六 MCP `file.put` / `file.get` 直接调用此函数）
@@ -1276,11 +1404,20 @@ pub async fn transfer_local_remote_file(
             .ok_or_else(|| anyhow!("读取传输任务状态失败"))
     } else {
         use sha2::{Digest, Sha256};
-        let sftp = pool.get_or_open_sftp(db, host_id).await?;
-        let meta = sftp
-            .metadata(remote_path)
-            .await
-            .with_context(|| format!("远端文件不存在: {remote_path}"))?;
+        let mut sftp = pool.get_or_open_sftp(db, host_id).await?;
+        let meta = match sftp.metadata(remote_path).await {
+            Ok(m) => m,
+            Err(err) if crate::ssh::is_sftp_session_dead(&err) => {
+                pool.invalidate_sftp(host_id).await;
+                sftp = pool.get_or_open_sftp(db, host_id).await?;
+                sftp.metadata(remote_path)
+                    .await
+                    .with_context(|| format!("远端文件不存在: {remote_path}"))?
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("远端文件不存在: {remote_path}"));
+            }
+        };
         let total = meta.size.unwrap_or(0);
         let filename = remote_path
             .rsplit('/')
@@ -1316,7 +1453,15 @@ pub async fn transfer_local_remote_file(
         };
 
         let started = Instant::now();
-        let mut remote_file = sftp.open(remote_path).await?;
+        let mut remote_file = match sftp.open(remote_path).await {
+            Ok(f) => f,
+            Err(err) if crate::ssh::is_sftp_session_dead(&err) => {
+                pool.invalidate_sftp(host_id).await;
+                sftp = pool.get_or_open_sftp(db, host_id).await?;
+                sftp.open(remote_path).await?
+            }
+            Err(err) => return Err(err.into()),
+        };
         let temp_local = format!("{local_path}.vps-part");
         let mut hasher = Sha256::new();
 
@@ -1468,11 +1613,21 @@ pub async fn transfer_remote_to_remote(
         .get_record(dst_host_id)?
         .ok_or_else(|| anyhow!("目标主机不存在: {dst_host_id}"))?;
 
-    let src_sftp = pool.get_or_open_sftp(db, src_host_id).await?;
-    let meta = src_sftp
-        .metadata(src_path)
-        .await
-        .with_context(|| format!("源主机文件不存在: {src_path}"))?;
+    let mut src_sftp = pool.get_or_open_sftp(db, src_host_id).await?;
+    let meta = match src_sftp.metadata(src_path).await {
+        Ok(m) => m,
+        Err(err) if crate::ssh::is_sftp_session_dead(&err) => {
+            pool.invalidate_sftp(src_host_id).await;
+            src_sftp = pool.get_or_open_sftp(db, src_host_id).await?;
+            src_sftp
+                .metadata(src_path)
+                .await
+                .with_context(|| format!("源主机文件不存在: {src_path}"))?
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("源主机文件不存在: {src_path}"));
+        }
+    };
     let total = meta.size.unwrap_or(0);
     let src_filename = src_path
         .rsplit('/')
@@ -1507,7 +1662,15 @@ pub async fn transfer_remote_to_remote(
         total,
     );
 
-    let src_file = src_sftp.open(src_path).await?;
+    let src_file = match src_sftp.open(src_path).await {
+        Ok(f) => f,
+        Err(err) if crate::ssh::is_sftp_session_dead(&err) => {
+            pool.invalidate_sftp(src_host_id).await;
+            src_sftp = pool.get_or_open_sftp(db, src_host_id).await?;
+            src_sftp.open(src_path).await?
+        }
+        Err(err) => return Err(err.into()),
+    };
     stream_upload_to_host(
         pool,
         db,
@@ -1554,5 +1717,49 @@ mod tests {
         ] {
             assert!(!is_root_like(p), "误判为根: {p:?}");
         }
+    }
+
+    #[test]
+    fn sftp_dead_session_errors_are_distinguished_from_business_status() {
+        use russh_sftp::client::error::Error as SftpErr;
+        use russh_sftp::protocol::{Status, StatusCode};
+
+        let closed = SftpErr::UnexpectedBehavior("session closed".into());
+        assert!(crate::ssh::is_sftp_session_dead(&closed));
+        let wrapped = anyhow::Error::new(closed).context("创建远端临时文件失败: /tmp/mini.txt.vps-part");
+        assert!(crate::ssh::is_anyhow_sftp_session_dead(&wrapped));
+
+        let timeout = SftpErr::Timeout;
+        assert!(crate::ssh::is_sftp_session_dead(&timeout));
+
+        let io_err = SftpErr::IO("unexpected eof".into());
+        assert!(crate::ssh::is_sftp_session_dead(&io_err));
+
+        let conn_lost = SftpErr::Status(Status {
+            id: 1,
+            status_code: StatusCode::ConnectionLost,
+            error_message: "connection lost".into(),
+            language_tag: "en".into(),
+        });
+        assert!(crate::ssh::is_sftp_session_dead(&conn_lost));
+
+        // 业务状态码（文件不存在、权限拒绝）说明 SFTP 通道活着，不应触发会话失效重连
+        let no_such_file = SftpErr::Status(Status {
+            id: 2,
+            status_code: StatusCode::NoSuchFile,
+            error_message: "No such file".into(),
+            language_tag: "en".into(),
+        });
+        assert!(!crate::ssh::is_sftp_session_dead(&no_such_file));
+        let wrapped_biz = anyhow::Error::new(no_such_file).context("读取远端文件失败");
+        assert!(!crate::ssh::is_anyhow_sftp_session_dead(&wrapped_biz));
+
+        let perm_denied = SftpErr::Status(Status {
+            id: 3,
+            status_code: StatusCode::PermissionDenied,
+            error_message: "Permission denied".into(),
+            language_tag: "en".into(),
+        });
+        assert!(!crate::ssh::is_sftp_session_dead(&perm_denied));
     }
 }

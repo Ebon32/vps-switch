@@ -148,15 +148,16 @@ impl SshPool {
                 return h.clone();
             }
         }
-        let resolved = sftp
-            .canonicalize(".")
-            .await
-            .unwrap_or_else(|_| "/root".to_string());
-        self.home_dirs
-            .lock()
-            .await
-            .insert(host_id.to_string(), resolved.clone());
-        resolved
+        match sftp.canonicalize(".").await {
+            Ok(resolved) => {
+                self.home_dirs
+                    .lock()
+                    .await
+                    .insert(host_id.to_string(), resolved.clone());
+                resolved
+            }
+            Err(_) => "/root".to_string(),
+        }
     }
 
     pub async fn get_or_connect(
@@ -173,6 +174,8 @@ impl SshPool {
                 }
             }
         }
+        // 旧 SSH 连接已断开或尚未建立，挂在旧连接上的 SFTP 会话必然已死，同步清除避免残留死句柄
+        self.sftps.lock().await.remove(&host.id);
 
         let handle = connect_single_or_jump(host, jump_host, master_key).await?;
         let arc_handle = Arc::new(handle);
@@ -246,7 +249,9 @@ impl SshPool {
     }
 
     pub async fn invalidate_sftp(&self, host_id: &str) {
-        self.sftps.lock().await.remove(host_id);
+        if self.sftps.lock().await.remove(host_id).is_some() {
+            tracing::warn!("SFTP 会话失效并清理缓存: host_id={host_id}");
+        }
     }
 
     pub async fn get_or_open_sftp(
@@ -254,13 +259,35 @@ impl SshPool {
         db: &Database,
         host_id: &str,
     ) -> Result<Arc<SftpSession>> {
-        {
+        let ssh_alive = {
+            let guard = self.sessions.lock().await;
+            guard.get(host_id).is_some_and(|h| !h.is_closed())
+        };
+        if ssh_alive {
             let guard = self.sftps.lock().await;
             if let Some(existing) = guard.get(host_id) {
                 return Ok(existing.clone());
             }
+        } else {
+            self.sftps.lock().await.remove(host_id);
         }
 
+        let sftp = match self.open_sftp_once(db, host_id).await {
+            Ok(s) => s,
+            Err(_) => {
+                self.invalidate_host(host_id).await;
+                self.open_sftp_once(db, host_id).await?
+            }
+        };
+        let arc_sftp = Arc::new(sftp);
+        {
+            let mut guard = self.sftps.lock().await;
+            guard.insert(host_id.to_string(), arc_sftp.clone());
+        }
+        Ok(arc_sftp)
+    }
+
+    async fn open_sftp_once(&self, db: &Database, host_id: &str) -> Result<SftpSession> {
         let (_record, channel) = open_host_channel(self, db, host_id).await?;
         channel
             .request_subsystem(true, "sftp")
@@ -276,16 +303,41 @@ impl SshPool {
             request_timeout_secs: 60,
         };
 
-        let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_cfg)
+        SftpSession::new_with_config(channel.into_stream(), sftp_cfg)
             .await
-            .context("初始化 SFTP 会话失败")?;
-        let arc_sftp = Arc::new(sftp);
-        {
-            let mut guard = self.sftps.lock().await;
-            guard.insert(host_id.to_string(), arc_sftp.clone());
-        }
-        Ok(arc_sftp)
+            .context("初始化 SFTP 会话失败")
     }
+}
+
+/// 判定 SFTP 错误是否属于底层会话/通道已死（区别于文件不存在、权限拒绝等服务端正常返回的业务状态码）。
+pub fn is_sftp_session_dead(err: &russh_sftp::client::error::Error) -> bool {
+    use russh_sftp::client::error::Error as SftpErr;
+    use russh_sftp::protocol::StatusCode;
+    match err {
+        SftpErr::Status(st) => matches!(
+            st.status_code,
+            StatusCode::NoConnection | StatusCode::ConnectionLost
+        ),
+        SftpErr::IO(_)
+        | SftpErr::Timeout
+        | SftpErr::UnexpectedPacket
+        | SftpErr::UnexpectedBehavior(_) => true,
+        SftpErr::Limited(_) => false,
+    }
+}
+
+pub fn is_anyhow_sftp_session_dead(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(sftp_err) = cause.downcast_ref::<russh_sftp::client::error::Error>() {
+            return is_sftp_session_dead(sftp_err);
+        }
+    }
+    let msg = format!("{err:#}");
+    msg.contains("session closed")
+        || msg.contains("SendError:")
+        || msg.contains("RecvError:")
+        || msg.contains("Connection lost")
+        || msg.contains("No connection")
 }
 
 async fn authenticate_session(

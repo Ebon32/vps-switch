@@ -1,13 +1,4 @@
-//! 无头 UI 测试：真实面板在测试窗口里渲染，用真实指针事件驱动。
-//!
-//! 注意：不要 `use gpui_kit::*`——glob 会把 gpui 的 `test` 宏带进作用域，
-//! 遮蔽 Rust 内置的 `#[test]` 属性（gpui-kit 文档明确提醒过）。这里全部
-//! 显式导入。
-//!
-//! 为什么不用 `gpui_kit::test::TestWindowExt`：gpui-kit 的 test-support
-//! feature 会拉入 gpui-fast 系列，与 gpui-pre 0.3.9 的依赖树版本冲突
-//! （cocoa / unicode-properties），解析直接失败。下面的 helper 是
-//! TestWindowExt 同一套底层调用的精简版（公共 GPUI API）。
+//! 板块一（VPS 仓库）+ 板块二（终端）+ 板块三（文件浏览器）无头 UI 集成测试。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,27 +10,97 @@ use gpui_kit::{
     WindowHandle, px, size,
 };
 
-use vps_switch_gpui::api::HostSummary;
-use vps_switch_gpui::hosts::{HostList, HostListEvent};
+use vps_switch_gpui::api::{Api, Host, HostLink};
+use vps_switch_gpui::terminal::PaneMeta;
+use vps_switch_gpui::theme;
+use vps_switch_gpui::workspace::{CenterStage, RightWing, StatusFilter, Workspace};
 
-fn host(id: &str, name: &str, online: bool) -> HostSummary {
-    HostSummary {
+fn make_host(
+    id: &str,
+    name: &str,
+    kind: &str,
+    status: &str,
+    distro: &str,
+    role: Option<&str>,
+    favorited: bool,
+) -> Host {
+    Host {
         id: id.into(),
         name: name.into(),
-        addr: "10.0.0.1".into(),
-        kind: "ssh".into(),
-        os: Some("linux".into()),
-        pretty_name: Some("Ubuntu 24.04".into()),
+        addr: if kind == "local" {
+            "127.0.0.1".into()
+        } else {
+            "203.0.113.10".into()
+        },
+        port: 22,
+        username: "root".into(),
+        kind: kind.into(),
+        auth_type: "password".into(),
+        has_password: true,
+        has_private_key: false,
+        has_passphrase: false,
+        jump_host_id: None,
+        jump_host_name: None,
+        status: status.into(),
+        os: Some(if distro == "windows" {
+            "windows".into()
+        } else {
+            "linux".into()
+        }),
+        pretty_name: Some(format!("{distro} server")),
+        distro_id: Some(distro.into()),
+        kernel: Some("6.8.0-generic".into()),
+        arch: Some("x86_64".into()),
+        cpu_cores: Some(4),
+        cpu_model: Some("AMD EPYC".into()),
         pinned: false,
-        favorited: false,
-        latency_ms: online.then_some(42),
+        favorited,
+        archived: false,
+        role: role.map(str::to_owned),
+        tags: vec!["hk".into(), "bgp".into()],
+        links: vec![HostLink {
+            id: "l1".into(),
+            name: "商家面板".into(),
+            url: "https://example.com".into(),
+            description: String::new(),
+        }],
+        latency_ms: Some(31),
         last_error: None,
     }
+}
+
+fn seed_hosts() -> Vec<Host> {
+    vec![
+        make_host("local", "本机", "local", "online", "windows", None, false),
+        make_host(
+            "vip-hk",
+            "vip-hk",
+            "ssh",
+            "online",
+            "debian",
+            Some("primary"),
+            true,
+        ),
+        make_host(
+            "us-node",
+            "us-node",
+            "ssh",
+            "offline",
+            "ubuntu",
+            Some("proxy"),
+            false,
+        ),
+    ]
 }
 
 fn render_frame(window: &mut Window, cx: &mut App) {
     window.refresh();
     window.draw(cx).clear(cx);
+}
+
+fn has_element(window: &Window, id: &str) -> bool {
+    let element_id = ElementId::Name(SharedString::from(id));
+    gpui_base::test_support::find(window, &[], &element_id).is_some()
 }
 
 fn element_center(window: &Window, id: &str) -> Point<Pixels> {
@@ -50,7 +111,6 @@ fn element_center(window: &Window, id: &str) -> Point<Pixels> {
         .center()
 }
 
-/// 在元素中心按下-抬起 `count` 次（2 次即双击）。
 fn click_element(window: &mut Window, id: &str, count: usize, cx: &mut App) {
     render_frame(window, cx);
     let position = element_center(window, id);
@@ -89,76 +149,297 @@ fn click_element(window: &mut Window, id: &str, count: usize, cx: &mut App) {
     render_frame(window, cx);
 }
 
-fn has_element(window: &Window, id: &str) -> bool {
-    let element_id = ElementId::Name(SharedString::from(id));
-    gpui_base::test_support::find(window, &[], &element_id).is_some()
+fn open_workspace(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Workspace>) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        theme::install(cx);
+    });
+    let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+    let holder_clone = holder.clone();
+    let handle = cx.open_window(size(px(1240.), px(780.)), |window, cx| {
+        let ws = cx.new(|cx| Workspace::new(Api::disconnected(), window, cx));
+        ws.update(cx, |w, cx| w.set_hosts_for_test(seed_hosts(), cx));
+        *holder_clone.borrow_mut() = Some(ws.clone());
+        Root::new(ws, window, cx)
+    });
+    let ws = holder.borrow().clone().unwrap();
+    (handle, ws)
 }
 
-fn open_host_list(
-    cx: &mut TestAppContext,
-) -> (
-    WindowHandle<Root>,
-    Entity<HostList>,
-    Rc<RefCell<Vec<String>>>,
-) {
-    cx.update(|cx| gpui_kit::init(cx));
-    let host_list: Rc<RefCell<Option<Entity<HostList>>>> = Rc::new(RefCell::new(None));
-    let seen = Rc::new(RefCell::new(Vec::<String>::new()));
-    let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
-        let list = cx.new(HostList::new);
-        list.update(cx, |list, cx| {
-            list.apply_hosts(
-                vec![host("local", "本机", true), host("vps1", "vps-1", false)],
+#[gpui_kit::test]
+fn renders_host_cards_and_official_os_badges(cx: &mut TestAppContext) {
+    let (handle, _) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        render_frame(window, cx);
+        assert!(has_element(window, "host-card-local"));
+        assert!(has_element(window, "host-card-vip-hk"));
+        assert!(has_element(window, "host-card-us-node"));
+        assert!(has_element(window, "os-badge-local"));
+        assert!(has_element(window, "os-badge-vip-hk"));
+        assert!(has_element(window, "os-badge-us-node"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clicking_card_toggles_detail_drawer_and_delete_confirm(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        assert!(ws.read(cx).right_wing.is_none());
+        click_element(window, "host-card-vip-hk", 1, cx);
+        assert_eq!(ws.read(cx).right_wing, Some(RightWing::Detail));
+        assert!(has_element(window, "detail-drawer"));
+        assert!(has_element(window, "drawer-delete"));
+
+        click_element(window, "drawer-delete", 1, cx);
+        assert!(has_element(window, "delete-modal-card"));
+        click_element(window, "delete-modal-cancel", 1, cx);
+        assert!(!has_element(window, "delete-modal-card"));
+
+        click_element(window, "host-card-vip-hk", 1, cx);
+        assert!(ws.read(cx).right_wing.is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn filter_dropdown_and_modals_work_end_to_end(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        click_element(window, "nav-filter", 1, cx);
+        assert!(has_element(window, "filter-dropdown-panel"));
+
+        click_element(window, "filter-status-online", 1, cx);
+        assert_eq!(ws.read(cx).status_filter, StatusFilter::Online);
+        assert!(has_element(window, "host-card-vip-hk"));
+        assert!(!has_element(window, "host-card-us-node"));
+
+        click_element(window, "filter-reset", 1, cx);
+        assert_eq!(ws.read(cx).status_filter, StatusFilter::All);
+        assert!(has_element(window, "host-card-us-node"));
+
+        click_element(window, "nav-add", 1, cx);
+        assert!(has_element(window, "host-modal-card"));
+        click_element(window, "modal-save", 1, cx);
+        assert!(has_element(window, "modal-error"));
+        click_element(window, "modal-cancel", 1, cx);
+        assert!(!has_element(window, "host-modal-card"));
+
+        click_element(window, "edit-vip-hk", 1, cx);
+        assert!(has_element(window, "host-modal-card"));
+        assert_eq!(
+            ws.read(cx)
+                .host_modal
+                .as_ref()
+                .and_then(|m| m.editing_id.as_deref()),
+            Some("vip-hk")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn terminal_stage_opens_splits_toggles_dark_and_collapses(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        click_element(window, "host-card-vip-hk", 2, cx);
+        assert_eq!(ws.read(cx).center_stage, Some(CenterStage::Terminal));
+        assert!(has_element(window, "terminal-stage"));
+        assert!(has_element(window, "stage-cwd-pill"));
+        assert!(has_element(window, "stage-exit-code-badge"));
+        assert!(has_element(window, "pane-cell-0"));
+        assert!(!has_element(window, "pane-cell-1"));
+
+        click_element(window, "split-row", 1, cx);
+        assert_eq!(ws.read(cx).open_tabs[0].panes.len(), 2);
+        assert!(has_element(window, "pane-cell-1"));
+        assert!(has_element(window, "close-pane-1"));
+
+        assert!(!ws.read(cx).terminal_dark);
+        click_element(window, "toggle-terminal-dark", 1, cx);
+        assert!(ws.read(cx).terminal_dark);
+
+        click_element(window, "close-pane-1", 1, cx);
+        assert_eq!(ws.read(cx).open_tabs[0].panes.len(), 1);
+        assert!(!has_element(window, "pane-cell-1"));
+
+        // 点击舞台顶栏「刷新」按钮，原地重置当前聚焦 pane
+        assert!(has_element(window, "refresh-terminal"));
+        assert_eq!(ws.read(cx).open_tabs[0].panes[0].read(cx).refresh_count, 0);
+        click_element(window, "refresh-terminal", 1, cx);
+        assert_eq!(ws.read(cx).open_tabs[0].panes[0].read(cx).refresh_count, 1);
+        assert_eq!(
+            ws.read(cx).open_tabs[0].panes[0].read(cx).pane_id.as_deref(),
+            Some("mock-pane-2")
+        );
+
+        click_element(window, "collapse-stage", 1, cx);
+        assert!(ws.read(cx).center_stage.is_none());
+        assert!(has_element(window, "session-vip-hk"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn file_browser_renders_breadcrumbs_entries_inline_prompt_and_editor(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        // 点击卡片「文件」按钮进入全宽文件舞台（命中预置缓存 /root）
+        click_element(window, "open-files-vip-hk", 1, cx);
+        assert_eq!(ws.read(cx).center_stage, Some(CenterStage::Files));
+        assert!(has_element(window, "file-browser-panel"));
+        assert!(has_element(window, "crumb-0"));
+        assert!(has_element(window, "crumb-1"));
+        assert!(has_element(window, "file-row-parent"));
+        assert!(has_element(window, "file-row-app"));
+        assert!(has_element(window, "file-row-nginx.conf"));
+        assert!(has_element(window, "file-row-backup.tar.gz"));
+        assert!(has_element(window, "file-extract-2"));
+
+        // 点击「+目录」展开行内输入条，再点「取消」收起
+        click_element(window, "files-btn-mkdir", 1, cx);
+        assert!(has_element(window, "files-inline-prompt"));
+        click_element(window, "files-prompt-cancel", 1, cx);
+        assert!(!has_element(window, "files-inline-prompt"));
+
+        // 点击文件打开右侧在线代码编辑器
+        click_element(window, "file-row-nginx.conf", 1, cx);
+        assert!(ws.read(cx).files.editor_open);
+        assert!(has_element(window, "files-editor-pane"));
+        assert!(has_element(window, "editor-save-btn"));
+
+        // 关闭编辑器
+        click_element(window, "editor-close-btn", 1, cx);
+        assert!(!ws.read(cx).files.editor_open);
+        assert!(!has_element(window, "files-editor-pane"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn settings_page_switches_all_five_tabs_and_expands_call_log(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        // 点击顶栏设置圆钮进入设置页（默认「常规与自启」）
+        click_element(window, "nav-settings", 1, cx);
+        assert!(has_element(window, "settings-panel-general"));
+        assert!(has_element(window, "settings-toggle-autostart"));
+
+        // 切换到「访问安全」
+        click_element(window, "settings-tab-security", 1, cx);
+        assert!(has_element(window, "settings-panel-security"));
+        assert!(has_element(window, "settings-save-auth"));
+
+        // 切换到「MCP Server」
+        click_element(window, "settings-tab-mcp", 1, cx);
+        assert!(has_element(window, "settings-panel-mcp"));
+        assert!(has_element(window, "settings-toggle-mcp"));
+        assert!(has_element(window, "settings-save-guard"));
+
+        // 切换到「调用记录」并点击展开第一条记录
+        click_element(window, "settings-tab-calls", 1, cx);
+        assert!(has_element(window, "settings-panel-calls"));
+        assert!(has_element(window, "mcp-call-row-call-1"));
+        click_element(window, "mcp-call-row-call-1", 1, cx);
+        assert_eq!(
+            ws.read(cx).settings.expanded_call_id.as_deref(),
+            Some("call-1")
+        );
+
+        // 切换到「关于与更新」
+        click_element(window, "settings-tab-about", 1, cx);
+        assert!(has_element(window, "settings-panel-about"));
+        assert!(has_element(window, "settings-check-update"));
+
+        // 点击「返回仓库」回到工作台
+        click_element(window, "settings-back-home", 1, cx);
+        assert!(has_element(window, "host-card-vip-hk"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn terminal_right_click_opens_context_menu_and_clears_screen(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        click_element(window, "host-card-vip-hk", 2, cx);
+        assert!(has_element(window, "terminal-stage"));
+        assert!(!has_element(window, "terminal-context-menu"));
+
+        // 确认初始 mock 快照首格有字符 'r' ("root@vip-hk:~# ")
+        let pane = ws.read(cx).open_tabs[0].panes[0].clone();
+        assert_eq!(pane.read(cx).snapshot.as_ref().unwrap().cells[0].c, 'r');
+
+        // 在终端区域右键按下，弹出终端右键菜单
+        let position = element_center(window, "pane-cell-0");
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Right,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        render_frame(window, cx);
+
+        assert!(has_element(window, "terminal-context-menu"));
+        assert!(has_element(window, "terminal-ctx-copy"));
+        assert!(has_element(window, "terminal-ctx-paste"));
+        assert!(has_element(window, "terminal-ctx-clear"));
+        assert!(has_element(window, "terminal-ctx-reconnect"));
+
+        // 点击「清屏」菜单项：菜单收起，终端屏幕清空且光标归位
+        click_element(window, "terminal-ctx-clear", 1, cx);
+        assert!(!has_element(window, "terminal-context-menu"));
+        let snap = pane.read(cx).snapshot.as_ref().unwrap();
+        assert_eq!(snap.cells[0].c, ' ');
+        assert_eq!(snap.cursor, Some((0, 0)));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn sse_reveal_terminal_event_switches_to_terminal_stage_and_shows_toast(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        assert!(ws.read(cx).center_stage.is_none());
+
+        ws.update(cx, |w, cx| {
+            w.reveal_terminal(
+                "vip-hk",
+                PaneMeta {
+                    id: "agent-pane-99".into(),
+                    host_id: "vip-hk".into(),
+                    cols: 100,
+                    rows: 30,
+                    cwd: Some("/etc/nginx".into()),
+                    title: None,
+                    running: true,
+                    last_exit_code: None,
+                    bracketed_paste: true,
+                    headless: false,
+                    exited: false,
+                },
+                Some("请检查 nginx 配置".into()),
                 cx,
             );
         });
-        *host_list.borrow_mut() = Some(list.clone());
-        Root::new(list, window, cx)
-    });
-    let list = host_list.borrow().clone().unwrap();
-    let sink = seen.clone();
-    cx.update(|cx| {
-        cx.subscribe(&list, move |_, event: &HostListEvent, _| {
-            if let HostListEvent::Open(host) = event {
-                sink.borrow_mut().push(host.id.clone());
-            }
-        })
-        .detach();
-    });
-    (handle, list, seen)
-}
-
-#[gpui_kit::test]
-fn hosts_render_with_their_rows(cx: &mut TestAppContext) {
-    let (handle, _, _) = open_host_list(cx);
-    cx.update_window(handle.into(), |_, window, cx| {
         render_frame(window, cx);
-        assert!(has_element(window, "host-local"));
-        assert!(has_element(window, "host-vps1"));
+
+        assert_eq!(ws.read(cx).center_stage, Some(CenterStage::Terminal));
+        assert_eq!(ws.read(cx).stage_host_id.as_deref(), Some("vip-hk"));
+        assert!(has_element(window, "terminal-stage"));
+        assert!(has_element(window, "stage-running-badge"));
+        assert!(has_element(window, "workspace-toast"));
+        assert_eq!(
+            ws.read(cx).toast.as_ref().map(|t| t.text.as_str()),
+            Some("Agent 唤起「vip-hk」终端: 请检查 nginx 配置")
+        );
     })
     .unwrap();
 }
 
-#[gpui_kit::test]
-fn double_click_opens_the_host(cx: &mut TestAppContext) {
-    let (handle, _, opened) = open_host_list(cx);
-    cx.update_window(handle.into(), |_, window, cx| {
-        click_element(window, "host-vps1", 2, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    assert_eq!(&*opened.borrow(), &["vps1".to_string()]);
-}
 
-#[gpui_kit::test]
-fn clicking_an_already_selected_host_opens_it(cx: &mut TestAppContext) {
-    let (handle, _, opened) = open_host_list(cx);
-    cx.update_window(handle.into(), |_, window, cx| {
-        // 第一次点击只选中；再点一次已选中的行即打开（与旧前端一致）。
-        click_element(window, "host-local", 1, cx);
-        click_element(window, "host-local", 1, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    assert_eq!(&*opened.borrow(), &["local".to_string()]);
-}

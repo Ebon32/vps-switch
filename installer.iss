@@ -5,7 +5,8 @@
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "weidu12123"
 #define MyAppURL "https://github.com/weidu12123/vps-switch"
-#define MyAppExeName "vps-switch.exe"
+#define MyAppExeName "vps-switch-gpui.exe"
+#define MyDaemonExeName "vps-switch.exe"
 
 [Setup]
 ; 基础信息
@@ -51,8 +52,9 @@ Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 核心程序与随包 Windows ConPTY
+; GPUI 原生桌面客户端 + 后端守护进程 + 随包 Windows ConPTY
 Source: "target\dist\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "target\dist\release\{#MyDaemonExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 

@@ -152,7 +152,8 @@ fn try_wakeup_existing_instance(port: u16) -> bool {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let is_mcp_stdio = args.iter().any(|a| a == "--mcp-stdio" || a == "mcp");
-    let is_headless = args.iter().any(|a| a == "--headless" || a == "--server");
+    let mut is_headless = args.iter().any(|a| a == "--headless" || a == "--server");
+    let start_minimized = args.iter().any(|a| a == "--minimized" || a == "--hidden");
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -163,6 +164,24 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     if !is_mcp_stdio && !is_headless && try_wakeup_existing_instance(port) {
         return Ok(());
+    }
+
+    // 若同级目录存在 GPUI 原生客户端 vps-switch-gpui.exe，则拉起它并自身转为无头守护进程运行
+    #[cfg(windows)]
+    if !is_mcp_stdio && !is_headless {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let gpui_bin = dir.join("vps-switch-gpui.exe");
+                if gpui_bin.is_file() {
+                    let mut cmd = std::process::Command::new(gpui_bin);
+                    if start_minimized {
+                        cmd.arg("--minimized");
+                    }
+                    let _ = cmd.spawn();
+                    is_headless = true;
+                }
+            }
+        }
     }
 
     if !is_mcp_stdio {

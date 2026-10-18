@@ -1,47 +1,146 @@
-//! 终端视图：GPUI Element 渲染网格快照 + 键盘输入编码。
+//! 终端面板视图（对齐 `TerminalPaneView.vue`）：
 //!
-//! 渲染策略（性能与正确性的折中，依据 `force_width` 的真实语义）：
-//! `shape_line` 的 `force_width` 会把**每个字形**吸附到 `n × 单格宽度` 的
-//! 网格上。对 ASCII 等宽字符这是精确对齐；对中文等双宽字符会把后续字符
-//! 挤进上一格。因此每行按段塑形：连续 ASCII 段带 `force_width` 合并成一次
-//! 塑形，双宽字符单独塑形、画在 `列号 × cell_width` 处。
+//! 1. GPUI `Element` 网格渲染：
+//!    - 修复 `ShapedLine::paint` 的 `wrap_width`（传 `Some(bounds.size.width)`，不再在第 4 格截断）
+//!    - 完整支持 16 基础 ANSI 色 + 216 立方体色 + 24 级灰度（256 色）+ TrueColor
+//!    - 完整支持 `Flags::INVERSE`（反显，htop/vim 必用）、`Flags::DIM`、`Flags::BOLD`、`Flags::ITALIC`、`Flags::UNDERLINE`
+//!    - 绝不在 `prepaint` 阶段重入 `view.update()`，尺寸同步与 IME 坐标更新放在 `paint` 阶段执行
+//! 2. 中文 IME 输入（`EntityInputHandler` + `window.handle_input`）：
+//!    - 光标处实时显示带下划线的 IME 预编辑文本 `marked_text`
+//!    - 准确向系统报告光标屏幕坐标 `ime_cursor_bounds`，输入法候选框跟随光标
+//! 3. 鼠标拖拽文本选区 + 智能 `Ctrl+C`（有选区复制并清选区，无选区发 `0x03`）+ `Ctrl+V`（安全 bracketed paste）
+//! 4. 底部断线重连提示条 / 会话已结束提示条 / 多分屏右上角「关闭分屏 ✕」按钮
 
+use std::ops::Range;
 use std::time::Duration;
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
+use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
-use super::session::{Session, SessionCommand, SessionEvent, Snapshot};
+use super::session::{PaneMeta, Session, SessionCommand, SessionEvent, Snapshot};
 
-const FONT_SIZE: f32 = 13.0;
-const LINE_HEIGHT: f32 = 1.4;
+const FONT_SIZE: f32 = 13.5;
+const LINE_HEIGHT: f32 = 1.32;
 
 pub struct TerminalView {
+    pub host_id: String,
+    pub pane_id: Option<String>,
+    pub meta: PaneMeta,
     session: Session,
-    snapshot: Option<Snapshot>,
-    focus_handle: FocusHandle,
-    /// 会话结束的原因；有值时在底部显示提示条。
-    status: Option<String>,
-    /// 白底 / 黑底（与旧前端的 LIGHT_THEME / DARK_THEME 对应）。
-    dark: bool,
+    pub snapshot: Option<Snapshot>,
+    pub focus_handle: FocusHandle,
+    pub dark: bool,
+    pub connecting: bool,
+    pub create_error: Option<String>,
+    pub disconnected: Option<(u32, bool)>,
     cols: u16,
     rows: u16,
+
+    // 鼠标拖拽选区：((start_row, start_col), (end_row, end_col))
+    pub selection: Option<((usize, usize), (usize, usize))>,
+    dragging_selection: bool,
+    last_cell_origin: Point<Pixels>,
+    last_cell_size: gpui_kit::Size<Pixels>,
+
+    // 中文 IME 预编辑状态
+    pub marked_text: String,
+    pub marked_selection: Range<usize>,
+    pub ime_cursor_bounds: Option<Bounds<Pixels>>,
+
+    // 终端右键菜单坐标（相对于终端视图左上角）
+    pub context_menu_pos: Option<Point<Pixels>>,
+
+    // 刷新/重连计数与无头测试样本
+    pub refresh_count: u32,
+    mock_sample_line: Option<String>,
+}
+
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        self.session.send(SessionCommand::Shutdown);
+    }
 }
 
 impl TerminalView {
     pub fn new(host_id: String, dark: bool, cx: &mut Context<Self>) -> Self {
         let (cols, rows) = (100, 30);
-        let this = Self {
-            session: Session::spawn(host_id, cols, rows),
-            snapshot: None,
-            focus_handle: cx.focus_handle(),
-            status: None,
+        let session = Session::spawn(host_id.clone(), cols, rows);
+        Self::from_session(host_id, session, dark, cols, rows, None, cx)
+    }
+
+    pub fn new_attached(
+        host_id: String,
+        pane: PaneMeta,
+        dark: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let cols = pane.cols.max(80);
+        let rows = pane.rows.max(24);
+        let session = Session::attach(host_id.clone(), pane, cols, rows);
+        Self::from_session(host_id, session, dark, cols, rows, None, cx)
+    }
+
+    pub fn new_mock(
+        host_id: String,
+        dark: bool,
+        sample_line: &str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (cols, rows) = (80, 24);
+        let session = Session::mock_with_text(cols, rows, sample_line);
+        Self::from_session(
+            host_id,
+            session,
             dark,
             cols,
             rows,
+            Some(sample_line.to_owned()),
+            cx,
+        )
+    }
+
+    fn from_session(
+        host_id: String,
+        session: Session,
+        dark: bool,
+        cols: u16,
+        rows: u16,
+        mock_sample_line: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self {
+            host_id: host_id.clone(),
+            pane_id: None,
+            meta: PaneMeta {
+                host_id,
+                cols,
+                rows,
+                ..PaneMeta::default()
+            },
+            session,
+            snapshot: None,
+            focus_handle: cx.focus_handle(),
+            dark,
+            connecting: true,
+            create_error: None,
+            disconnected: None,
+            cols,
+            rows,
+            selection: None,
+            dragging_selection: false,
+            last_cell_origin: point(px(0.), px(0.)),
+            last_cell_size: size(px(8.), px(18.)),
+            marked_text: String::new(),
+            marked_selection: 0..0,
+            ime_cursor_bounds: None,
+            context_menu_pos: None,
+            refresh_count: 0,
+            mock_sample_line,
         };
+        this.drain_events();
         Self::poll(cx);
         this
     }
@@ -53,25 +152,124 @@ impl TerminalView {
         }
     }
 
-    fn poll(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(16))
-                .await;
-            let alive = this.update(cx, |this, cx| {
-                let mut changed = false;
-                while let Some(event) = this.session.try_recv() {
-                    changed = true;
-                    match event {
-                        SessionEvent::Updated => {
-                            this.snapshot = this.session.snapshot();
-                        }
-                        SessionEvent::Closed(reason) => {
-                            this.status = Some(reason);
-                        }
+    pub fn manual_reconnect(&mut self, cx: &mut Context<Self>) {
+        self.disconnected = None;
+        self.create_error = None;
+        self.session.send(SessionCommand::ManualReconnect);
+        cx.notify();
+    }
+
+    pub fn reconnect_fresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_count += 1;
+        self.create_error = None;
+        self.disconnected = None;
+        self.meta.exited = false;
+        self.selection = None;
+        self.marked_text.clear();
+        self.marked_selection = 0..0;
+        self.context_menu_pos = None;
+
+        if let Some(sample) = &self.mock_sample_line {
+            let new_id = format!("mock-pane-{}", self.refresh_count + 1);
+            self.pane_id = Some(new_id.clone());
+            self.meta.id = new_id;
+            self.connecting = false;
+            self.session = Session::mock_with_text(self.cols, self.rows, sample);
+            self.snapshot = self.session.snapshot();
+        } else {
+            self.connecting = true;
+            self.snapshot = None;
+            self.session.send(SessionCommand::ReconnectFresh);
+        }
+        cx.notify();
+    }
+
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        self.context_menu_pos = None;
+        if let Some(selected) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(selected));
+            self.selection = None;
+            cx.notify();
+            true
+        } else {
+            cx.notify();
+            false
+        }
+    }
+
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        self.context_menu_pos = None;
+        if let Some(item) = cx.read_from_clipboard()
+            && let Some(text) = item.text()
+        {
+            self.send_paste(text);
+        }
+        cx.notify();
+    }
+
+    pub fn clear_screen(&mut self, cx: &mut Context<Self>) {
+        self.selection = None;
+        self.context_menu_pos = None;
+        if let Some(snap) = &mut self.snapshot {
+            for cell in &mut snap.cells {
+                *cell = super::session::CellSnapshot::default();
+            }
+            snap.cursor = Some((0, 0));
+            snap.display_offset = 0;
+            snap.history_size = 0;
+        }
+        self.session.send(SessionCommand::Clear);
+        cx.notify();
+    }
+
+    fn drain_events(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(event) = self.session.try_recv() {
+            changed = true;
+            match event {
+                SessionEvent::Created { pane_id, meta } => {
+                    self.pane_id = Some(pane_id);
+                    self.meta = meta;
+                    self.connecting = false;
+                    self.create_error = None;
+                }
+                SessionEvent::CreateFailed(reason) => {
+                    self.connecting = false;
+                    self.create_error = Some(reason);
+                }
+                SessionEvent::Connected => {
+                    self.connecting = false;
+                    self.disconnected = None;
+                }
+                SessionEvent::Updated => {
+                    self.snapshot = self.session.snapshot();
+                }
+                SessionEvent::Meta(meta) => {
+                    self.meta = meta;
+                    if self.meta.exited {
+                        self.disconnected = None;
                     }
                 }
-                if changed {
+                SessionEvent::Disconnected { attempt, exhausted } => {
+                    if !self.meta.exited {
+                        self.disconnected = Some((attempt, exhausted));
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn poll(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            let interval = if crate::rendering::is_software_rendering() {
+                crate::rendering::SOFTWARE_FRAME_INTERVAL
+            } else {
+                Duration::from_millis(16)
+            };
+            cx.background_executor().timer(interval).await;
+            let alive = this.update(cx, |this, cx| {
+                if this.drain_events() {
                     cx.notify();
                 }
             });
@@ -82,23 +280,127 @@ impl TerminalView {
         .detach();
     }
 
-    fn request_size(&mut self, cols: u16, rows: u16) {
-        if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
-            return;
+    pub fn sync_viewport(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_origin: Point<Pixels>,
+        cell_size: gpui_kit::Size<Pixels>,
+        ime_bounds: Option<Bounds<Pixels>>,
+    ) {
+        self.last_cell_origin = cell_origin;
+        self.last_cell_size = cell_size;
+        self.ime_cursor_bounds = ime_bounds;
+        if cols >= 2 && rows >= 1 && (cols != self.cols || rows != self.rows) {
+            self.cols = cols;
+            self.rows = rows;
+            self.session.send(SessionCommand::Resize { cols, rows });
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.session.send(SessionCommand::Resize { cols, rows });
     }
 
-    fn input(&mut self, bytes: Vec<u8>) {
+    pub fn send_input(&mut self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
             self.session.send(SessionCommand::Input(bytes));
         }
     }
 
+    pub fn send_paste(&mut self, text: String) {
+        if !text.is_empty() {
+            self.session.send(SessionCommand::Paste(text));
+        }
+    }
+
     fn scroll(&mut self, lines: i32) {
         self.session.send(SessionCommand::Scroll(lines));
+    }
+
+    /// 提取当前鼠标选区内的纯文本。
+    pub fn selected_text(&self) -> Option<String> {
+        let ((r0, c0), (r1, c1)) = normalized_selection(self.selection)?;
+        let snap = self.snapshot.as_ref()?;
+        let mut out = String::new();
+        for row in r0..=r1.min(snap.rows.saturating_sub(1)) {
+            let start_col = if row == r0 { c0 } else { 0 };
+            let end_col = if row == r1 {
+                c1.min(snap.cols.saturating_sub(1))
+            } else {
+                snap.cols.saturating_sub(1)
+            };
+            if start_col > end_col {
+                continue;
+            }
+            let mut line = String::new();
+            for col in start_col..=end_col {
+                let cell = &snap.cells[row * snap.cols + col];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line.push(if cell.c.is_control() { ' ' } else { cell.c });
+            }
+            if row < r1 {
+                out.push_str(line.trim_end());
+                out.push('\n');
+            } else {
+                out.push_str(line.trim_end());
+            }
+        }
+        let trimmed = out.trim_matches('\n').to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+
+    fn point_to_cell(&self, position: Point<Pixels>) -> (usize, usize) {
+        let cw = self.last_cell_size.width.as_f32().max(1.0);
+        let ch = self.last_cell_size.height.as_f32().max(1.0);
+        let dx = (position.x - self.last_cell_origin.x).as_f32().max(0.0);
+        let dy = (position.y - self.last_cell_origin.y).as_f32().max(0.0);
+        let col = (dx / cw).floor() as usize;
+        let row = (dy / ch).floor() as usize;
+        (
+            row.min(self.rows.saturating_sub(1) as usize),
+            col.min(self.cols.saturating_sub(1) as usize),
+        )
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &event.keystroke;
+        let key = ks.key.to_lowercase();
+        let ctrl_or_cmd = ks.modifiers.control || ks.modifiers.platform;
+
+        if key == "escape" && self.context_menu_pos.is_some() {
+            self.context_menu_pos = None;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        // 1. Ctrl+C：有选区则复制并清空选区；无选区则发送 0x03 (SIGINT)
+        if ctrl_or_cmd && !ks.modifiers.shift && !ks.modifiers.alt && key == "c" {
+            if self.copy_selection(cx) {
+                cx.stop_propagation();
+                return;
+            }
+            if ks.modifiers.control {
+                self.send_input(vec![0x03]);
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        // 2. Ctrl+V / Cmd+V：从系统剪贴板读取并发送 bracketed paste
+        if ctrl_or_cmd && !ks.modifiers.shift && !ks.modifiers.alt && key == "v" {
+            self.paste_from_clipboard(cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // 3. 特殊控制键与 Ctrl/Alt 组合键由这里直接编码发送并停止冒泡；
+        //    普通可打印字符与中文输入法留给 EntityInputHandler 处理，避免重复输入。
+        if let Some(bytes) = encode_special_key(ks) {
+            self.selection = None;
+            self.context_menu_pos = None;
+            self.send_input(bytes);
+            cx.stop_propagation();
+        }
     }
 }
 
@@ -108,21 +410,186 @@ impl Focusable for TerminalView {
     }
 }
 
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let len = self.marked_text.encode_utf16().count();
+        adjusted_range.replace(0..len);
+        Some(self.marked_text.clone())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.marked_selection.clone(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        (!self.marked_text.is_empty()).then(|| 0..self.marked_text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked_text.clear();
+        self.marked_selection = 0..0;
+        cx.notify();
+    }
+
+    fn paste(&mut self, item: ClipboardItem, _: &mut Window, _cx: &mut Context<Self>) {
+        if let Some(text) = item.text() {
+            self.send_paste(text);
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text.clear();
+        self.marked_selection = 0..0;
+        self.selection = None;
+        if !text.is_empty() {
+            self.send_input(text.as_bytes().to_vec());
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = new_text.to_owned();
+        let len = new_text.encode_utf16().count();
+        self.marked_selection = new_selected_range.unwrap_or(len..len);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.ime_cursor_bounds.or(Some(element_bounds))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.marked_selection.end)
+    }
+
+    fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        Some(self.marked_text.encode_utf16().count())
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        !self.meta.exited && self.create_error.is_none()
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
         let focus = self.focus_handle.clone();
-        let palette = palette(self.dark);
-        let mut root = div()
-            .size_full()
-            .bg(Hsla::from(rgb(palette.background)))
-            .track_focus(&focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if let Some(bytes) = encode_key(&event.keystroke) {
-                    this.input(bytes);
+        let colors = term_palette(self.dark);
+
+        let canvas_area = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .px(px(12.))
+            .py(px(8.))
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    this.context_menu_pos = None;
+                    let cell = this.point_to_cell(event.position);
+                    this.selection = Some((cell, cell));
+                    this.dragging_selection = true;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    let rel_x = (event.position.x - this.last_cell_origin.x).max(px(12.));
+                    let rel_y = (event.position.y - this.last_cell_origin.y).max(px(12.));
+                    this.context_menu_pos = Some(point(rel_x, rel_y));
+                    cx.notify();
                     cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.dragging_selection && event.pressed_button == Some(MouseButton::Left) {
+                    let cell = this.point_to_cell(event.position);
+                    if let Some((start, _)) = this.selection {
+                        this.selection = Some((start, cell));
+                        cx.notify();
+                    }
                 }
             }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    this.dragging_selection = false;
+                    if let Some((start, end)) = this.selection
+                        && start == end
+                    {
+                        this.selection = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(TerminalElement {
+                view: this.clone(),
+                snapshot: self.snapshot.clone(),
+                focus_handle: focus.clone(),
+                dark: self.dark,
+                selection: normalized_selection(self.selection),
+                marked_text: self.marked_text.clone(),
+            });
+
+        let mut root = div()
+            .id(SharedString::from(format!(
+                "terminal-pane-{}",
+                self.pane_id.as_deref().unwrap_or("pending")
+            )))
+            .test_support()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .bg(Hsla::from(rgb(colors.background)))
+            .track_focus(&focus)
+            .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, _cx| {
                 let dy = event.delta.pixel_delta(px(FONT_SIZE)).y;
                 if dy != px(0.) {
@@ -132,28 +599,363 @@ impl Render for TerminalView {
                     }
                 }
             }))
-            .child(TerminalElement { view: this });
-        if let Some(status) = &self.status {
+            .child(canvas_area);
+
+        // 0. 正在创建/刷新或创建失败时的内嵌提示（保障多分屏与独立终端窗口同样有反馈与重试按钮）
+        if let Some(err) = self.create_error.clone() {
+            let this_retry = this.clone();
             root = root.child(
-                div()
+                v_flex()
+                    .id("terminal-pane-error-overlay")
+                    .test_support()
                     .absolute()
-                    .bottom_2()
-                    .left_1_2()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().danger)
-                    .text_sm()
-                    .text_color(cx.theme().danger_foreground)
-                    .child(status.clone()),
+                    .inset_0()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .p(px(20.))
+                    .bg(Hsla::from(rgb(colors.background)))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(0xdc2626))
+                            .child("连接终端失败"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .text_size(px(12.))
+                            .text_color(rgb(0x71717a))
+                            .child(err),
+                    )
+                    .child(
+                        div()
+                            .id("terminal-pane-retry")
+                            .test_support()
+                            .rounded_xl()
+                            .border_1()
+                            .border_color(rgb(if self.dark { 0x3f3f46 } else { 0xe4e4e7 }))
+                            .bg(rgb(if self.dark { 0x18181b } else { 0xffffff }))
+                            .px(px(14.))
+                            .py(px(6.))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(colors.foreground))
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                let _ = this_retry.update(cx, |v, cx| v.reconnect_fresh(cx));
+                            })
+                            .child("重试"),
+                    ),
+            );
+        } else if self.connecting && self.snapshot.is_none() {
+            root = root.child(
+                v_flex()
+                    .id("terminal-pane-connecting-overlay")
+                    .test_support()
+                    .absolute()
+                    .inset_0()
+                    .items_center()
+                    .justify_center()
+                    .bg(Hsla::from(rgb(colors.background)))
+                    .text_size(px(12.))
+                    .text_color(rgb(0x71717a))
+                    .child("正在连接终端…"),
             );
         }
+
+        // 1. 连接断开提示条（`disconnected && !exited`）
+        if let Some((_, exhausted)) = self.disconnected
+            && !self.meta.exited
+        {
+            let this_reconn = this.clone();
+            let msg = if exhausted {
+                "终端连接已断开"
+            } else {
+                "连接中断，正在重连…"
+            };
+            root = root.child(
+                h_flex()
+                    .id("terminal-disconnected-bar")
+                    .test_support()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(rgb(0xfde68a))
+                    .bg(rgb(0xfffbeb))
+                    .text_size(px(12.))
+                    .text_color(rgb(0xb45309))
+                    .child(msg)
+                    .child(
+                        div()
+                            .id("terminal-manual-reconnect")
+                            .test_support()
+                            .rounded_md()
+                            .bg(rgb(0xd97706))
+                            .text_color(rgb(0xffffff))
+                            .px(px(8.))
+                            .py(px(2.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0xb45309)))
+                            .on_click(move |_, _, cx| {
+                                let _ = this_reconn
+                                    .update(cx, |view, cx| view.manual_reconnect(cx));
+                            })
+                            .child("立即重连"),
+                    ),
+            );
+        }
+
+        // 2. 会话已结束提示条（`exited`）
+        if self.meta.exited {
+            let this_fresh = this.clone();
+            root = root.child(
+                h_flex()
+                    .id("terminal-exited-bar")
+                    .test_support()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .px(px(12.))
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(rgb(0xe4e4e7))
+                    .bg(rgb(0xfafafa))
+                    .text_size(px(12.))
+                    .text_color(rgb(0x71717a))
+                    .child("终端会话已结束（远端断开或进程退出）")
+                    .child(
+                        div()
+                            .id("terminal-reconnect-fresh")
+                            .test_support()
+                            .rounded_md()
+                            .bg(rgb(0x18181b))
+                            .text_color(rgb(0xffffff))
+                            .px(px(10.))
+                            .py(px(3.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                let _ = this_fresh
+                                    .update(cx, |view, cx| view.reconnect_fresh(cx));
+                            })
+                            .child("重新连接"),
+                    ),
+            );
+        }
+
+        // 3. 终端右键菜单（复制 / 粘贴 / 清屏 / 重新连接）
+        if let Some(pos) = self.context_menu_pos {
+            let has_selection = self.selected_text().is_some();
+            root = root.child(render_context_menu(
+                pos,
+                self.dark,
+                has_selection,
+                this,
+                focus,
+            ));
+        }
+
         root
+    }
+}
+
+fn render_context_menu(
+    pos: Point<Pixels>,
+    dark: bool,
+    has_selection: bool,
+    this: Entity<TerminalView>,
+    focus: FocusHandle,
+) -> impl IntoElement {
+    let menu_bg = if dark { rgb(0x18181b) } else { rgb(0xffffff) };
+    let border_col = if dark { rgb(0x27272a) } else { rgb(0xe4e4e7) };
+    let hover_bg = if dark { rgb(0x27272a) } else { rgb(0xf4f4f5) };
+    let fg = if dark { rgb(0xf4f4f5) } else { rgb(0x18181b) };
+    let muted_fg = if dark { rgb(0x71717a) } else { rgb(0xa1a1aa) };
+
+    let copy_entity = this.clone();
+    let copy_focus = focus.clone();
+    let paste_entity = this.clone();
+    let paste_focus = focus.clone();
+    let clear_entity = this.clone();
+    let clear_focus = focus.clone();
+    let reconn_entity = this;
+    let reconn_focus = focus;
+
+    v_flex()
+        .id("terminal-context-menu")
+        .test_support()
+        .absolute()
+        .left(pos.x)
+        .top(pos.y)
+        .w(px(168.))
+        .p(px(4.))
+        .gap(px(2.))
+        .rounded_xl()
+        .border_1()
+        .border_color(border_col)
+        .bg(menu_bg)
+        .shadow_lg()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .child(
+            h_flex()
+                .id("terminal-ctx-copy")
+                .test_support()
+                .items_center()
+                .justify_between()
+                .px(px(10.))
+                .py(px(6.))
+                .rounded_lg()
+                .text_size(px(12.))
+                .text_color(if has_selection { fg } else { muted_fg })
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(move |_, window, cx| {
+                    window.focus(&copy_focus, cx);
+                    let _ = copy_entity.update(cx, |v, cx| {
+                        v.copy_selection(cx);
+                    });
+                    cx.stop_propagation();
+                })
+                .child("复制")
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(muted_fg)
+                        .child("Ctrl+C"),
+                ),
+        )
+        .child(
+            h_flex()
+                .id("terminal-ctx-paste")
+                .test_support()
+                .items_center()
+                .justify_between()
+                .px(px(10.))
+                .py(px(6.))
+                .rounded_lg()
+                .text_size(px(12.))
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(move |_, window, cx| {
+                    window.focus(&paste_focus, cx);
+                    let _ = paste_entity.update(cx, |v, cx| {
+                        v.paste_from_clipboard(cx);
+                    });
+                    cx.stop_propagation();
+                })
+                .child("粘贴")
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(muted_fg)
+                        .child("Ctrl+V"),
+                ),
+        )
+        .child(
+            h_flex()
+                .id("terminal-ctx-clear")
+                .test_support()
+                .items_center()
+                .justify_between()
+                .px(px(10.))
+                .py(px(6.))
+                .rounded_lg()
+                .text_size(px(12.))
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(move |_, window, cx| {
+                    window.focus(&clear_focus, cx);
+                    let _ = clear_entity.update(cx, |v, cx| {
+                        v.clear_screen(cx);
+                    });
+                    cx.stop_propagation();
+                })
+                .child("清屏"),
+        )
+        .child(div().h(px(1.)).my(px(2.)).bg(border_col))
+        .child(
+            h_flex()
+                .id("terminal-ctx-reconnect")
+                .test_support()
+                .items_center()
+                .justify_between()
+                .px(px(10.))
+                .py(px(6.))
+                .rounded_lg()
+                .text_size(px(12.))
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(move |_, window, cx| {
+                    window.focus(&reconn_focus, cx);
+                    let _ = reconn_entity.update(cx, |v, cx| {
+                        v.reconnect_fresh(cx);
+                    });
+                    cx.stop_propagation();
+                })
+                .child("刷新 / 重新连接"),
+        )
+}
+
+fn normalized_selection(
+    sel: Option<((usize, usize), (usize, usize))>,
+) -> Option<((usize, usize), (usize, usize))> {
+    let (a, b) = sel?;
+    if a == b {
+        return None;
+    }
+    if a <= b {
+        Some((a, b))
+    } else {
+        Some((b, a))
+    }
+}
+
+fn is_cell_selected(
+    sel: Option<((usize, usize), (usize, usize))>,
+    row: usize,
+    col: usize,
+) -> bool {
+    let Some(((r0, c0), (r1, c1))) = sel else {
+        return false;
+    };
+    if row < r0 || row > r1 {
+        return false;
+    }
+    if r0 == r1 {
+        col >= c0 && col <= c1
+    } else if row == r0 {
+        col >= c0
+    } else if row == r1 {
+        col <= c1
+    } else {
+        true
     }
 }
 
 struct TerminalElement {
     view: Entity<TerminalView>,
+    snapshot: Option<Snapshot>,
+    focus_handle: FocusHandle,
+    dark: bool,
+    selection: Option<((usize, usize), (usize, usize))>,
+    marked_text: String,
 }
 
 impl IntoElement for TerminalElement {
@@ -168,8 +970,12 @@ struct TerminalPaintState {
     segments: Vec<Segment>,
     backgrounds: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    preedit_line: Option<(Point<Pixels>, ShapedLine, PaintQuad)>,
+    ime_cursor_bounds: Option<Bounds<Pixels>>,
     cell_width: Pixels,
     line_height: Pixels,
+    computed_cols: u16,
+    computed_rows: u16,
 }
 
 struct Segment {
@@ -228,53 +1034,67 @@ impl Element for TerminalElement {
             .width()
             .max(px(1.));
         let line_height = window.pixel_snap(font_size * LINE_HEIGHT).max(px(1.));
-        let cols = ((bounds.size.width / cell_width).floor() as usize).max(1);
+        let cols = ((bounds.size.width / cell_width).floor() as usize).max(2);
         let rows = ((bounds.size.height / line_height).floor() as usize).max(1);
 
-        let snapshot = self.view.read(cx).snapshot.clone();
         let mut state = TerminalPaintState {
             segments: Vec::new(),
             backgrounds: Vec::new(),
             cursor: None,
+            preedit_line: None,
+            ime_cursor_bounds: None,
             cell_width,
             line_height,
+            computed_cols: cols.min(u16::MAX as usize) as u16,
+            computed_rows: rows.min(u16::MAX as usize) as u16,
         };
-        let Some(snapshot) = snapshot else {
+
+        let Some(snapshot) = &self.snapshot else {
             return state;
         };
 
-        // 尺寸变化同步给后端 PTY。
-        let clamped_cols = cols.min(u16::MAX as usize) as u16;
-        let clamped_rows = rows.min(u16::MAX as usize) as u16;
-        if clamped_cols != snapshot.cols as u16 || clamped_rows != snapshot.rows as u16 {
-            self.view
-                .update(cx, |view, _| view.request_size(clamped_cols, clamped_rows));
-        }
-
-        let colors = palette(self.view.read(cx).dark);
+        let colors = term_palette(self.dark);
         let default_fg: Hsla = Hsla::from(rgb(colors.foreground));
         let default_bg: Hsla = Hsla::from(rgb(colors.background));
+        let selection_bg: Hsla = if self.dark {
+            Hsla::from(rgb(0xffffff)).opacity(0.18)
+        } else {
+            Hsla::from(rgb(0x18181b)).opacity(0.14)
+        };
         let palette: [Hsla; 16] = colors.ansi.map(|hex| Hsla::from(rgb(hex)));
 
         let rows_to_draw = rows.min(snapshot.rows);
         let cols_to_draw = cols.min(snapshot.cols);
+
         for row in 0..rows_to_draw {
             let y = bounds.top() + line_height * row as f32;
             let mut col = 0;
-            // 背景：连续的非默认背景区间合并成矩形。
+
+            // 1. 背景色区间合并（含 INVERSE 反显与鼠标选区高亮）
             while col < cols_to_draw {
                 let cell = &snapshot.cells[row * snapshot.cols + col];
-                if is_default_bg(cell.bg) {
+                let selected = is_cell_selected(self.selection, row, col);
+                let cell_bg = effective_bg(cell, default_fg, default_bg, &palette);
+                let paint_bg = if selected {
+                    Some(selection_bg)
+                } else {
+                    cell_bg
+                };
+                let Some(color) = paint_bg else {
                     col += 1;
                     continue;
-                }
-                let color = resolve_color(cell.bg, default_fg, default_bg, &palette);
+                };
                 let start = col;
+                col += 1;
                 while col < cols_to_draw {
                     let next = &snapshot.cells[row * snapshot.cols + col];
-                    if is_default_bg(next.bg)
-                        || resolve_color(next.bg, default_fg, default_bg, &palette) != color
-                    {
+                    let next_sel = is_cell_selected(self.selection, row, col);
+                    let next_bg = if next_sel {
+                        Some(selection_bg)
+                    } else {
+                        effective_bg(next, default_fg, default_bg, &palette)
+                    };
+                    if next_bg != Some(color) {
                         break;
                     }
                     col += 1;
@@ -286,30 +1106,46 @@ impl Element for TerminalElement {
                 state.backgrounds.push(fill(rect, color));
             }
 
-            // 文本：按段塑形。
+            // 2. 文本按段塑形
             col = 0;
             while col < cols_to_draw {
                 let cell = &snapshot.cells[row * snapshot.cols + col];
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.c == ' ' {
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || (cell.c == ' ' && !cell.flags.contains(Flags::UNDERLINE))
+                {
                     col += 1;
                     continue;
                 }
                 let wide = cell.flags.contains(Flags::WIDE_CHAR);
                 let start_col = col;
                 if wide {
-                    // 双宽字符单独塑形，按列定位；不经过 force_width 网格。
                     let text = cell.c.to_string();
+                    let fg = effective_fg(cell, default_fg, default_bg, &palette);
                     let run = TextRun {
                         len: text.len(),
                         font: styled_font(&mono, cell.flags),
-                        color: resolve_color(cell.fg, default_fg, default_bg, &palette),
+                        color: fg,
                         background_color: None,
-                        underline: None,
-                        strikethrough: None,
+                        underline: cell.flags.contains(Flags::UNDERLINE).then_some(
+                            UnderlineStyle {
+                                thickness: px(1.),
+                                color: Some(fg),
+                                wavy: false,
+                            },
+                        ),
+                        strikethrough: cell.flags.contains(Flags::STRIKEOUT).then_some(
+                            StrikethroughStyle {
+                                thickness: px(1.),
+                                color: Some(fg),
+                            },
+                        ),
                     };
-                    let line = window
-                        .text_system()
-                        .shape_line(SharedString::from(text), font_size, &[run], None);
+                    let line = window.text_system().shape_line(
+                        SharedString::from(text),
+                        font_size,
+                        &[run],
+                        None,
+                    );
                     state.segments.push(Segment {
                         origin: point(bounds.left() + cell_width * start_col as f32, y),
                         line,
@@ -317,8 +1153,8 @@ impl Element for TerminalElement {
                     col += 1;
                     continue;
                 }
-                // 连续单宽字符段（同前景色）合并为一次塑形。
-                let fg = resolve_color(cell.fg, default_fg, default_bg, &palette);
+
+                // 连续单宽字符合并为一次 shape_line（带 force_width = Some(cell_width)）
                 let mut text = String::new();
                 let mut runs: Vec<TextRun> = Vec::new();
                 while col < cols_to_draw {
@@ -328,28 +1164,44 @@ impl Element for TerminalElement {
                     {
                         break;
                     }
-                    let next_fg = resolve_color(next.fg, default_fg, default_bg, &palette);
-                    if next_fg != fg && !text.is_empty() {
-                        break;
-                    }
-                    let ch = next.c;
+                    let ch = if next.c.is_control() { ' ' } else { next.c };
                     let len = ch.len_utf8();
+                    let fg = effective_fg(next, default_fg, default_bg, &palette);
+                    let fnt = styled_font(&mono, next.flags);
+                    let ul = next.flags.contains(Flags::UNDERLINE).then_some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(fg),
+                        wavy: false,
+                    });
+                    let st = next
+                        .flags
+                        .contains(Flags::STRIKEOUT)
+                        .then_some(StrikethroughStyle {
+                            thickness: px(1.),
+                            color: Some(fg),
+                        });
                     text.push(ch);
                     match runs.last_mut() {
-                        Some(run) => run.len += len,
-                        None => runs.push(TextRun {
+                        Some(last)
+                            if last.font == fnt
+                                && last.color == fg
+                                && last.underline == ul
+                                && last.strikethrough == st =>
+                        {
+                            last.len += len;
+                        }
+                        _ => runs.push(TextRun {
                             len,
-                            font: mono.clone(),
+                            font: fnt,
                             color: fg,
                             background_color: None,
-                            underline: None,
-                            strikethrough: None,
+                            underline: ul,
+                            strikethrough: st,
                         }),
                     }
                     col += 1;
                 }
-                if text.trim().is_empty() {
-                    // 纯空白不塑形，只推进列（背景已经画过）。
+                if text.trim().is_empty() && runs.iter().all(|r| r.underline.is_none()) {
                     continue;
                 }
                 let line = window.text_system().shape_line(
@@ -365,26 +1217,63 @@ impl Element for TerminalElement {
             }
         }
 
-        // 光标：实心块。
-        if let Some((row, col)) = snapshot.cursor.filter(|(row, _)| *row < rows_to_draw) {
-            let rect = Bounds {
-                origin: point(
-                    bounds.left() + cell_width * col as f32,
-                    bounds.top() + line_height * row as f32,
-                ),
+        // 3. 光标与中文 IME 预编辑串
+        if let Some((row, col)) = snapshot.cursor.filter(|(r, _)| *r < rows_to_draw) {
+            let cursor_origin = point(
+                bounds.left() + cell_width * col as f32,
+                bounds.top() + line_height * row as f32,
+            );
+            let cursor_rect = Bounds {
+                origin: cursor_origin,
                 size: size(cell_width, line_height),
             };
-            let color = match snapshot.cursor_shape {
-                CursorShape::Hidden => {
-                    state.cursor = None;
-                    return state;
-                }
-                CursorShape::Block | CursorShape::HollowBlock | CursorShape::Beam => {
-                    Hsla::from(rgb(colors.cursor)).opacity(0.7)
-                }
-                CursorShape::Underline => Hsla::from(rgb(colors.cursor)).opacity(0.5),
-            };
-            state.cursor = Some(fill(rect, color));
+            state.ime_cursor_bounds = Some(cursor_rect);
+
+            if !self.marked_text.is_empty() {
+                let run = TextRun {
+                    len: self.marked_text.len(),
+                    font: mono,
+                    color: default_fg,
+                    background_color: None,
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.5),
+                        color: Some(Hsla::from(rgb(0xf97316))),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(
+                    SharedString::from(self.marked_text.clone()),
+                    font_size,
+                    &[run],
+                    None,
+                );
+                let bg_rect = Bounds {
+                    origin: cursor_origin,
+                    size: size(shaped.width().max(cell_width), line_height),
+                };
+                state.preedit_line = Some((cursor_origin, shaped, fill(bg_rect, default_bg)));
+            } else if snapshot.cursor_shape != CursorShape::Hidden {
+                let cursor_color = Hsla::from(rgb(colors.cursor)).opacity(
+                    if self.focus_handle.is_focused(window) {
+                        0.72
+                    } else {
+                        0.28
+                    },
+                );
+                let shape_rect = match snapshot.cursor_shape {
+                    CursorShape::Beam => Bounds {
+                        origin: cursor_origin,
+                        size: size(px(2.), line_height),
+                    },
+                    CursorShape::Underline => Bounds {
+                        origin: point(cursor_origin.x, cursor_origin.y + line_height - px(2.)),
+                        size: size(cell_width, px(2.)),
+                    },
+                    _ => cursor_rect,
+                };
+                state.cursor = Some(fill(shape_rect, cursor_color));
+            }
         }
 
         state
@@ -400,6 +1289,23 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // 挂载 IME 输入处理器
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            cx,
+        );
+
+        // 在 paint 阶段安全同步终端网格尺寸与光标位置（不在 prepaint 重入）
+        let cols = state.computed_cols;
+        let rows = state.computed_rows;
+        let cell_origin = bounds.origin;
+        let cell_size = size(state.cell_width, state.line_height);
+        let ime_bounds = state.ime_cursor_bounds;
+        self.view.update(cx, |view, _| {
+            view.sync_viewport(cols, rows, cell_origin, cell_size, ime_bounds);
+        });
+
         let mask = ContentMask { bounds };
         window.with_content_mask(Some(mask), |window| {
             for quad in state.backgrounds.drain(..) {
@@ -410,7 +1316,18 @@ impl Element for TerminalElement {
                     segment.origin,
                     state.line_height,
                     TextAlign::Left,
-                    Some(state.cell_width * 4.),
+                    Some(bounds.size.width),
+                    window,
+                    cx,
+                );
+            }
+            if let Some((origin, line, bg_quad)) = state.preedit_line.take() {
+                window.paint_quad(bg_quad);
+                let _ = line.paint(
+                    origin,
+                    state.line_height,
+                    TextAlign::Left,
+                    Some(bounds.size.width),
                     window,
                     cx,
                 );
@@ -422,42 +1339,68 @@ impl Element for TerminalElement {
     }
 }
 
-/// 终端配色，与旧前端 `TerminalPaneView.vue` 的 LIGHT_THEME / DARK_THEME 对齐。
-struct Palette {
+struct TermPalette {
     background: u32,
     foreground: u32,
     cursor: u32,
     ansi: [u32; 16],
 }
 
-fn palette(dark: bool) -> Palette {
+fn term_palette(dark: bool) -> TermPalette {
     if dark {
-        Palette {
+        TermPalette {
             background: 0x0c0d10,
             foreground: 0xe4e4e7,
             cursor: 0xf4f4f5,
             ansi: [
-                0x27272a, 0xf87171, 0x4ade80, 0xfacc15, 0x60a5fa, 0xc084fc, 0x22d3ee,
-                0xe4e4e7, 0x71717a, 0xfca5a5, 0x86efac, 0xfde047, 0x93c5fd, 0xd8b4fe,
-                0x67e8f9, 0xffffff,
+                0x27272a, 0xf87171, 0x4ade80, 0xfacc15, 0x60a5fa, 0xc084fc, 0x22d3ee, 0xe4e4e7,
+                0x71717a, 0xfca5a5, 0x86efac, 0xfde047, 0x93c5fd, 0xd8b4fe, 0x67e8f9, 0xffffff,
             ],
         }
     } else {
-        Palette {
+        TermPalette {
             background: 0xffffff,
             foreground: 0x18181b,
             cursor: 0x18181b,
             ansi: [
-                0x18181b, 0xdc2626, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2,
-                0xe4e4e7, 0x71717a, 0xef4444, 0x22c55e, 0xeab308, 0x3b82f6, 0xa855f7,
-                0x06b6d4, 0xfafafa,
+                0x18181b, 0xdc2626, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2, 0xe4e4e7,
+                0x71717a, 0xef4444, 0x22c55e, 0xeab308, 0x3b82f6, 0xa855f7, 0x06b6d4, 0xfafafa,
             ],
         }
     }
 }
 
-fn is_default_bg(color: Color) -> bool {
-    matches!(color, Color::Named(NamedColor::Background))
+fn effective_bg(
+    cell: &super::session::CellSnapshot,
+    default_fg: Hsla,
+    default_bg: Hsla,
+    palette: &[Hsla; 16],
+) -> Option<Hsla> {
+    if cell.flags.contains(Flags::INVERSE) {
+        Some(resolve_color(cell.fg, default_fg, default_bg, palette))
+    } else if matches!(cell.bg, Color::Named(NamedColor::Background)) {
+        None
+    } else {
+        Some(resolve_color(cell.bg, default_fg, default_bg, palette))
+    }
+}
+
+fn effective_fg(
+    cell: &super::session::CellSnapshot,
+    default_fg: Hsla,
+    default_bg: Hsla,
+    palette: &[Hsla; 16],
+) -> Hsla {
+    let base = if cell.flags.contains(Flags::INVERSE) {
+        resolve_color(cell.bg, default_fg, default_bg, palette)
+    } else {
+        resolve_color(cell.fg, default_fg, default_bg, palette)
+    };
+    if cell.flags.contains(Flags::DIM) {
+        base.opacity(0.66)
+    } else {
+        base
+    }
 }
 
 fn resolve_color(color: Color, default_fg: Hsla, default_bg: Hsla, palette: &[Hsla; 16]) -> Hsla {
@@ -471,8 +1414,30 @@ fn resolve_color(color: Color, default_fg: Hsla, default_bg: Hsla, palette: &[Hs
                 .map(|index| palette[index])
                 .unwrap_or(default_fg),
         },
-        Color::Indexed(index) => palette[index as usize % palette.len()],
-        Color::Spec(rgb_color) => Hsla::from(rgb(u32::from(rgb_color.r) << 16 | u32::from(rgb_color.g) << 8 | u32::from(rgb_color.b))),
+        Color::Indexed(index) => match index {
+            0..=15 => palette[index as usize],
+            16..=231 => {
+                // 6x6x6 RGB 立方体
+                let idx = index - 16;
+                let r_idx = (idx / 36) % 6;
+                let g_idx = (idx / 6) % 6;
+                let b_idx = idx % 6;
+                const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255];
+                let hex =
+                    (LEVELS[r_idx as usize] << 16) | (LEVELS[g_idx as usize] << 8) | LEVELS[b_idx as usize];
+                Hsla::from(rgb(hex))
+            }
+            232..=255 => {
+                // 24 级灰度
+                let v = u32::from(8 + (index - 232) * 10);
+                Hsla::from(rgb((v << 16) | (v << 8) | v))
+            }
+        },
+        Color::Spec(rgb_color) => Hsla::from(rgb(
+            (u32::from(rgb_color.r) << 16)
+                | (u32::from(rgb_color.g) << 8)
+                | u32::from(rgb_color.b),
+        )),
     }
 }
 
@@ -510,16 +1475,21 @@ fn styled_font(font: &Font, flags: Flags) -> Font {
     font
 }
 
-/// 把一次按键编码成终端字节。M2 第一版覆盖 ASCII 与控制键；
-/// IME / 中文输入走 InputHandler 路径（后续里程碑）。
-fn encode_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
+/// 只编码特殊控制键与 Ctrl/Alt 组合键；普通字符与 IME 交给 `EntityInputHandler`。
+fn encode_special_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
     let key = keystroke.key.as_str();
     let ctrl = keystroke.modifiers.control;
     let alt = keystroke.modifiers.alt;
     let sequence: Vec<u8> = match key {
         "enter" => b"\r".to_vec(),
         "backspace" => b"\x7f".to_vec(),
-        "tab" => b"\t".to_vec(),
+        "tab" => {
+            if keystroke.modifiers.shift {
+                b"\x1b[Z".to_vec()
+            } else {
+                b"\t".to_vec()
+            }
+        }
         "escape" => b"\x1b".to_vec(),
         "up" => b"\x1b[A".to_vec(),
         "down" => b"\x1b[B".to_vec(),
@@ -527,9 +1497,22 @@ fn encode_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
         "left" => b"\x1b[D".to_vec(),
         "home" => b"\x1b[H".to_vec(),
         "end" => b"\x1b[F".to_vec(),
+        "insert" => b"\x1b[2~".to_vec(),
         "delete" => b"\x1b[3~".to_vec(),
         "pageup" => b"\x1b[5~".to_vec(),
         "pagedown" => b"\x1b[6~".to_vec(),
+        "f1" => b"\x1bOP".to_vec(),
+        "f2" => b"\x1bOQ".to_vec(),
+        "f3" => b"\x1bOR".to_vec(),
+        "f4" => b"\x1bOS".to_vec(),
+        "f5" => b"\x1b[15~".to_vec(),
+        "f6" => b"\x1b[17~".to_vec(),
+        "f7" => b"\x1b[18~".to_vec(),
+        "f8" => b"\x1b[19~".to_vec(),
+        "f9" => b"\x1b[20~".to_vec(),
+        "f10" => b"\x1b[21~".to_vec(),
+        "f11" => b"\x1b[23~".to_vec(),
+        "f12" => b"\x1b[24~".to_vec(),
         "space" if ctrl => vec![0x00],
         _ => {
             if ctrl {
@@ -542,12 +1525,21 @@ fn encode_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
                     vec![0x1c]
                 } else if key == "]" {
                     vec![0x1d]
+                } else if key == "/" || key == "_" {
+                    vec![0x1f]
+                } else {
+                    return None;
+                }
+            } else if alt {
+                let text = keystroke.key_char.clone().unwrap_or_else(|| key.to_owned());
+                if text.chars().count() == 1 {
+                    text.into_bytes()
                 } else {
                     return None;
                 }
             } else {
-                let text = keystroke.key_char.clone()?;
-                text.into_bytes()
+                // 普通可打印字符返回 None，交给 EntityInputHandler::replace_text_in_range
+                return None;
             }
         }
     };
@@ -557,5 +1549,34 @@ fn encode_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
         Some(bytes)
     } else {
         Some(sequence)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::vte::ansi::Color;
+    use gpui_kit::{Hsla, rgb};
+
+    use super::{resolve_color, term_palette};
+
+    #[test]
+    fn resolves_256_color_cube_and_grayscale_distinct_from_base_16() {
+        let p = term_palette(false);
+        let default_fg = Hsla::from(rgb(p.foreground));
+        let default_bg = Hsla::from(rgb(p.background));
+        let ansi = p.ansi.map(|hex| Hsla::from(rgb(hex)));
+
+        let idx_196 = resolve_color(Color::Indexed(196), default_fg, default_bg, &ansi);
+        let idx_4 = resolve_color(Color::Indexed(4), default_fg, default_bg, &ansi);
+        assert_ne!(
+            idx_196, idx_4,
+            "Indexed(196) 必须是 6x6x6 红色立方体，不能模 16 变成蓝色 Indexed(4)"
+        );
+
+        let gray_240 = resolve_color(Color::Indexed(240), default_fg, default_bg, &ansi);
+        assert!(
+            (gray_240.s).abs() < 0.01,
+            "Indexed(240) 必须是无饱和度的灰度色"
+        );
     }
 }

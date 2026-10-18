@@ -77,6 +77,15 @@
                             KeyPath='yes'/>
                     </Component>
 
+                    <Component Id='gpui_binary' Guid='A74E9C18-2D5B-48F3-B6E1-9C3D8F1E2A70'>
+                        <File
+                            Id='gpui_exe'
+                            Name='vps-switch-gpui.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\vps-switch-gpui.exe'
+                            KeyPath='yes'/>
+                    </Component>
+
                     <!-- 随包的 Windows Terminal ConPTY：必须与 exe 同目录才会被加载 -->
                     <Component Id='conpty' Guid='7F3A2D58-6B14-4E93-9C05-2A8D4E1B7F60'>
                         <File
@@ -105,7 +114,7 @@
                         <Shortcut Id='ApplicationStartMenuShortcut'
                             Name='VPS Switch'
                             Description='Lightweight VPS manager and MCP server'
-                            Target='[!exe0]'
+                            Target='[!gpui_exe]'
                             WorkingDirectory='APPLICATIONFOLDER'
                             Icon='ProductICO'/>
                         <RemoveFolder Id='ApplicationProgramsFolder' On='uninstall'/>
@@ -126,6 +135,7 @@
             Absent='disallow'>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='gpui_binary'/>
             <ComponentRef Id='conpty'/>
             <ComponentRef Id='openconsole'/>
             <ComponentRef Id='ApplicationShortcut'/>

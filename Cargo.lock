@@ -9751,11 +9751,14 @@ dependencies = [
  "gpui-base",
  "gpui-component",
  "gpui-kit",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tray-icon",
+ "winres",
 ]
 
 [[package]]

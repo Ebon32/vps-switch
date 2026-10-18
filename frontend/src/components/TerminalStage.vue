@@ -116,6 +116,30 @@ const activePane = computed(() => {
           </button>
         </div>
 
+        <!-- 刷新 / 原地重连当前终端分屏 -->
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 rounded-xl border border-zinc-200/80 bg-white px-2.5 py-1 text-xs font-medium text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+          :disabled="creating"
+          title="刷新当前终端会话（关闭旧会话并重新连接）"
+          @click="activePane ? emit('reconnectPane', activePane.id) : emit('retry')"
+        >
+          <svg
+            class="h-3.5 w-3.5"
+            :class="creating ? 'animate-spin' : ''"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+            <path d="M16 16h5v5" />
+          </svg>
+          <span>刷新</span>
+        </button>
+
         <!-- 白底 / 黑底一键切换 -->
         <button
           type="button"

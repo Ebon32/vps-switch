@@ -1229,7 +1229,12 @@ fn set_autostart_enabled(enabled: bool) -> anyhow::Result<()> {
     {
         if enabled {
             let exe = std::env::current_exe()?;
-            let exe_str = exe.to_string_lossy();
+            let target_exe = exe
+                .parent()
+                .map(|dir| dir.join("vps-switch-gpui.exe"))
+                .filter(|p| p.is_file())
+                .unwrap_or(exe);
+            let exe_str = target_exe.to_string_lossy();
             let cmd_val = format!("\"{}\" --minimized", exe_str);
             let status = std::process::Command::new("reg")
                 .args([
