@@ -65,8 +65,8 @@ VPS Switch 是一个本地优先的主机管理工具。它集成了终端、文
 
 ```bash
 # 解压
-tar -xzf vps-switch-*-linux-x86_64.tar.gz
-cd vps-switch-*-linux-x86_64
+tar -xzf vps-switch-0.1.0-linux-x86_64.tar.gz
+cd vps-switch-0.1.0-linux-x86_64
 
 # 快速运行（默认监听 18800 端口，浏览器访问 http://<你的IP>:18800）
 ./vps-switch
@@ -80,6 +80,12 @@ sudo systemctl enable --now vps-switch
 ```
 
 *Linux 首启默认开启 Web 登录密码，默认初始凭据为：`admin` / `vps-switch`（登录后可在设置面板修改）。*
+
+### macOS（arm64 / x86_64）
+- **`vps-switch-0.1.0-macos-aarch64.zip`**：Apple Silicon（M 系列芯片）原生包。
+- **`vps-switch-0.1.0-macos-x86_64.zip`**：Intel 芯片原生包。
+
+解压得到 `VPS Switch.app`，拖入「应用程序」后即可运行（首次打开若提示未签名，请在「系统设置 → 隐私与安全性」中点击「仍要打开」，或执行 `xattr -dr com.apple.quarantine "VPS Switch.app"`）。
 
 ---
 
