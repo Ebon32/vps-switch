@@ -183,3 +183,6 @@ cargo build --release -p vps-switch -p vps-switch-gpui
 ```
 
 Linux 无头服务只需编译 `vps-switch` 包（`cargo build --release -p vps-switch`），Web 控制台已内嵌进单一二进制。
+
+##友链：
+http://linux.do
