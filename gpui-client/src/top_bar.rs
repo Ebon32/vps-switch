@@ -473,6 +473,10 @@ pub fn render_filter_overlay(
     let mut panel = v_flex()
         .id("filter-dropdown-panel")
         .test_support()
+        .occlude()
+        .on_scroll_wheel(|_, _, cx| {
+            cx.stop_propagation();
+        })
         .absolute()
         .top(px(48.))
         .right(px(196.))
@@ -697,6 +701,9 @@ pub fn render_filter_overlay(
                         .id("filter-tags-scroll")
                         .max_h(px(128.))
                         .overflow_y_scroll()
+                        .on_scroll_wheel(|_, _, cx| {
+                            cx.stop_propagation();
+                        })
                         .child(tag_chips),
                 ),
         );

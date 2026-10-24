@@ -48,6 +48,7 @@ pub struct HostRecord {
     pub pinned: bool,
     pub favorited: bool,
     pub archived: bool,
+    pub mcp_exposed: bool,
     pub sort_order: i64,
     pub status: String, // "online" | "offline" | "unknown"
     pub latency_ms: Option<i64>,
@@ -79,6 +80,7 @@ pub struct PublicHost {
     pub pinned: bool,
     pub favorited: bool,
     pub archived: bool,
+    pub mcp_exposed: bool,
     pub sort_order: i64,
     pub status: String,
     pub latency_ms: Option<i64>,
@@ -115,6 +117,8 @@ pub struct HostUpsertPayload {
     pub favorited: bool,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default = "default_mcp_exposed")]
+    pub mcp_exposed: bool,
 }
 
 fn default_port() -> u16 {
@@ -126,6 +130,9 @@ fn default_username() -> String {
 fn default_auth_type() -> String {
     "password".to_string()
 }
+fn default_mcp_exposed() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,9 +140,17 @@ pub struct HostMetaPatch {
     pub pinned: Option<bool>,
     pub favorited: Option<bool>,
     pub archived: Option<bool>,
+    pub mcp_exposed: Option<bool>,
     pub role: Option<String>,
     pub tags: Option<Vec<String>>,
     pub links: Option<Vec<HostLink>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchMcpExposePayload {
+    pub exposed: bool,
+    pub host_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

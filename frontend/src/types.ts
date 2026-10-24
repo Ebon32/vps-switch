@@ -39,6 +39,7 @@ export interface PublicHost {
   pinned: boolean;
   favorited?: boolean;
   archived: boolean;
+  mcpExposed?: boolean;
   sortOrder: number;
   status: 'online' | 'offline' | 'unknown';
   latencyMs?: number | null;
@@ -63,6 +64,7 @@ export interface HostUpsertPayload {
   links: HostLink[];
   pinned: boolean;
   archived: boolean;
+  mcpExposed?: boolean;
 }
 
 export const ROLE_META: Record<HostRole, { label: string }> = {

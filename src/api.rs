@@ -3,7 +3,9 @@ use crate::{
     files::{self, join_remote_path, TransferManager},
     inspector::InspectorEngine,
     mcp::{handle_mcp_request, sync_cli_mcp_configs, ExecTaskManager, JsonRpcRequest},
-    models::{HostMetaPatch, HostUpsertPayload, ReorderPayload, LOCAL_HOST_ID},
+    models::{
+        BatchMcpExposePayload, HostMetaPatch, HostUpsertPayload, ReorderPayload, LOCAL_HOST_ID,
+    },
     ssh::SshPool,
     terminal::{PaneBroadcast, PaneCommand, PaneHandle, TerminalManager},
 };
@@ -74,6 +76,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/api/events", get(api_sse_events))
         .route("/api/hosts", get(list_hosts).post(create_host))
         .route("/api/hosts/reorder", put(reorder_hosts))
+        .route("/api/hosts/mcp-expose", put(batch_set_mcp_expose))
         .route("/api/hosts/import-1shell", post(import_from_1shell))
         .route("/api/hosts/check-all", post(check_all_hosts))
         .route("/api/hosts/:id", put(update_host).delete(delete_host))
@@ -220,14 +223,18 @@ async fn patch_host_meta(
     Json(patch): Json<HostMetaPatch>,
 ) -> impl IntoResponse {
     match state.db.patch_meta(&id, patch) {
-        Ok(host) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "host": host,
-            })),
-        )
-            .into_response(),
+        Ok(host) => {
+            let hosts = state.db.list_public_hosts().unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "host": host,
+                    "hosts": hosts,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => err_response(StatusCode::BAD_REQUEST, e).into_response(),
     }
 }
@@ -237,6 +244,29 @@ async fn reorder_hosts(
     Json(payload): Json<ReorderPayload>,
 ) -> impl IntoResponse {
     match state.db.reorder(&payload.ordered_ids) {
+        Ok(()) => match state.db.list_public_hosts() {
+            Ok(hosts) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "hosts": hosts,
+                })),
+            )
+                .into_response(),
+            Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
+        Err(e) => err_response(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn batch_set_mcp_expose(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchMcpExposePayload>,
+) -> impl IntoResponse {
+    match state
+        .db
+        .set_mcp_exposed_batch(payload.exposed, payload.host_ids.as_deref())
+    {
         Ok(()) => match state.db.list_public_hosts() {
             Ok(hosts) => (
                 StatusCode::OK,
@@ -1534,20 +1564,23 @@ async fn api_update_auth_settings(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateMcpSettingsPayload {
-    mcp_enabled: bool,
-    mcp_require_api_key: bool,
+    mcp_enabled: Option<bool>,
+    mcp_require_api_key: Option<bool>,
     #[serde(default)]
     regenerate_key: bool,
+    mcp_enabled_tools: Option<Vec<String>>,
 }
 
 async fn api_update_mcp_settings(
     State(state): State<Arc<AppState>>,
     Json(p): Json<UpdateMcpSettingsPayload>,
 ) -> impl IntoResponse {
-    match state
-        .db
-        .update_mcp_settings(p.mcp_enabled, p.mcp_require_api_key, p.regenerate_key)
-    {
+    match state.db.update_mcp_settings(
+        p.mcp_enabled,
+        p.mcp_require_api_key,
+        p.regenerate_key,
+        p.mcp_enabled_tools.as_deref(),
+    ) {
         Ok(settings) => (
             StatusCode::OK,
             Json(json!({

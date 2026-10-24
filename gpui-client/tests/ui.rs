@@ -6,8 +6,8 @@ use std::rc::Rc;
 use gpui_kit::component::Root;
 use gpui_kit::{
     App, AppContext as _, ElementId, Entity, InputEvent as _, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, TestAppContext, Window,
-    WindowHandle, px, size,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
+    TestAppContext, TouchPhase, Window, WindowHandle, point, px, size,
 };
 
 use vps_switch_gpui::api::{Api, Host, HostLink};
@@ -56,6 +56,13 @@ fn make_host(
         pinned: false,
         favorited,
         archived: false,
+        mcp_exposed: true,
+        sort_order: match id {
+            "local" => 0,
+            "vip-hk" => 1,
+            "us-node" => 2,
+            _ => 10,
+        },
         role: role.map(str::to_owned),
         tags: vec!["hk".into(), "bgp".into()],
         links: vec![HostLink {
@@ -171,7 +178,7 @@ fn open_workspace(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Worksp
 
 #[gpui_kit::test]
 fn renders_host_cards_and_official_os_badges(cx: &mut TestAppContext) {
-    let (handle, _) = open_workspace(cx);
+    let (handle, ws) = open_workspace(cx);
     cx.update_window(handle.into(), |_, window, cx| {
         render_frame(window, cx);
         assert!(has_element(window, "host-card-local"));
@@ -180,6 +187,27 @@ fn renders_host_cards_and_official_os_badges(cx: &mut TestAppContext) {
         assert!(has_element(window, "os-badge-local"));
         assert!(has_element(window, "os-badge-vip-hk"));
         assert!(has_element(window, "os-badge-us-node"));
+
+        // 初始顺序：local -> vip-hk -> us-node
+        let y_local = element_bounds(window, "host-card-local").origin.y;
+        let y_vip = element_bounds(window, "host-card-vip-hk").origin.y;
+        let y_us = element_bounds(window, "host-card-us-node").origin.y;
+        assert!(y_local < y_vip && y_vip < y_us);
+
+        // 点击 us-node 置顶按钮：立即移到 vip-hk 之上（紧随 local 之后）
+        click_element(window, "pin-us-node", 1, cx);
+        assert!(ws.read(cx).host_by_id("us-node").unwrap().pinned);
+        let y_local_after = element_bounds(window, "host-card-local").origin.y;
+        let y_us_after = element_bounds(window, "host-card-us-node").origin.y;
+        let y_vip_after = element_bounds(window, "host-card-vip-hk").origin.y;
+        assert!(y_local_after < y_us_after && y_us_after < y_vip_after);
+
+        // 再次点击取消置顶：恢复到 vip-hk 之下
+        click_element(window, "pin-us-node", 1, cx);
+        assert!(!ws.read(cx).host_by_id("us-node").unwrap().pinned);
+        let y_vip_restored = element_bounds(window, "host-card-vip-hk").origin.y;
+        let y_us_restored = element_bounds(window, "host-card-us-node").origin.y;
+        assert!(y_vip_restored < y_us_restored);
     })
     .unwrap();
 }
@@ -271,6 +299,22 @@ fn filter_dropdown_and_modals_work_end_to_end(cx: &mut TestAppContext) {
                 .as_ref()
                 .map(|m| m.jump_host_id.as_str()),
             Some("us-node")
+        );
+
+        // 主机编辑弹窗底部「允许 MCP 访问」复选框默认勾选，点击可切换
+        assert!(has_element(window, "modal-check-mcp-exposed"));
+        assert!(
+            ws.read(cx)
+                .host_modal
+                .as_ref()
+                .is_some_and(|m| m.mcp_exposed)
+        );
+        click_element(window, "modal-check-mcp-exposed", 1, cx);
+        assert!(
+            ws.read(cx)
+                .host_modal
+                .as_ref()
+                .is_some_and(|m| !m.mcp_exposed)
         );
     })
     .unwrap();
@@ -378,6 +422,32 @@ fn settings_page_switches_all_five_tabs_and_expands_call_log(cx: &mut TestAppCon
         click_element(window, "settings-tab-mcp", 1, cx);
         assert!(has_element(window, "settings-panel-mcp"));
         assert!(has_element(window, "settings-toggle-mcp"));
+        assert!(has_element(window, "settings-mcp-expose-card"));
+        assert!(has_element(window, "settings-mcp-host-vip-hk"));
+        assert!(ws.read(cx).host_by_id("vip-hk").unwrap().mcp_exposed);
+        click_element(window, "settings-mcp-host-vip-hk", 1, cx);
+        assert!(!ws.read(cx).host_by_id("vip-hk").unwrap().mcp_exposed);
+        click_element(window, "settings-mcp-expose-none", 1, cx);
+        assert!(ws.read(cx).hosts.iter().all(|h| !h.mcp_exposed));
+        click_element(window, "settings-mcp-expose-all", 1, cx);
+        assert!(ws.read(cx).hosts.iter().all(|h| h.mcp_exposed));
+
+        // 7 大 MCP 工具开放范围：默认全开（7 个），支持单项切换、全不选与全选
+        assert!(has_element(window, "settings-mcp-tools-card"));
+        assert!(has_element(window, "settings-mcp-tool-vps_exec"));
+        assert_eq!(ws.read(cx).settings.mcp_enabled_tools.len(), 7);
+        click_element(window, "settings-mcp-tool-vps_exec", 1, cx);
+        assert!(
+            !ws.read(cx)
+                .settings
+                .mcp_enabled_tools
+                .iter()
+                .any(|t| t == "vps_exec")
+        );
+        click_element(window, "settings-mcp-tools-none", 1, cx);
+        assert!(ws.read(cx).settings.mcp_enabled_tools.is_empty());
+        click_element(window, "settings-mcp-tools-all", 1, cx);
+        assert_eq!(ws.read(cx).settings.mcp_enabled_tools.len(), 7);
         assert!(has_element(window, "settings-save-guard"));
 
         // 切换到「调用记录」：未展开时多行参数、空摘要与单行记录的行高必须完全一致
@@ -491,6 +561,153 @@ fn sse_reveal_terminal_event_switches_to_terminal_stage_and_shows_toast(cx: &mut
         assert_eq!(
             ws.read(cx).toast.as_ref().map(|t| t.text.as_str()),
             Some("Agent 唤起「vip-hk」终端: 请检查 nginx 配置")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn nested_scroll_containers_scroll_independently_without_moving_outer_page(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        let mut many_hosts = vec![make_host(
+            "local", "本机", "local", "online", "windows", None, false,
+        )];
+        for i in 1..=30 {
+            let id = format!("node-{i}");
+            many_hosts.push(make_host(
+                &id,
+                &id,
+                "ssh",
+                "online",
+                "debian",
+                Some("primary"),
+                false,
+            ));
+        }
+        ws.update(cx, |w, cx| {
+            w.set_hosts_for_test(many_hosts, cx);
+            w.settings.call_hosts = (1..=30).map(|i| format!("node-{i}")).collect();
+        });
+        render_frame(window, cx);
+
+        // 1. 主机弹窗跳板机下拉列表：30 台节点时高度受限且滚轮只滚动下拉列表内部，不动外层弹窗和底层仓库
+        click_element(window, "edit-node-1", 1, cx);
+        click_element(window, "modal-jump-cycle", 1, cx);
+        let jump_bounds = element_bounds(window, "modal-jump-dropdown");
+        let opt0_before = element_bounds(window, "modal-jump-opt-0").origin.y;
+        let trigger_before = element_bounds(window, "modal-jump-cycle").origin.y;
+        let bg_card_before = element_bounds(window, "host-card-local").origin.y;
+
+        let pos = jump_bounds.center();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: pos,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            ScrollWheelEvent {
+                position: pos,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+                modifiers: Default::default(),
+                touch_phase: TouchPhase::Moved,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        render_frame(window, cx);
+
+        let opt0_after = element_bounds(window, "modal-jump-opt-0").origin.y;
+        let trigger_after = element_bounds(window, "modal-jump-cycle").origin.y;
+        let bg_card_after = element_bounds(window, "host-card-local").origin.y;
+        assert!(
+            opt0_after < opt0_before,
+            "inner jump dropdown must scroll up"
+        );
+        assert_eq!(
+            trigger_after, trigger_before,
+            "outer modal body must not scroll"
+        );
+        assert_eq!(
+            bg_card_after, bg_card_before,
+            "background host list must not scroll"
+        );
+        click_element(window, "modal-cancel", 1, cx);
+
+        // 2. 设置 → MCP Server 的「MCP 暴露主机范围」：滚轮只滚内部主机网格，不动外层设置页
+        click_element(window, "nav-settings", 1, cx);
+        click_element(window, "settings-tab-mcp", 1, cx);
+        let expose_bounds = element_bounds(window, "settings-mcp-expose-scroll");
+        let host0_before = element_bounds(window, "settings-mcp-host-local").origin.y;
+        let card_before = element_bounds(window, "settings-mcp-expose-card").origin.y;
+
+        let pos2 = expose_bounds.center();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: pos2,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            ScrollWheelEvent {
+                position: pos2,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+                modifiers: Default::default(),
+                touch_phase: TouchPhase::Moved,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        render_frame(window, cx);
+
+        let host0_after = element_bounds(window, "settings-mcp-host-local").origin.y;
+        let card_after = element_bounds(window, "settings-mcp-expose-card").origin.y;
+        assert!(
+            host0_after < host0_before,
+            "inner mcp expose grid must scroll up"
+        );
+        assert_eq!(
+            card_after, card_before,
+            "outer settings page must not scroll"
+        );
+
+        // 3. 设置 → 调用记录 的「主机」筛选下拉面板：滚轮只滚内部芯片区，不动外层设置页
+        click_element(window, "settings-tab-calls", 1, cx);
+        click_element(window, "calls-filter-host", 1, cx);
+        let calls_drop_bounds = element_bounds(window, "calls-host-dropdown");
+        let calls_trigger_before = element_bounds(window, "calls-filter-host").origin.y;
+        let pos3 = calls_drop_bounds.center();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: pos3,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            ScrollWheelEvent {
+                position: pos3,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+                modifiers: Default::default(),
+                touch_phase: TouchPhase::Moved,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        render_frame(window, cx);
+        let calls_trigger_after = element_bounds(window, "calls-filter-host").origin.y;
+        assert_eq!(
+            calls_trigger_after, calls_trigger_before,
+            "outer calls settings page must not scroll when scrolling inside calls host dropdown"
         );
     })
     .unwrap();

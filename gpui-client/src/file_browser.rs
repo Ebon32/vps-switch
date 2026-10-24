@@ -1933,6 +1933,9 @@ fn render_transfers_footer(
                 .id("files-transfers-scroll")
                 .max_h(px(164.))
                 .overflow_y_scroll()
+                .on_scroll_wheel(|_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .child(list),
         )
 }

@@ -12,10 +12,13 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::*;
 use gpui_kit::*;
 
-use crate::api::{ApiCommand, McpCallRecord, SettingsBundle, UpdateCheckOutcome};
+use crate::api::{
+    ALL_MCP_TOOL_NAMES, ApiCommand, McpCallRecord, SettingsBundle, UpdateCheckOutcome,
+    default_mcp_tool_names,
+};
 use crate::assets::CatalogIcon;
 use crate::palette::Palette;
-use crate::widgets::{BrandLogoSize, brand_logo, lucide_icon};
+use crate::widgets::{BrandLogoSize, brand_logo, lucide_icon, status_dot};
 use crate::workspace::{Page, ToastKind, Workspace};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +58,7 @@ pub struct SettingsState {
     pub mcp_enabled: bool,
     pub mcp_require_api_key: bool,
     pub mcp_api_key: String,
+    pub mcp_enabled_tools: Vec<String>,
     pub show_api_key: bool,
     pub claude_code_synced: bool,
     pub codex_synced: bool,
@@ -181,6 +185,7 @@ impl SettingsState {
             mcp_enabled: true,
             mcp_require_api_key: true,
             mcp_api_key: String::new(),
+            mcp_enabled_tools: default_mcp_tool_names(),
             show_api_key: false,
             claude_code_synced: true,
             codex_synced: true,
@@ -202,7 +207,7 @@ impl SettingsState {
             expanded_call_id: None,
             expanded_detail: None,
             loading_detail: false,
-            version: "v0.1.0".into(),
+            version: concat!("v", env!("CARGO_PKG_VERSION")).into(),
             port: 18800,
             exe_path: "vps-switch.exe".into(),
             checking_update: false,
@@ -214,6 +219,7 @@ impl SettingsState {
         self.mcp_enabled = bundle.mcp_enabled;
         self.mcp_require_api_key = bundle.mcp_require_api_key;
         self.mcp_api_key = bundle.mcp_api_key;
+        self.mcp_enabled_tools = bundle.mcp_enabled_tools;
         self.auth_enabled = bundle.auth_enabled;
         self.has_admin_password = bundle.has_admin_password;
         self.autostart = bundle.autostart;
@@ -412,6 +418,36 @@ impl Workspace {
             regenerate_key: true,
             prev_enabled: en,
             prev_require_key: req,
+        });
+        cx.notify();
+    }
+
+    pub fn toggle_mcp_tool(&mut self, tool_name: &str, cx: &mut Context<Self>) {
+        if self.settings.mcp_enabled_tools.iter().any(|t| t == tool_name) {
+            self.settings.mcp_enabled_tools.retain(|t| t != tool_name);
+        } else {
+            self.settings.mcp_enabled_tools.push(tool_name.to_owned());
+            self.settings.mcp_enabled_tools.sort_by_key(|t| {
+                ALL_MCP_TOOL_NAMES
+                    .iter()
+                    .position(|k| *k == t.as_str())
+                    .unwrap_or(99)
+            });
+        }
+        self.api.send(ApiCommand::SaveMcpTools {
+            mcp_enabled_tools: self.settings.mcp_enabled_tools.clone(),
+        });
+        cx.notify();
+    }
+
+    pub fn set_all_mcp_tools(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.mcp_enabled_tools = if enabled {
+            default_mcp_tool_names()
+        } else {
+            Vec::new()
+        };
+        self.api.send(ApiCommand::SaveMcpTools {
+            mcp_enabled_tools: self.settings.mcp_enabled_tools.clone(),
         });
         cx.notify();
     }
@@ -1658,6 +1694,392 @@ fn render_mcp_tab(
             ),
     );
 
+    // 板块 1.5：MCP 暴露主机选择
+    let active_hosts: Vec<_> = workspace.hosts.iter().filter(|h| !h.archived).collect();
+    let total_hosts = active_hosts.len();
+    let exposed_count = active_hosts.iter().filter(|h| h.mcp_exposed).count();
+    let this_expose_all = this.clone();
+    let this_expose_none = this.clone();
+
+    let mut host_grid = div().w_full().flex().flex_wrap().gap(px(8.));
+    for host in &active_hosts {
+        let hid = host.id.clone();
+        let exposed = host.mcp_exposed;
+        let checking = workspace.checking.contains(&host.id);
+        let addr_label = if host.kind == "local" {
+            format!("{}@127.0.0.1", host.username)
+        } else {
+            format!("{}@{}:{}", host.username, host.addr, host.port)
+        };
+        let this_toggle_host = this.clone();
+        let item = h_flex()
+            .id(SharedString::from(format!(
+                "settings-mcp-host-{}",
+                host.id
+            )))
+            .test_support()
+            .w(px(266.))
+            .items_center()
+            .justify_between()
+            .gap(px(10.))
+            .rounded_xl()
+            .border_1()
+            .border_color(if exposed {
+                palette.border_selected
+            } else {
+                palette.border
+            })
+            .bg(if exposed {
+                palette.card_solid_bg
+            } else {
+                palette.muted_surface_bg
+            })
+            .px(px(12.))
+            .py(px(9.))
+            .cursor_pointer()
+            .hover(|s| s.border_color(palette.border_selected))
+            .on_click(move |_, _, cx| {
+                let id = hid.clone();
+                let _ = this_toggle_host.update(cx, |w, cx| w.toggle_host_mcp_exposed(&id, cx));
+            })
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(status_dot(
+                        &host.status,
+                        checking,
+                        8.0,
+                        format!("mcp-expose-dot-{}", host.id),
+                        palette,
+                    ))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if exposed {
+                                        palette.text_primary
+                                    } else {
+                                        palette.text_muted
+                                    })
+                                    .truncate()
+                                    .child(host.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(palette.text_faint)
+                                    .truncate()
+                                    .child(addr_label),
+                            ),
+                    ),
+            )
+            .child(check_box(exposed, palette));
+        host_grid = host_grid.child(item);
+    }
+
+    let expose_card = section_shell(palette)
+        .id("settings-mcp-expose-card")
+        .test_support()
+        .child(
+            v_flex()
+                .gap(px(14.))
+                .child(
+                    h_flex()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(12.))
+                        .pb(px(12.))
+                        .border_b_1()
+                        .border_color(palette.divider)
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .text_size(px(14.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(palette.text_primary)
+                                                .child("MCP 暴露主机范围"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("settings-mcp-expose-count")
+                                                .test_support()
+                                                .rounded_full()
+                                                .bg(palette.subtle_bg)
+                                                .px(px(8.))
+                                                .py(px(1.))
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(palette.text_secondary)
+                                                .child(format!(
+                                                    "已暴露 {exposed_count} / {total_hosts} 台"
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(palette.text_faint)
+                                        .child("仅勾选的主机对外部 Agent 可见且可操作；未勾选的主机在 vps_list 中隐藏并拒绝一切 MCP 工具访问"),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .id("settings-mcp-expose-all")
+                                        .test_support()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(palette.border)
+                                        .bg(palette.card_solid_bg)
+                                        .px(px(10.))
+                                        .py(px(4.))
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(palette.text_secondary)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(palette.subtle_bg))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = this_expose_all.update(cx, |w, cx| {
+                                                w.set_all_hosts_mcp_exposed(true, cx);
+                                            });
+                                        })
+                                        .child("全选"),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-mcp-expose-none")
+                                        .test_support()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(palette.border)
+                                        .bg(palette.card_solid_bg)
+                                        .px(px(10.))
+                                        .py(px(4.))
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(palette.text_secondary)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(palette.subtle_bg))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = this_expose_none.update(cx, |w, cx| {
+                                                w.set_all_hosts_mcp_exposed(false, cx);
+                                            });
+                                        })
+                                        .child("全不选"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("settings-mcp-expose-scroll")
+                        .test_support()
+                        .max_h(px(280.))
+                        .overflow_y_scroll()
+                        .on_scroll_wheel(|_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(host_grid),
+                ),
+        );
+
+    // 板块 1.6：MCP 开放工具选择（7 大工具）
+    let tool_catalog: [(&str, &str); 7] = [
+        ("vps_list", "主机列表与概览"),
+        ("vps_inspect", "实时深度探针"),
+        ("vps_exec", "非交互命令执行"),
+        ("vps_terminal", "交互式 PTY 终端"),
+        ("vps_fs", "远程文件系统"),
+        ("vps_transfer", "大文件流式传输"),
+        ("vps_task", "后台任务查询与取消"),
+    ];
+    let enabled_tools_count = tool_catalog
+        .iter()
+        .filter(|(name, _)| s.mcp_enabled_tools.iter().any(|t| t == *name))
+        .count();
+    let this_tools_all = this.clone();
+    let this_tools_none = this.clone();
+
+    let mut tools_grid = div().w_full().flex().flex_wrap().gap(px(8.));
+    for (tool_name, tool_desc) in tool_catalog {
+        let enabled = s.mcp_enabled_tools.iter().any(|t| t == tool_name);
+        let t_name = tool_name.to_owned();
+        let this_toggle_tool = this.clone();
+        let item = h_flex()
+            .id(SharedString::from(format!("settings-mcp-tool-{tool_name}")))
+            .test_support()
+            .w(px(266.))
+            .items_center()
+            .justify_between()
+            .gap(px(10.))
+            .rounded_xl()
+            .border_1()
+            .border_color(if enabled {
+                palette.border_selected
+            } else {
+                palette.border
+            })
+            .bg(if enabled {
+                palette.card_solid_bg
+            } else {
+                palette.muted_surface_bg
+            })
+            .px(px(12.))
+            .py(px(9.))
+            .cursor_pointer()
+            .hover(|st| st.border_color(palette.border_selected))
+            .on_click(move |_, _, cx| {
+                let name = t_name.clone();
+                let _ = this_toggle_tool.update(cx, |w, cx| w.toggle_mcp_tool(&name, cx));
+            })
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if enabled {
+                                palette.text_primary
+                            } else {
+                                palette.text_muted
+                            })
+                            .truncate()
+                            .child(tool_name),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(palette.text_faint)
+                            .truncate()
+                            .child(tool_desc),
+                    ),
+            )
+            .child(check_box(enabled, palette));
+        tools_grid = tools_grid.child(item);
+    }
+
+    let tools_card = section_shell(palette)
+        .id("settings-mcp-tools-card")
+        .test_support()
+        .child(
+            v_flex()
+                .gap(px(14.))
+                .child(
+                    h_flex()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(12.))
+                        .pb(px(12.))
+                        .border_b_1()
+                        .border_color(palette.divider)
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .text_size(px(14.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(palette.text_primary)
+                                                .child("MCP 开放工具范围"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("settings-mcp-tools-count")
+                                                .test_support()
+                                                .rounded_full()
+                                                .bg(palette.subtle_bg)
+                                                .px(px(8.))
+                                                .py(px(1.))
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(palette.text_secondary)
+                                                .child(format!(
+                                                    "已开放 {enabled_tools_count} / 7 个"
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(palette.text_faint)
+                                        .child("默认全部开放；取消勾选的工具将从 tools/list 中移除并拒绝外部 Agent 调用（如公网部署仅保留只读巡检）"),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .id("settings-mcp-tools-all")
+                                        .test_support()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(palette.border)
+                                        .bg(palette.card_solid_bg)
+                                        .px(px(10.))
+                                        .py(px(4.))
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(palette.text_secondary)
+                                        .cursor_pointer()
+                                        .hover(|st| st.bg(palette.subtle_bg))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = this_tools_all.update(cx, |w, cx| {
+                                                w.set_all_mcp_tools(true, cx);
+                                            });
+                                        })
+                                        .child("全选"),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-mcp-tools-none")
+                                        .test_support()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(palette.border)
+                                        .bg(palette.card_solid_bg)
+                                        .px(px(10.))
+                                        .py(px(4.))
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(palette.text_secondary)
+                                        .cursor_pointer()
+                                        .hover(|st| st.bg(palette.subtle_bg))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = this_tools_none.update(cx, |w, cx| {
+                                                w.set_all_mcp_tools(false, cx);
+                                            });
+                                        })
+                                        .child("全不选"),
+                                ),
+                        ),
+                )
+                .child(tools_grid),
+        );
+
     // 板块 2：命令黑名单
     let card2 = section_shell(palette).child(
         v_flex()
@@ -1766,6 +2188,8 @@ fn render_mcp_tab(
         .id("settings-panel-mcp")
         .test_support()
         .gap(px(16.))
+        .child(expose_card)
+        .child(tools_card)
         .child(card1)
         .child(card2)
         .into_any_element()
@@ -2122,6 +2546,9 @@ fn render_calls_tab(
                 .test_support()
                 .max_h(px(180.))
                 .overflow_y_scroll()
+                .on_scroll_wheel(|_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .rounded_xl()
                 .border_1()
                 .border_color(palette.border)
@@ -2178,6 +2605,9 @@ fn render_calls_tab(
                 .test_support()
                 .max_h(px(160.))
                 .overflow_y_scroll()
+                .on_scroll_wheel(|_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .rounded_xl()
                 .border_1()
                 .border_color(palette.border)
@@ -2470,6 +2900,9 @@ fn render_calls_tab(
                                         .id(detail_args_id)
                                         .max_h(px(260.))
                                         .overflow_y_scroll()
+                                        .on_scroll_wheel(|_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
                                         .rounded_xl()
                                         .border_1()
                                         .border_color(palette.border)
@@ -2532,6 +2965,9 @@ fn render_calls_tab(
                                         .id(detail_res_id)
                                         .max_h(px(340.))
                                         .overflow_y_scroll()
+                                        .on_scroll_wheel(|_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
                                         .rounded_xl()
                                         .border_1()
                                         .border_color(palette.border)

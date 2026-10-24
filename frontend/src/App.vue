@@ -93,6 +93,24 @@ const searchInputRef = ref<HTMLInputElement | null>(null);
 const mcpEnabled = ref(true);
 const mcpRequireApiKey = ref(false);
 const mcpApiKey = ref('');
+const mcpEnabledTools = ref<string[]>([
+  'vps_list',
+  'vps_inspect',
+  'vps_exec',
+  'vps_terminal',
+  'vps_fs',
+  'vps_transfer',
+  'vps_task',
+]);
+const mcpToolCatalog = [
+  { name: 'vps_list', desc: '主机列表与概览' },
+  { name: 'vps_inspect', desc: '实时深度探针' },
+  { name: 'vps_exec', desc: '非交互命令执行' },
+  { name: 'vps_terminal', desc: '交互式 PTY 终端' },
+  { name: 'vps_fs', desc: '远程文件系统' },
+  { name: 'vps_transfer', desc: '大文件流式传输' },
+  { name: 'vps_task', desc: '后台任务查询与取消' },
+] as const;
 const showApiKey = ref(false);
 const configModePreview = ref<'remote' | 'stdio'>('remote');
 
@@ -182,8 +200,8 @@ const updateStatus = ref<{
   checking: false,
   checked: false,
   hasUpdate: false,
-  currentVersion: 'v0.1.0',
-  latestVersion: 'v0.1.0',
+  currentVersion: 'v0.1.1',
+  latestVersion: 'v0.1.1',
 });
 
 // 拖拽排序
@@ -408,6 +426,9 @@ async function loadSettings() {
       mcpEnabled.value = Boolean(s.mcpEnabled);
       mcpRequireApiKey.value = Boolean(s.mcpRequireApiKey);
       mcpApiKey.value = s.mcpApiKey || '';
+      if (Array.isArray(s.mcpEnabledTools)) {
+        mcpEnabledTools.value = s.mcpEnabledTools;
+      }
       settingAuthEnabled.value = Boolean(s.authEnabled);
       authEnabled.value = Boolean(s.authEnabled);
       settingAdminUsername.value = s.adminUsername || 'admin';
@@ -620,8 +641,8 @@ async function checkAppUpdate() {
         checking: false,
         checked: true,
         hasUpdate: Boolean(data.hasUpdate),
-        currentVersion: data.currentVersion || 'v0.1.0',
-        latestVersion: data.latestVersion || 'v0.1.0',
+        currentVersion: data.currentVersion || 'v0.1.1',
+        latestVersion: data.latestVersion || 'v0.1.1',
         publishedAt: data.publishedAt,
         releaseNotes: data.releaseNotes,
         releaseUrl: data.releaseUrl,
@@ -891,6 +912,18 @@ async function restoreExistingTerminals() {
   }
 }
 
+function sortHostsInPlace() {
+  hosts.value.sort((a, b) => {
+    const aLocal = a.kind === 'local' || a.id === 'local' ? 0 : 1;
+    const bLocal = b.kind === 'local' || b.id === 'local' ? 0 : 1;
+    if (aLocal !== bLocal) return aLocal - bLocal;
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    const orderDiff = (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
+    if (orderDiff !== 0) return orderDiff;
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+  });
+}
+
 function replaceHostInList(updated: PublicHost) {
   const idx = hosts.value.findIndex((h) => h.id === updated.id);
   if (idx >= 0) {
@@ -898,6 +931,7 @@ function replaceHostInList(updated: PublicHost) {
   } else {
     hosts.value.push(updated);
   }
+  sortHostsInPlace();
 }
 
 async function checkSingleHost(host: PublicHost) {
@@ -1271,6 +1305,10 @@ async function handleModalSubmit(payload: HostUpsertPayload, editingId: string |
 }
 
 async function handlePatchMeta(host: PublicHost, patch: Record<string, unknown>) {
+  if (typeof patch.pinned === 'boolean') {
+    host.pinned = patch.pinned;
+    sortHostsInPlace();
+  }
   try {
     const res = await apiFetch(`/api/hosts/${encodeURIComponent(host.id)}/meta`, {
       method: 'PATCH',
@@ -1284,10 +1322,82 @@ async function handlePatchMeta(host: PublicHost, patch: Record<string, unknown>)
       await fetchHosts();
       return;
     }
-    replaceHostInList(data.host);
+    if (Array.isArray(data.hosts)) {
+      hosts.value = data.hosts;
+    } else {
+      replaceHostInList(data.host);
+    }
   } catch (e) {
     showToast(`更新失败: ${(e as Error).message}`, 'err');
   }
+}
+
+const activeUnarchivedHosts = computed(() => hosts.value.filter((h) => !h.archived));
+const mcpExposedCount = computed(
+  () => activeUnarchivedHosts.value.filter((h) => h.mcpExposed !== false).length
+);
+
+function toggleHostMcpExposed(host: PublicHost) {
+  const next = host.mcpExposed === false;
+  host.mcpExposed = next;
+  void handlePatchMeta(host, { mcpExposed: next });
+}
+
+async function setAllHostsMcpExposed(exposed: boolean) {
+  try {
+    const res = await apiFetch('/api/hosts/mcp-expose', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exposed }),
+    });
+    if (!res) return;
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.hosts)) {
+      showToast(data.error || '批量更新 MCP 暴露范围失败', 'err');
+      await fetchHosts();
+      return;
+    }
+    hosts.value = data.hosts;
+    showToast(exposed ? '已将全部主机设为对 MCP 暴露' : '已隐藏全部主机的 MCP 暴露');
+  } catch (e) {
+    showToast(`操作失败: ${(e as Error).message}`, 'err');
+  }
+}
+
+async function saveMcpTools(nextTools: string[]) {
+  mcpEnabledTools.value = nextTools;
+  try {
+    const res = await apiFetch('/api/settings/mcp', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mcpEnabledTools: nextTools }),
+    });
+    if (!res) return;
+    const data = await res.json();
+    if (!data.ok || !data.settings) {
+      showToast(data.error || '保存 MCP 工具开放范围失败', 'err');
+      await loadSettings();
+      return;
+    }
+    if (Array.isArray(data.settings.mcpEnabledTools)) {
+      mcpEnabledTools.value = data.settings.mcpEnabledTools;
+    }
+  } catch (e) {
+    showToast(`保存失败: ${(e as Error).message}`, 'err');
+  }
+}
+
+function toggleMcpTool(toolName: string) {
+  const exists = mcpEnabledTools.value.includes(toolName);
+  const next = exists
+    ? mcpEnabledTools.value.filter((t) => t !== toolName)
+    : [...mcpEnabledTools.value, toolName];
+  void saveMcpTools(next);
+}
+
+function setAllMcpTools(enabled: boolean) {
+  const next = enabled ? mcpToolCatalog.map((t) => t.name) : [];
+  void saveMcpTools(next);
 }
 
 function handleDeleteHost(host: PublicHost) {
@@ -2275,6 +2385,140 @@ onBeforeUnmount(() => {
             <pre
               class="overflow-x-auto rounded-xl border border-zinc-200/80 bg-zinc-950 p-3.5 font-mono text-[11px] leading-relaxed text-zinc-200 dark:border-zinc-800"
             >{{ displayedMcpConfigJson }}</pre>
+          </div>
+        </section>
+
+        <!-- 板块 1.5：MCP 暴露主机范围 -->
+        <section
+          class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
+        >
+          <div class="flex items-start justify-between gap-3 border-b border-zinc-100 pb-3.5 dark:border-zinc-800">
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="text-sm font-semibold">MCP 暴露主机范围</h3>
+                <span class="rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                  已暴露 {{ mcpExposedCount }} / {{ activeUnarchivedHosts.length }} 台
+                </span>
+              </div>
+              <p class="mt-0.5 text-xs text-zinc-400">
+                仅勾选的主机对外部 Agent 可见且可操作；未勾选的主机在 vps_list 中隐藏并拒绝一切 MCP 工具访问
+              </p>
+            </div>
+            <div class="flex shrink-0 items-center gap-1.5">
+              <button
+                type="button"
+                class="rounded-lg border border-zinc-200/80 bg-white px-2.5 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                @click="setAllHostsMcpExposed(true)"
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                class="rounded-lg border border-zinc-200/80 bg-white px-2.5 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                @click="setAllHostsMcpExposed(false)"
+              >
+                全不选
+              </button>
+            </div>
+          </div>
+
+          <div class="grid max-h-72 grid-cols-1 gap-2 overflow-y-auto sm:grid-cols-2 md:grid-cols-3">
+            <button
+              v-for="h in activeUnarchivedHosts"
+              :key="`mcp-exp-${h.id}`"
+              type="button"
+              class="flex items-center justify-between gap-2.5 rounded-xl border px-3 py-2 text-left transition"
+              :class="
+                h.mcpExposed !== false
+                  ? 'border-zinc-300 bg-white dark:border-zinc-700 dark:bg-zinc-900'
+                  : 'border-zinc-200/70 bg-zinc-50/60 opacity-75 dark:border-zinc-800 dark:bg-zinc-800/40'
+              "
+              @click="toggleHostMcpExposed(h)"
+            >
+              <div class="flex min-w-0 items-center gap-2">
+                <span
+                  class="h-2 w-2 shrink-0 rounded-full"
+                  :class="
+                    h.status === 'online'
+                      ? 'bg-emerald-500'
+                      : h.status === 'offline'
+                        ? 'bg-red-500'
+                        : 'bg-zinc-300 dark:bg-zinc-600'
+                  "
+                ></span>
+                <div class="min-w-0">
+                  <div class="truncate text-xs font-semibold">{{ h.name }}</div>
+                  <div class="truncate font-mono text-[10px] text-zinc-400">
+                    {{ h.kind === 'local' ? `${h.username}@127.0.0.1` : `${h.username}@${h.addr}:${h.port}` }}
+                  </div>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                :checked="h.mcpExposed !== false"
+                class="h-4 w-4 shrink-0 rounded border-zinc-300 text-zinc-900 pointer-events-none"
+              />
+            </button>
+          </div>
+        </section>
+
+        <!-- 板块 1.6：MCP 开放工具范围 -->
+        <section
+          class="space-y-4 rounded-2xl border border-zinc-200/80 bg-white/85 p-5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/85"
+        >
+          <div class="flex items-start justify-between gap-3 border-b border-zinc-100 pb-3.5 dark:border-zinc-800">
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="text-sm font-semibold">MCP 开放工具范围</h3>
+                <span class="rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                  已开放 {{ mcpEnabledTools.length }} / {{ mcpToolCatalog.length }} 个
+                </span>
+              </div>
+              <p class="mt-0.5 text-xs text-zinc-400">
+                默认全部开放；取消勾选的工具将从 tools/list 中移除并拒绝外部 Agent 调用（如公网部署仅保留只读巡检）
+              </p>
+            </div>
+            <div class="flex shrink-0 items-center gap-1.5">
+              <button
+                type="button"
+                class="rounded-lg border border-zinc-200/80 bg-white px-2.5 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                @click="setAllMcpTools(true)"
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                class="rounded-lg border border-zinc-200/80 bg-white px-2.5 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                @click="setAllMcpTools(false)"
+              >
+                全不选
+              </button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3">
+            <button
+              v-for="tool in mcpToolCatalog"
+              :key="`mcp-tool-${tool.name}`"
+              type="button"
+              class="flex items-center justify-between gap-2.5 rounded-xl border px-3 py-2 text-left transition"
+              :class="
+                mcpEnabledTools.includes(tool.name)
+                  ? 'border-zinc-300 bg-white dark:border-zinc-700 dark:bg-zinc-900'
+                  : 'border-zinc-200/70 bg-zinc-50/60 opacity-75 dark:border-zinc-800 dark:bg-zinc-800/40'
+              "
+              @click="toggleMcpTool(tool.name)"
+            >
+              <div class="min-w-0">
+                <div class="truncate font-mono text-xs font-semibold">{{ tool.name }}</div>
+                <div class="truncate text-[10px] text-zinc-400">{{ tool.desc }}</div>
+              </div>
+              <input
+                type="checkbox"
+                :checked="mcpEnabledTools.includes(tool.name)"
+                class="h-4 w-4 shrink-0 rounded border-zinc-300 text-zinc-900 pointer-events-none"
+              />
+            </button>
           </div>
         </section>
 

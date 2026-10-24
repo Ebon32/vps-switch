@@ -87,6 +87,8 @@ pub struct Host {
     pub pinned: bool,
     pub favorited: bool,
     pub archived: bool,
+    pub mcp_exposed: bool,
+    pub sort_order: i64,
     pub role: Option<String>,
     pub tags: Vec<String>,
     pub links: Vec<HostLink>,
@@ -202,11 +204,26 @@ pub struct McpCallRecord {
     pub summary: String,
 }
 
+pub const ALL_MCP_TOOL_NAMES: [&str; 7] = [
+    "vps_list",
+    "vps_inspect",
+    "vps_exec",
+    "vps_terminal",
+    "vps_fs",
+    "vps_transfer",
+    "vps_task",
+];
+
+pub fn default_mcp_tool_names() -> Vec<String> {
+    ALL_MCP_TOOL_NAMES.iter().map(|s| (*s).to_owned()).collect()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SettingsBundle {
     pub mcp_enabled: bool,
     pub mcp_require_api_key: bool,
     pub mcp_api_key: String,
+    pub mcp_enabled_tools: Vec<String>,
     pub auth_enabled: bool,
     pub admin_username: String,
     pub has_admin_password: bool,
@@ -335,6 +352,7 @@ pub enum ApiEvent {
         mcp_enabled: bool,
         mcp_require_api_key: bool,
         mcp_api_key: String,
+        mcp_enabled_tools: Vec<String>,
         regenerated: bool,
     },
     McpSaveFailed {
@@ -394,6 +412,10 @@ pub enum ApiCommand {
     PatchMeta {
         host_id: String,
         patch: serde_json::Value,
+    },
+    SetMcpExposedBatch {
+        exposed: bool,
+        host_ids: Option<Vec<String>>,
     },
     Reorder {
         ordered_ids: Vec<String>,
@@ -478,6 +500,9 @@ pub enum ApiCommand {
         regenerate_key: bool,
         prev_enabled: bool,
         prev_require_key: bool,
+    },
+    SaveMcpTools {
+        mcp_enabled_tools: Vec<String>,
     },
     SaveAuth {
         auth_enabled: bool,
@@ -710,6 +735,24 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                     Some(host) => Some(ApiEvent::HostUpdated(host)),
                     None => Some(ApiEvent::Json(body)),
                 },
+                Err(error) => Some(ApiEvent::Failed(error)),
+            }
+        }
+        ApiCommand::SetMcpExposedBatch { exposed, host_ids } => {
+            match put_json(
+                client,
+                "/api/hosts/mcp-expose",
+                &serde_json::json!({
+                    "exposed": exposed,
+                    "hostIds": host_ids,
+                }),
+            )
+            .await
+            {
+                Ok(body) => Some(ApiEvent::Hosts {
+                    hosts: hosts_from_json(&body),
+                    inspections: inspections_map_from_json(&body),
+                }),
                 Err(error) => Some(ApiEvent::Failed(error)),
             }
         }
@@ -1111,12 +1154,13 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
         }
         ApiCommand::LoadSettings => {
             let mut bundle = SettingsBundle {
+                mcp_enabled_tools: default_mcp_tool_names(),
                 admin_username: "admin".into(),
                 close_action: "tray".into(),
                 proxy_mode: "per_host".into(),
                 proxy_port: 7890,
                 port: port().parse().unwrap_or(18800),
-                version: "v0.1.0".into(),
+                version: concat!("v", env!("CARGO_PKG_VERSION")).into(),
                 ..SettingsBundle::default()
             };
             if let Ok(body) = get_json(client, "/api/settings").await {
@@ -1134,6 +1178,12 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_owned();
+                    if let Some(arr) = s.get("mcpEnabledTools").and_then(|v| v.as_array()) {
+                        bundle.mcp_enabled_tools = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect();
+                    }
                     bundle.auth_enabled = s
                         .get("authEnabled")
                         .and_then(|v| v.as_bool())
@@ -1300,6 +1350,15 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_owned(),
+                        mcp_enabled_tools: s
+                            .and_then(|v| v.get("mcpEnabledTools"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_else(default_mcp_tool_names),
                         regenerated: regenerate_key,
                     })
                 }
@@ -1308,6 +1367,47 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                     prev_require_key,
                     error,
                 }),
+            }
+        }
+        ApiCommand::SaveMcpTools { mcp_enabled_tools } => {
+            let res = put_json(
+                client,
+                "/api/settings/mcp",
+                &serde_json::json!({
+                    "mcpEnabledTools": mcp_enabled_tools,
+                }),
+            )
+            .await;
+            match res {
+                Ok(body) => {
+                    let s = body.get("settings");
+                    Some(ApiEvent::McpSaved {
+                        mcp_enabled: s
+                            .and_then(|v| v.get("mcpEnabled"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                        mcp_require_api_key: s
+                            .and_then(|v| v.get("mcpRequireApiKey"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                        mcp_api_key: s
+                            .and_then(|v| v.get("mcpApiKey"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                        mcp_enabled_tools: s
+                            .and_then(|v| v.get("mcpEnabledTools"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or(mcp_enabled_tools),
+                        regenerated: false,
+                    })
+                }
+                Err(error) => Some(ApiEvent::Failed(format!("保存 MCP 工具开放范围失败: {error}"))),
             }
         }
         ApiCommand::SaveAuth {
@@ -1474,7 +1574,7 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                     let current_version = body
                         .get("currentVersion")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("v0.1.0")
+                        .unwrap_or(concat!("v", env!("CARGO_PKG_VERSION")))
                         .to_owned();
                     let latest_version = body
                         .get("latestVersion")
@@ -1521,8 +1621,8 @@ async fn handle(client: &reqwest::Client, command: ApiCommand) -> Option<ApiEven
                 Err(err) => Some(ApiEvent::UpdateChecked(UpdateCheckOutcome {
                     ok: false,
                     has_update: false,
-                    current_version: "v0.1.0".into(),
-                    latest_version: "v0.1.0".into(),
+                    current_version: concat!("v", env!("CARGO_PKG_VERSION")).into(),
+                    latest_version: concat!("v", env!("CARGO_PKG_VERSION")).into(),
                     release_notes: None,
                     release_url: None,
                     error: Some(err.to_string()),
@@ -1699,6 +1799,14 @@ pub fn host_from_json(value: &serde_json::Value) -> Option<Host> {
             .get("archived")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        mcp_exposed: value
+            .get("mcpExposed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        sort_order: value
+            .get("sortOrder")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
         role: field("role").map(str::to_owned),
         tags: value
             .get("tags")
