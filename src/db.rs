@@ -132,6 +132,7 @@ impl Database {
                  pinned INTEGER NOT NULL DEFAULT 0,
                  favorited INTEGER NOT NULL DEFAULT 0,
                  archived INTEGER NOT NULL DEFAULT 0,
+                 mcp_exposed INTEGER NOT NULL DEFAULT 1,
                  sort_order INTEGER NOT NULL DEFAULT 0,
                  status TEXT NOT NULL DEFAULT 'unknown',
                  latency_ms INTEGER,
@@ -157,9 +158,13 @@ impl Database {
              );
              CREATE INDEX IF NOT EXISTS idx_mcp_calls_ts ON mcp_calls(ts);",
         )?;
-        // 兼容升级已有数据库：安全添加 favorited 列
+        // 兼容升级已有数据库：安全添加 favorited 与 mcp_exposed 列
         let _ = conn.execute(
             "ALTER TABLE hosts ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE hosts ADD COLUMN mcp_exposed INTEGER NOT NULL DEFAULT 1",
             [],
         );
         // 兼容升级：MCP 调用留痕补上「返回给 agent 的完整结果」一列
@@ -287,6 +292,7 @@ impl Database {
             pinned: row.get::<_, i64>("pinned")? != 0,
             favorited: row.get::<_, i64>("favorited").unwrap_or(0) != 0,
             archived: row.get::<_, i64>("archived")? != 0,
+            mcp_exposed: row.get::<_, i64>("mcp_exposed").unwrap_or(1) != 0,
             sort_order: row.get("sort_order")?,
             status: row.get("status")?,
             latency_ms: row.get("latency_ms")?,
@@ -438,6 +444,7 @@ impl Database {
             pinned: r.pinned,
             favorited: r.favorited,
             archived: r.archived,
+            mcp_exposed: r.mcp_exposed,
             sort_order: r.sort_order,
             status: r.status,
             latency_ms: r.latency_ms,
@@ -494,8 +501,8 @@ impl Database {
                     id, name, kind, addr, port, username, auth_type,
                     encrypted_password, encrypted_private_key, encrypted_passphrase,
                     jump_host_id, role, tags_json, links_json,
-                    pinned, favorited, archived, sort_order, status, created_at, updated_at
-                ) VALUES (?1, ?2, 'ssh', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'unknown', ?18, ?18)",
+                    pinned, favorited, archived, mcp_exposed, sort_order, status, created_at, updated_at
+                ) VALUES (?1, ?2, 'ssh', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'unknown', ?19, ?19)",
                 params![
                     id,
                     name,
@@ -513,6 +520,7 @@ impl Database {
                     if payload.pinned { 1 } else { 0 },
                     if payload.favorited { 1 } else { 0 },
                     if payload.archived { 1 } else { 0 },
+                    if payload.mcp_exposed { 1 } else { 0 },
                     max_order + 1,
                     now
                 ],
@@ -539,7 +547,7 @@ impl Database {
         if existing.kind == "local" {
             let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
             conn.execute(
-                "UPDATE hosts SET name = ?1, role = ?2, tags_json = ?3, links_json = ?4, updated_at = ?5 WHERE id = ?6",
+                "UPDATE hosts SET name = ?1, role = ?2, tags_json = ?3, links_json = ?4, mcp_exposed = ?5, updated_at = ?6 WHERE id = ?7",
                 params![
                     if payload.name.trim().is_empty() {
                         &existing.name
@@ -549,6 +557,7 @@ impl Database {
                     role,
                     serde_json::to_string(&tags)?,
                     serde_json::to_string(&links)?,
+                    if payload.mcp_exposed { 1 } else { 0 },
                     now,
                     id
                 ],
@@ -582,8 +591,8 @@ impl Database {
                     name = ?1, addr = ?2, port = ?3, username = ?4, auth_type = ?5,
                     encrypted_password = ?6, encrypted_private_key = ?7, encrypted_passphrase = ?8,
                     jump_host_id = ?9, role = ?10, tags_json = ?11, links_json = ?12,
-                    pinned = ?13, favorited = ?14, archived = ?15, updated_at = ?16
-                 WHERE id = ?17",
+                    pinned = ?13, favorited = ?14, archived = ?15, mcp_exposed = ?16, updated_at = ?17
+                 WHERE id = ?18",
                 params![
                     payload.name.trim(),
                     payload.addr.trim(),
@@ -600,6 +609,7 @@ impl Database {
                     if payload.pinned { 1 } else { 0 },
                     if payload.favorited { 1 } else { 0 },
                     if payload.archived { 1 } else { 0 },
+                    if payload.mcp_exposed { 1 } else { 0 },
                     now,
                     id
                 ],
@@ -618,6 +628,7 @@ impl Database {
         let pinned = patch.pinned.unwrap_or(existing.pinned);
         let favorited = patch.favorited.unwrap_or(existing.favorited);
         let archived = patch.archived.unwrap_or(existing.archived);
+        let mcp_exposed = patch.mcp_exposed.unwrap_or(existing.mcp_exposed);
         let role = match patch.role {
             Some(r) => {
                 let t = r.trim().to_string();
@@ -635,11 +646,12 @@ impl Database {
         {
             let conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
             conn.execute(
-                "UPDATE hosts SET pinned = ?1, favorited = ?2, archived = ?3, role = ?4, tags_json = ?5, links_json = ?6, updated_at = ?7 WHERE id = ?8",
+                "UPDATE hosts SET pinned = ?1, favorited = ?2, archived = ?3, mcp_exposed = ?4, role = ?5, tags_json = ?6, links_json = ?7, updated_at = ?8 WHERE id = ?9",
                 params![
                     if pinned { 1 } else { 0 },
                     if favorited { 1 } else { 0 },
                     if archived { 1 } else { 0 },
+                    if mcp_exposed { 1 } else { 0 },
                     role,
                     serde_json::to_string(&tags)?,
                     serde_json::to_string(&links)?,
@@ -651,6 +663,35 @@ impl Database {
 
         self.get_public_host(id)?
             .ok_or_else(|| anyhow!("更新元数据后读取失败"))
+    }
+
+    pub fn set_mcp_exposed_batch(
+        &self,
+        exposed: bool,
+        host_ids: Option<&[String]>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let val = if exposed { 1i64 } else { 0i64 };
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("数据库锁异常"))?;
+        match host_ids {
+            Some(ids) => {
+                let tx = conn.transaction()?;
+                for id in ids {
+                    tx.execute(
+                        "UPDATE hosts SET mcp_exposed = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![val, &now, id],
+                    )?;
+                }
+                tx.commit()?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE hosts SET mcp_exposed = ?1, updated_at = ?2",
+                    params![val, &now],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub fn reorder(&self, ordered_ids: &[String]) -> Result<()> {
@@ -1156,6 +1197,7 @@ impl Database {
                 k
             }
         };
+        let mcp_enabled_tools = self.get_enabled_mcp_tools();
 
         Ok(AppSettings {
             auth_enabled,
@@ -1164,7 +1206,24 @@ impl Database {
             mcp_enabled,
             mcp_require_api_key,
             mcp_api_key,
+            mcp_enabled_tools,
         })
+    }
+
+    pub fn get_enabled_mcp_tools(&self) -> Vec<String> {
+        match self.get_setting("mcp_enabled_tools") {
+            Ok(Some(raw)) => match serde_json::from_str::<Vec<String>>(&raw) {
+                Ok(list) => normalize_mcp_tools(&list),
+                Err(_) => default_mcp_tools(),
+            },
+            _ => default_mcp_tools(),
+        }
+    }
+
+    pub fn set_enabled_mcp_tools(&self, tools: &[String]) -> Result<Vec<String>> {
+        let normalized = normalize_mcp_tools(tools);
+        self.set_setting("mcp_enabled_tools", &serde_json::to_string(&normalized)?)?;
+        Ok(normalized)
     }
 
     pub fn update_auth_settings(
@@ -1224,21 +1283,51 @@ impl Database {
 
     pub fn update_mcp_settings(
         &self,
-        mcp_enabled: bool,
-        mcp_require_api_key: bool,
+        mcp_enabled: Option<bool>,
+        mcp_require_api_key: Option<bool>,
         regenerate_key: bool,
+        mcp_enabled_tools: Option<&[String]>,
     ) -> Result<AppSettings> {
-        self.set_setting("mcp_enabled", if mcp_enabled { "true" } else { "false" })?;
-        self.set_setting(
-            "mcp_require_api_key",
-            if mcp_require_api_key { "true" } else { "false" },
-        )?;
+        if let Some(en) = mcp_enabled {
+            self.set_setting("mcp_enabled", if en { "true" } else { "false" })?;
+        }
+        if let Some(req) = mcp_require_api_key {
+            self.set_setting(
+                "mcp_require_api_key",
+                if req { "true" } else { "false" },
+            )?;
+        }
         if regenerate_key {
             let new_key = generate_api_key();
             self.set_setting("mcp_api_key", &new_key)?;
         }
+        if let Some(tools) = mcp_enabled_tools {
+            self.set_enabled_mcp_tools(tools)?;
+        }
         self.get_app_settings()
     }
+}
+
+pub const ALL_MCP_TOOLS: [&str; 7] = [
+    "vps_list",
+    "vps_inspect",
+    "vps_exec",
+    "vps_terminal",
+    "vps_fs",
+    "vps_transfer",
+    "vps_task",
+];
+
+fn default_mcp_tools() -> Vec<String> {
+    ALL_MCP_TOOLS.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn normalize_mcp_tools(tools: &[String]) -> Vec<String> {
+    ALL_MCP_TOOLS
+        .iter()
+        .filter(|&&known| tools.iter().any(|t| t.trim() == known))
+        .map(|&s| s.to_string())
+        .collect()
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1250,6 +1339,7 @@ pub struct AppSettings {
     pub mcp_enabled: bool,
     pub mcp_require_api_key: bool,
     pub mcp_api_key: String,
+    pub mcp_enabled_tools: Vec<String>,
 }
 
 fn default_auth_enabled() -> bool {

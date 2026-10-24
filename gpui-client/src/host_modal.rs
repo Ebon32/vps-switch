@@ -40,6 +40,7 @@ pub struct HostModalState {
     pub tags: Entity<InputState>,
     pub pinned: bool,
     pub archived: bool,
+    pub mcp_exposed: bool,
     pub links: Vec<LinkRowInput>,
     pub saving: bool,
     pub error_msg: Option<String>,
@@ -72,6 +73,7 @@ impl HostModalState {
         let tags_val = editing.map(|h| h.tags.join(", ")).unwrap_or_default();
         let pinned = editing.is_some_and(|h| h.pinned);
         let archived = editing.is_some_and(|h| h.archived);
+        let mcp_exposed = editing.map(|h| h.mcp_exposed).unwrap_or(true);
 
         let name = cx.new(|cx| {
             InputState::new(window, cx)
@@ -152,6 +154,7 @@ impl HostModalState {
             tags,
             pinned,
             archived,
+            mcp_exposed,
             links,
             saving: false,
             error_msg: None,
@@ -263,6 +266,7 @@ impl HostModalState {
             "links": valid_links,
             "pinned": self.pinned,
             "archived": self.archived,
+            "mcpExposed": self.mcp_exposed,
         });
 
         let pwd = self.password.read(cx).value().to_string();
@@ -657,6 +661,9 @@ pub fn render_host_modal(
                 .mt(px(2.))
                 .max_h(px(208.))
                 .overflow_y_scroll()
+                .on_scroll_wheel(|_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .rounded_xl()
                 .border_1()
                 .border_color(palette.border)
@@ -803,17 +810,17 @@ pub fn render_host_modal(
     }
     form = form.child(links_section);
 
-    // 第七行：置顶显示 / 归档隐藏
-    if !modal.is_local {
+    // 第七行：置顶显示 / 归档隐藏 / 允许 MCP 访问
+    {
         let pinned = modal.pinned;
         let archived = modal.archived;
+        let mcp_exposed = modal.mcp_exposed;
         let this_pin = this.clone();
         let this_arch = this.clone();
-        form = form.child(
-            h_flex()
-                .pt(px(4.))
-                .items_center()
-                .gap(px(20.))
+        let this_mcp = this.clone();
+        let mut checks_row = h_flex().pt(px(4.)).items_center().gap(px(20.));
+        if !modal.is_local {
+            checks_row = checks_row
                 .child(checkbox_toggle(
                     "modal-check-pinned",
                     "置顶显示",
@@ -841,8 +848,23 @@ pub fn render_host_modal(
                             }
                         });
                     },
-                )),
-        );
+                ));
+        }
+        checks_row = checks_row.child(checkbox_toggle(
+            "modal-check-mcp-exposed",
+            "允许 MCP 访问",
+            mcp_exposed,
+            palette,
+            move |_, _, cx| {
+                let _ = this_mcp.update(cx, |w, cx| {
+                    if let Some(m) = &mut w.host_modal {
+                        m.mcp_exposed = !m.mcp_exposed;
+                        cx.notify();
+                    }
+                });
+            },
+        ));
+        form = form.child(checks_row);
     }
 
     let body = div()
@@ -850,6 +872,9 @@ pub fn render_host_modal(
         .max_h(px(468.))
         .min_h_0()
         .overflow_y_scroll()
+        .on_scroll_wheel(|_, _, cx| {
+            cx.stop_propagation();
+        })
         .px(px(20.))
         .py(px(16.))
         .child(form);
@@ -908,6 +933,10 @@ pub fn render_host_modal(
     div()
         .id("host-modal-backdrop")
         .test_support()
+        .occlude()
+        .on_scroll_wheel(|_, _, cx| {
+            cx.stop_propagation();
+        })
         .absolute()
         .inset_0()
         .bg(Hsla::from(rgb(0x18181b)).opacity(0.32))
@@ -968,6 +997,10 @@ pub fn render_delete_confirm(
     div()
         .id("delete-modal-backdrop")
         .test_support()
+        .occlude()
+        .on_scroll_wheel(|_, _, cx| {
+            cx.stop_propagation();
+        })
         .absolute()
         .inset_0()
         .bg(Hsla::from(rgb(0x18181b)).opacity(0.32))

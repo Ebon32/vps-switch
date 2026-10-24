@@ -26,6 +26,7 @@ const role = ref<HostRole | ''>('');
 const tagsText = ref('');
 const pinned = ref(false);
 const archived = ref(false);
+const mcpExposed = ref(true);
 const links = ref<HostLink[]>([]);
 const errorMsg = ref('');
 
@@ -60,6 +61,7 @@ watch(
       tagsText.value = host.tags.join(', ');
       pinned.value = host.pinned;
       archived.value = host.archived;
+      mcpExposed.value = host.mcpExposed !== false;
       links.value = host.links.length
         ? host.links.map((l) => ({ ...l }))
         : [{ id: '', name: '', url: '', description: '' }];
@@ -74,6 +76,7 @@ watch(
       tagsText.value = '';
       pinned.value = false;
       archived.value = false;
+      mcpExposed.value = true;
       links.value = [{ id: '', name: '', url: '', description: '' }];
     }
     password.value = '';
@@ -131,6 +134,7 @@ function handleSubmit() {
     links: validLinks,
     pinned: pinned.value,
     archived: archived.value,
+    mcpExposed: mcpExposed.value,
   };
 
   if (password.value) payload.password = password.value;
@@ -355,14 +359,18 @@ function handleSubmit() {
             </div>
           </div>
 
-          <div v-if="!isLocal" class="flex items-center gap-5 pt-1">
-            <label class="inline-flex items-center gap-2 text-xs text-zinc-700">
+          <div class="flex items-center gap-5 pt-1">
+            <label v-if="!isLocal" class="inline-flex items-center gap-2 text-xs text-zinc-700">
               <input v-model="pinned" type="checkbox" class="rounded border-zinc-300 text-zinc-900" />
               置顶显示
             </label>
-            <label class="inline-flex items-center gap-2 text-xs text-zinc-700">
+            <label v-if="!isLocal" class="inline-flex items-center gap-2 text-xs text-zinc-700">
               <input v-model="archived" type="checkbox" class="rounded border-zinc-300 text-zinc-900" />
               归档隐藏
+            </label>
+            <label class="inline-flex items-center gap-2 text-xs text-zinc-700">
+              <input v-model="mcpExposed" type="checkbox" class="rounded border-zinc-300 text-zinc-900" />
+              允许 MCP 访问
             </label>
           </div>
         </form>

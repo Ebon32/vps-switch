@@ -30,9 +30,19 @@ pub fn resolve_host(db: &Database, query: &str) -> Result<HostRecord> {
     let records = db.list_records()?;
     let lower = q.to_lowercase();
 
+    let check_exposed = |rec: &HostRecord| -> Result<HostRecord> {
+        if !rec.mcp_exposed {
+            return Err(anyhow!(
+                "主机「{}」未在 MCP 中暴露（可在「设置 → MCP Server」中勾选开启）",
+                rec.name
+            ));
+        }
+        Ok(rec.clone())
+    };
+
     if lower == "local" || lower == "本机" || lower == "localhost" || lower == "127.0.0.1" {
         if let Some(loc) = records.iter().find(|r| r.id == LOCAL_HOST_ID) {
-            return Ok(loc.clone());
+            return check_exposed(loc);
         }
     }
 
@@ -41,26 +51,35 @@ pub fn resolve_host(db: &Database, query: &str) -> Result<HostRecord> {
         .iter()
         .find(|r| r.name.eq_ignore_ascii_case(q) || r.id.eq_ignore_ascii_case(q))
     {
-        return Ok(exact.clone());
+        return check_exposed(exact);
     }
 
     // 2. 精确匹配 IP / 域名
     if let Some(by_addr) = records.iter().find(|r| r.addr.eq_ignore_ascii_case(q)) {
-        return Ok(by_addr.clone());
+        return check_exposed(by_addr);
     }
 
-    // 3. 唯一子串匹配 name
-    let partial: Vec<_> = records
+    // 3. 唯一子串匹配 name（优先在已暴露主机中匹配）
+    let partial_exposed: Vec<_> = records
         .iter()
-        .filter(|r| r.name.to_lowercase().contains(&lower))
+        .filter(|r| !r.archived && r.mcp_exposed && r.name.to_lowercase().contains(&lower))
         .collect();
-    if partial.len() == 1 {
-        return Ok(partial[0].clone());
+    if partial_exposed.len() == 1 {
+        return Ok(partial_exposed[0].clone());
+    }
+    if partial_exposed.is_empty() {
+        let partial_hidden: Vec<_> = records
+            .iter()
+            .filter(|r| !r.mcp_exposed && r.name.to_lowercase().contains(&lower))
+            .collect();
+        if partial_hidden.len() == 1 {
+            return check_exposed(partial_hidden[0]);
+        }
     }
 
     let available: Vec<String> = records
         .iter()
-        .filter(|r| !r.archived)
+        .filter(|r| !r.archived && r.mcp_exposed)
         .map(|r| r.name.clone())
         .collect();
     Err(anyhow!(
@@ -814,6 +833,23 @@ pub struct JsonRpcRequest {
     pub params: Value,
 }
 
+pub fn mcp_tool_definitions_filtered(enabled_tools: &[String]) -> Value {
+    let all = mcp_tool_definitions();
+    let Some(arr) = all.as_array() else {
+        return json!([]);
+    };
+    let filtered: Vec<Value> = arr
+        .iter()
+        .filter(|item| {
+            item.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|name| enabled_tools.iter().any(|t| t == name))
+        })
+        .cloned()
+        .collect();
+    Value::Array(filtered)
+}
+
 pub fn mcp_tool_definitions() -> Value {
     json!([
         {
@@ -1114,7 +1150,7 @@ pub async fn handle_mcp_request(
                 },
                 "serverInfo": {
                     "name": "vps-switch",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }
         })),
@@ -1123,13 +1159,16 @@ pub async fn handle_mcp_request(
             "id": id,
             "result": {}
         })),
-        "tools/list" => Some(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "tools": mcp_tool_definitions()
-            }
-        })),
+        "tools/list" => {
+            let enabled = state.db.get_enabled_mcp_tools();
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": mcp_tool_definitions_filtered(&enabled)
+                }
+            }))
+        }
         "tools/call" => {
             let tool_name = req
                 .params
@@ -1209,6 +1248,14 @@ async fn dispatch_tool_call(
     name: &str,
     args: Value,
 ) -> Result<Value> {
+    if crate::db::ALL_MCP_TOOLS.contains(&name) {
+        let enabled = state.db.get_enabled_mcp_tools();
+        if !enabled.iter().any(|t| t == name) {
+            return Err(anyhow!(
+                "MCP 工具「{name}」已在设置中关闭（可在「设置 → MCP Server」中勾选开启）"
+            ));
+        }
+    }
     match name {
         "vps_list" => tool_vps_list(state, args).await,
         "vps_inspect" => tool_vps_inspect(state, args).await,
@@ -1240,7 +1287,10 @@ async fn tool_vps_list(state: &Arc<AppState>, args: Value) -> Result<Value> {
 
     if refresh {
         let records = state.db.list_records()?;
-        let active: Vec<_> = records.into_iter().filter(|r| !r.archived).collect();
+        let active: Vec<_> = records
+            .into_iter()
+            .filter(|r| !r.archived && r.mcp_exposed)
+            .collect();
         stream::iter(active)
             .for_each_concurrent(8, |rec| {
                 let st = state.clone();
@@ -1259,7 +1309,7 @@ async fn tool_vps_list(state: &Arc<AppState>, args: Value) -> Result<Value> {
 
     let mut out = Vec::new();
     for h in hosts {
-        if h.archived {
+        if h.archived || !h.mcp_exposed {
             continue;
         }
         if !role_filter.is_empty() && h.role.as_deref() != Some(role_filter) {
@@ -2207,6 +2257,128 @@ mod tests {
         assert!(first.contains("[mcp_servers.other]\ncommand = \"keep\""));
         sync_codex_toml(&codex, "C:\\tools\\vps-switch.exe", &env).unwrap();
         assert_eq!(std::fs::read_to_string(&codex).unwrap(), first);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_host_enforces_mcp_exposed_and_hides_unexposed_from_available_list() {
+        use crate::crypto::MasterKey;
+        use crate::models::{HostMetaPatch, HostUpsertPayload};
+
+        let dir = std::env::temp_dir().join(format!("vps-switch-mcp-expose-{}", Uuid::new_v4()));
+        let key = MasterKey::load_or_create(&dir).unwrap();
+        let db = Database::open(&dir, key).unwrap();
+
+        let h1 = db
+            .create_host(HostUpsertPayload {
+                name: "hk-prod".into(),
+                addr: "203.0.113.10".into(),
+                port: 22,
+                username: "root".into(),
+                auth_type: "password".into(),
+                password: None,
+                private_key: None,
+                passphrase: None,
+                jump_host_id: None,
+                role: Some("primary".into()),
+                tags: vec![],
+                links: vec![],
+                pinned: false,
+                favorited: false,
+                archived: false,
+                mcp_exposed: true,
+            })
+            .unwrap();
+        let h2 = db
+            .create_host(HostUpsertPayload {
+                name: "hk-secret".into(),
+                addr: "203.0.113.99".into(),
+                port: 22,
+                username: "root".into(),
+                auth_type: "password".into(),
+                password: None,
+                private_key: None,
+                passphrase: None,
+                jump_host_id: None,
+                role: Some("primary".into()),
+                tags: vec![],
+                links: vec![],
+                pinned: false,
+                favorited: false,
+                archived: false,
+                mcp_exposed: false,
+            })
+            .unwrap();
+
+        assert!(h1.mcp_exposed);
+        assert!(!h2.mcp_exposed);
+
+        // 1. 已暴露的 hk-prod 可以正常解析，且子串 "hk" 只命中唯一的已暴露主机 hk-prod
+        assert_eq!(resolve_host(&db, "hk-prod").unwrap().id, h1.id);
+        assert_eq!(resolve_host(&db, "hk").unwrap().id, h1.id);
+
+        // 2. 未暴露的 hk-secret 无论是按名称、IP 还是唯一子串 "secret" 访问，均明确拒绝
+        let err_name = resolve_host(&db, "hk-secret").unwrap_err().to_string();
+        assert!(err_name.contains("未在 MCP 中暴露"));
+        let err_ip = resolve_host(&db, "203.0.113.99").unwrap_err().to_string();
+        assert!(err_ip.contains("未在 MCP 中暴露"));
+        let err_sub = resolve_host(&db, "secret").unwrap_err().to_string();
+        assert!(err_sub.contains("未在 MCP 中暴露"));
+
+        // 3. 查询不存在的主机时，报错列出的可用主机名绝不能泄露未暴露的 hk-secret
+        let err_missing = resolve_host(&db, "non-existent").unwrap_err().to_string();
+        assert!(err_missing.contains("hk-prod"));
+        assert!(!err_missing.contains("hk-secret"));
+
+        // 4. patch_meta 切换本机不暴露后，resolve_host("local") 同样被拦截
+        db.patch_meta(
+            LOCAL_HOST_ID,
+            HostMetaPatch {
+                pinned: None,
+                favorited: None,
+                archived: None,
+                mcp_exposed: Some(false),
+                role: None,
+                tags: None,
+                links: None,
+            },
+        )
+        .unwrap();
+        assert!(resolve_host(&db, "local").is_err());
+
+        // 5. 批量全选恢复暴露
+        db.set_mcp_exposed_batch(true, None).unwrap();
+        assert!(resolve_host(&db, "local").is_ok());
+        assert_eq!(resolve_host(&db, "hk-secret").unwrap().id, h2.id);
+
+        // 6. 工具开放范围：默认全部 7 个工具开启；设置为仅开放 vps_list/vps_inspect 后，tools/list 严格只返回 2 个
+        let default_tools = db.get_enabled_mcp_tools();
+        assert_eq!(default_tools.len(), 7);
+        assert_eq!(
+            mcp_tool_definitions_filtered(&default_tools)
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        let saved_tools = db
+            .set_enabled_mcp_tools(&[
+                "vps_list".into(),
+                "vps_inspect".into(),
+                "invalid_tool".into(),
+            ])
+            .unwrap();
+        assert_eq!(saved_tools, vec!["vps_list", "vps_inspect"]);
+        let filtered_defs = mcp_tool_definitions_filtered(&saved_tools);
+        let names: Vec<&str> = filtered_defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["vps_list", "vps_inspect"]);
+
+        drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

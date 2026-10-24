@@ -421,10 +421,30 @@ impl Workspace {
         cx.notify();
     }
 
-    fn replace_host(&mut self, updated: Host) {
+    pub fn sort_hosts(&mut self) {
+        self.hosts.sort_by(|a, b| {
+            let a_local = a.kind == "local" || a.id == "local";
+            let b_local = b.kind == "local" || b.id == "local";
+            b_local
+                .cmp(&a_local)
+                .then_with(|| b.pinned.cmp(&a.pinned))
+                .then_with(|| a.sort_order.cmp(&b.sort_order))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+
+    fn replace_host(&mut self, mut updated: Host) {
         match self.hosts.iter_mut().find(|host| host.id == updated.id) {
             Some(existing) => *existing = updated,
             None => {
+                let min_order = self
+                    .hosts
+                    .iter()
+                    .filter(|h| h.kind != "local" && h.id != "local")
+                    .map(|h| h.sort_order)
+                    .min()
+                    .unwrap_or(0);
+                updated.sort_order = min_order - 1;
                 let insert_pos = self
                     .hosts
                     .iter()
@@ -433,6 +453,7 @@ impl Workspace {
                 self.hosts.insert(insert_pos, updated);
             }
         }
+        self.sort_hosts();
     }
 
     pub fn toggle_detail(&mut self, host_id: &str, cx: &mut Context<Self>) {
@@ -974,12 +995,17 @@ impl Workspace {
     }
 
     pub fn patch_meta(&mut self, host_id: &str, patch: serde_json::Value, cx: &mut Context<Self>) {
+        let mut need_resort = false;
         if let Some(host) = self.hosts.iter_mut().find(|h| h.id == host_id) {
             if let Some(fav) = patch.get("favorited").and_then(|v| v.as_bool()) {
                 host.favorited = fav;
             }
             if let Some(pin) = patch.get("pinned").and_then(|v| v.as_bool()) {
                 host.pinned = pin;
+                need_resort = true;
+            }
+            if let Some(exp) = patch.get("mcpExposed").and_then(|v| v.as_bool()) {
+                host.mcp_exposed = exp;
             }
             if let Some(role_val) = patch.get("role") {
                 host.role = role_val.as_str().map(str::to_owned);
@@ -991,11 +1017,42 @@ impl Workspace {
                     .collect();
             }
         }
+        if need_resort {
+            self.sort_hosts();
+        }
         self.api.send(ApiCommand::PatchMeta {
             host_id: host_id.to_owned(),
             patch,
         });
         crate::tray::update_hosts(&self.hosts);
+        cx.notify();
+    }
+
+    pub fn toggle_host_mcp_exposed(&mut self, host_id: &str, cx: &mut Context<Self>) {
+        let Some(host) = self.host_by_id(host_id) else {
+            return;
+        };
+        let next = !host.mcp_exposed;
+        self.patch_meta(host_id, serde_json::json!({ "mcpExposed": next }), cx);
+    }
+
+    pub fn set_all_hosts_mcp_exposed(&mut self, exposed: bool, cx: &mut Context<Self>) {
+        for host in &mut self.hosts {
+            host.mcp_exposed = exposed;
+        }
+        self.api.send(ApiCommand::SetMcpExposedBatch {
+            exposed,
+            host_ids: None,
+        });
+        self.show_toast(
+            if exposed {
+                "已将全部主机设为对 MCP 暴露"
+            } else {
+                "已隐藏全部主机的 MCP 暴露"
+            },
+            ToastKind::Ok,
+            cx,
+        );
         cx.notify();
     }
 
@@ -1012,7 +1069,17 @@ impl Workspace {
             return;
         };
         let pinned = !host.pinned;
+        let name = host.name.clone();
         self.patch_meta(host_id, serde_json::json!({ "pinned": pinned }), cx);
+        self.show_toast(
+            if pinned {
+                format!("已将「{name}」置顶到列表顶部")
+            } else {
+                format!("已取消「{name}」置顶")
+            },
+            ToastKind::Ok,
+            cx,
+        );
     }
 
     pub fn add_tag_from_input(
@@ -1086,6 +1153,15 @@ impl Workspace {
         ) {
             let item = self.hosts.remove(f_idx);
             self.hosts.insert(t_idx, item);
+            for (idx, host) in self
+                .hosts
+                .iter_mut()
+                .filter(|h| h.kind != "local" && h.id != "local")
+                .enumerate()
+            {
+                host.sort_order = idx as i64;
+            }
+            self.sort_hosts();
         }
 
         self.api.send(ApiCommand::Reorder { ordered_ids: ids });
@@ -1598,6 +1674,7 @@ impl Workspace {
                     mcp_enabled,
                     mcp_require_api_key,
                     mcp_api_key,
+                    mcp_enabled_tools,
                     regenerated,
                 } => {
                     self.settings.mcp_enabled = mcp_enabled;
@@ -1605,6 +1682,7 @@ impl Workspace {
                     if !mcp_api_key.is_empty() {
                         self.settings.mcp_api_key = mcp_api_key;
                     }
+                    self.settings.mcp_enabled_tools = mcp_enabled_tools;
                     self.toast = Some(Toast {
                         text: if regenerated {
                             "已生成新的 MCP API Key".into()

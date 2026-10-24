@@ -342,6 +342,8 @@ mod tests {
             pinned,
             favorited,
             archived,
+            mcp_exposed: true,
+            sort_order: 0,
             role: None,
             tags: Vec::new(),
             links: Vec::new(),
