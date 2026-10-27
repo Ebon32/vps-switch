@@ -17,7 +17,7 @@ const name = ref('');
 const addr = ref('');
 const port = ref(22);
 const username = ref('root');
-const authType = ref<'password' | 'privateKey'>('password');
+const authType = ref<'password' | 'privateKey' | 'none'>('password');
 const password = ref('');
 const privateKey = ref('');
 const passphrase = ref('');
@@ -55,7 +55,12 @@ watch(
       addr.value = host.addr;
       port.value = host.port || 22;
       username.value = host.username || 'root';
-      authType.value = host.authType === 'privateKey' ? 'privateKey' : 'password';
+      authType.value =
+        host.authType === 'privateKey'
+          ? 'privateKey'
+          : host.authType === 'none'
+            ? 'none'
+            : 'password';
       jumpHostId.value = host.jumpHostId || '';
       role.value = (host.role as HostRole) || '';
       tagsText.value = host.tags.join(', ');
@@ -234,7 +239,7 @@ function handleSubmit() {
             <div class="grid grid-cols-2 gap-3">
               <div>
                 <label class="block text-xs font-medium text-zinc-600">认证方式</label>
-                <div class="mt-1 grid grid-cols-2 gap-1 rounded-xl bg-zinc-100 p-1">
+                <div class="mt-1 grid grid-cols-3 gap-1 rounded-xl bg-zinc-100 p-1">
                   <button
                     type="button"
                     class="rounded-lg py-1.5 text-xs font-medium transition"
@@ -250,6 +255,14 @@ function handleSubmit() {
                     @click="authType = 'privateKey'"
                   >
                     SSH 私钥
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded-lg py-1.5 text-xs font-medium transition"
+                    :class="authType === 'none' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500'"
+                    @click="authType = 'none'"
+                  >
+                    免凭据
                   </button>
                 </div>
               </div>
@@ -282,7 +295,7 @@ function handleSubmit() {
               />
             </div>
 
-            <div v-else class="space-y-2.5">
+            <div v-else-if="authType === 'privateKey'" class="space-y-2.5">
               <div>
                 <label class="block text-xs font-medium text-zinc-600">
                   SSH 私钥 (PEM / OpenSSH)
