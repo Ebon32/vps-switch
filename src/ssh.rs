@@ -367,6 +367,17 @@ async fn authenticate_session(
         host.username.trim()
     };
 
+    // instabox 这类保活机器：服务端在 SSH 握手里直接接受 none 认证（用户名即凭据，无密码无密钥）。
+    // russh 的 authenticate_none 会走完整的 none 请求，服务端回 USERAUTH_SUCCESS 即通过。
+    if host.auth_type == "none" {
+        match session.authenticate_none(user).await? {
+            AuthResult::Success => return Ok(()),
+            AuthResult::Failure { .. } => {
+                return Err(anyhow!("SSH none（免凭据）认证被服务器拒绝"))
+            }
+        }
+    }
+
     if host.auth_type == "privateKey" {
         let key_pem = master_key
             .decrypt(host.encrypted_private_key.as_deref())?
